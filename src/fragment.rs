@@ -26,7 +26,14 @@ use super::{
 };
 
 const STOPS: &[&str] = &["before_copy", "before_publish"];
-const INJECTS: &[&str] = &["body_schema", "db_commit"];
+const INJECTS: &[&str] = &[
+    "body_schema",
+    "extract_status",
+    "publish_tx",
+    "result_encode",
+    "replay_tx",
+    "db_commit",
+];
 
 pub struct FragmentRequest {
     pub vault: PathBuf,
@@ -209,18 +216,63 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
     journal.object_id = Some(opened.object_id.clone());
     journal.state = "object_ready".into();
     write_journal(&session.root, &journal)?;
+    // The source row is committed. Later failures of this call must not fall
+    // through note_uncommitted's default NotPreserved. Pre-commit failures,
+    // including body_schema, return above this line and keep that default.
+    let source_id = opened.source_id.clone();
+    let kept_hash = hash.clone();
+    continue_after_source(
+        &session,
+        &req,
+        &mut journal,
+        &opened,
+        &hash,
+        &text,
+        &mut hooks,
+    )
+    .map_err(|fail| after_source_committed(fail, &source_id, &kept_hash))
+}
 
+fn continue_after_source(
+    session: &super::Session,
+    req: &FragmentRequest,
+    journal: &mut Journal,
+    opened: &Opened,
+    hash: &str,
+    text: &str,
+    hooks: &mut HookRun,
+) -> Result<Value, Fail> {
     if opened.already_succeeded {
-        if req.hooks.stop_at.is_some() || req.hooks.inject_point.is_some() {
+        match req.hooks.inject_point.as_deref() {
+            Some("replay_tx") | Some("result_encode") => {}
+            Some(_) => return Err(missed("run_already_succeeded")),
+            None => {}
+        }
+        if req.hooks.stop_at.is_some() {
             return Err(missed("run_already_succeeded"));
         }
-        let receipt = publish_replay(&session.conn, &req, &journal, &opened, &hash)?;
-        return finish_journal(&session.root, &mut journal, receipt);
+        let receipt = publish_replay(&session.conn, req, journal, opened, hash, hooks)?;
+        hook_reached(hooks)?;
+        return finish_journal(&session.root, journal, receipt);
     }
 
-    let drafts = match body::extract(&text) {
+    let drafts = match body::extract(text) {
         Ok(drafts) => drafts,
         Err(error) => {
+            if req.hooks.inject_point.as_deref() == Some("extract_status") {
+                hooks.inject(
+                    "extract_status",
+                    checkpoint_map(
+                        &req.command_id,
+                        0,
+                        journal.byte_length.map(|n| n as u64),
+                        Some(hash),
+                        true,
+                        false,
+                    ),
+                )?;
+                return Err(missed("extract_status"));
+            }
             let reason = match error {
                 ExtractError::OverLine => "over_line",
                 ExtractError::TooMany => "too_many_candidates",
@@ -229,7 +281,7 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
             set_run_status(&session.conn, &opened.run_id, "failed")?;
             journal.state = "aborted".into();
             journal.reason = Some(reason.into());
-            write_journal(&session.root, &journal)?;
+            write_journal(&session.root, journal)?;
             return Err(refused(reason)
                 .extra("preservation", json!(PRESERVED))
                 .extra("object_intact", json!(true))
@@ -240,14 +292,19 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
                 .extra("run_id", json!(opened.run_id)));
         }
     };
+    match req.hooks.inject_point.as_deref() {
+        Some(point @ ("extract_status" | "replay_tx")) => return Err(missed(point)),
+        _ => {}
+    }
 
+    let byte_len = journal.byte_length.unwrap_or(0) as u64;
     hooks.stop(
         "before_publish",
         checkpoint_map(
             &req.command_id,
-            bytes.len() as u64,
-            Some(bytes.len() as u64),
-            Some(&hash),
+            byte_len,
+            Some(byte_len),
+            Some(hash),
             true,
             false,
         ),
@@ -266,29 +323,79 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
             "cancelled",
         )?;
         set_run_status(&session.conn, &opened.run_id, "cancelled")?;
-        return finish_cancel(&session, &mut journal, Some(&opened));
+        return finish_cancel(session, journal, Some(opened));
     }
 
-    let receipt = match publish(
-        &session, &req, &journal, &opened, &hash, &drafts, &mut hooks,
-    ) {
+    let receipt = match publish(session, req, journal, opened, hash, &drafts, hooks) {
         Ok(receipt) => receipt,
-        Err(fail) => {
-            let _ = set_attempt(
-                &session.conn,
-                &opened.attempt_id,
-                "failed",
-                0,
-                fail.reason.as_str(),
-            );
-            let _ = set_run_status(&session.conn, &opened.run_id, "failed");
-            journal.state = "aborted".into();
-            journal.reason = Some(fail.reason.clone());
-            write_journal(&session.root, &journal)?;
-            return Err(fail);
-        }
+        Err(fail) => return Err(note_status_writes(session, journal, opened, fail)),
     };
-    finish_journal(&session.root, &mut journal, receipt)
+    hook_reached(hooks)?;
+    finish_journal(&session.root, journal, receipt)
+}
+
+/// The source row survived. This call's error does not relabel it.
+fn after_source_committed(mut fail: Fail, source_id: &str, hash: &str) -> Fail {
+    // The constructors still say NotPreserved. This call did not publish, and
+    // the source row is already stored. Exit codes stay with the constructor:
+    // db_commit remains exit 3, a database error remains exit 15.
+    if fail.outcome == "NotPreserved" {
+        fail.outcome = "NotPublished";
+    }
+    fail.extra.insert("preservation".into(), json!(PRESERVED));
+    if !fail.extra.contains_key("candidates_published") {
+        fail.extra
+            .insert("candidates_published".into(), json!(false));
+    }
+    if !fail.extra.contains_key("source_id") {
+        fail.extra.insert("source_id".into(), json!(source_id));
+    }
+    if !fail.extra.contains_key("content_sha256") {
+        fail.extra.insert("content_sha256".into(), json!(hash));
+    }
+    if !fail.extra.contains_key("new_effect") {
+        fail.extra.insert("new_effect".into(), json!(false));
+    }
+    fail
+}
+
+fn note_status_writes(
+    session: &super::Session,
+    journal: &mut Journal,
+    opened: &Opened,
+    mut fail: Fail,
+) -> Fail {
+    let attempt = set_attempt(
+        &session.conn,
+        &opened.attempt_id,
+        "failed",
+        0,
+        fail.reason.as_str(),
+    );
+    let run = set_run_status(&session.conn, &opened.run_id, "failed");
+    if attempt.is_err() {
+        fail = fail.extra("attempt_update", json!("failed"));
+    }
+    if run.is_err() {
+        fail = fail.extra("run_update", json!("failed"));
+    }
+    if attempt.is_ok() && run.is_ok() {
+        journal.state = "aborted".into();
+        journal.reason = Some(fail.reason.clone());
+        if write_journal(&session.root, journal).is_err() {
+            fail = fail.extra("journal_update", json!("failed"));
+        }
+    }
+    fail
+}
+
+fn hook_reached(hooks: &HookRun) -> Result<(), Fail> {
+    if let Some(point) = hooks.hooks.inject_point.as_deref() {
+        if !hooks.inject_reached {
+            return Err(missed(point));
+        }
+    }
+    Ok(())
 }
 
 struct Opened {
@@ -418,6 +525,17 @@ fn publish(
         .conn
         .unchecked_transaction()
         .map_err(|err| db_fail(err, "begin"))?;
+    hooks.inject(
+        "publish_tx",
+        checkpoint_map(
+            &req.command_id,
+            hash.len() as u64,
+            Some(hash.len() as u64),
+            Some(hash),
+            true,
+            false,
+        ),
+    )?;
     let attempt_status = attempt_status(&tx, &opened.attempt_id)?;
     if attempt_status != "running" {
         return Err(refused("attempt_not_running")
@@ -465,6 +583,17 @@ fn publish(
     )
     .map_err(|err| db_fail(err, "finish_run"))?;
     let receipt = success_receipt(req, journal, opened, hash, &ids, true);
+    hooks.inject(
+        "result_encode",
+        checkpoint_map(
+            &req.command_id,
+            hash.len() as u64,
+            Some(hash.len() as u64),
+            Some(hash),
+            true,
+            false,
+        ),
+    )?;
     let encoded = serde_json::to_string(&receipt)
         .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
     store::insert_command(
@@ -508,7 +637,19 @@ fn publish_replay(
     journal: &Journal,
     opened: &Opened,
     hash: &str,
+    hooks: &mut HookRun,
 ) -> Result<Value, Fail> {
+    hooks.inject(
+        "replay_tx",
+        checkpoint_map(
+            &req.command_id,
+            hash.len() as u64,
+            Some(hash.len() as u64),
+            Some(hash),
+            true,
+            true,
+        ),
+    )?;
     let tx = conn
         .unchecked_transaction()
         .map_err(|err| db_fail(err, "begin"))?;
@@ -519,6 +660,17 @@ fn publish_replay(
         map.insert("new_effect".into(), json!(false));
         map.insert("attempt_created".into(), json!(false));
     }
+    hooks.inject(
+        "result_encode",
+        checkpoint_map(
+            &req.command_id,
+            hash.len() as u64,
+            Some(hash.len() as u64),
+            Some(hash),
+            true,
+            true,
+        ),
+    )?;
     let encoded = serde_json::to_string(&replay)
         .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
     store::insert_command(

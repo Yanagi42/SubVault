@@ -843,6 +843,294 @@ fn stdin_is_not_read_as_the_fragment() {
     assert_eq!(body["candidate_count"], 1);
 }
 
+fn inject_fragment(
+    vault: &Path,
+    command: &str,
+    file: &Path,
+    point: &str,
+    witness: &Path,
+) -> (i32, Value) {
+    let spec = format!("enospc:{point}");
+    run(&[
+        "fragment",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        command,
+        "--fragment",
+        file.to_str().unwrap(),
+        "--inject",
+        spec.as_str(),
+        "--witness",
+        witness.to_str().unwrap(),
+    ])
+}
+
+fn assert_source_kept(body: &Value, hash: &str) {
+    assert_eq!(body["preservation"], "preserved", "{body}");
+    assert_ne!(body["outcome"], "NotPreserved", "{body}");
+    assert_eq!(body["candidates_published"], false, "{body}");
+    assert_eq!(body["new_effect"], false, "{body}");
+    assert_eq!(body["content_sha256"], hash, "{body}");
+}
+
+#[test]
+fn failure_after_the_source_commit_does_not_relabel_preservation() {
+    let tmp = Tmp::new("kept");
+    let vault = init(&tmp);
+    let old = tmp.path().join("old.txt");
+    write_file(&old, b"Amount paid USD 15.99\n");
+    let (code, first) = fragment(&vault, "old", &old);
+    assert_eq!(code, 0, "{first}");
+    let old_hash = first["content_sha256"].as_str().unwrap().to_string();
+    let old_id = first["candidate_ids"][0].as_str().unwrap().to_string();
+    let old_object = object_bytes(&vault, &first);
+
+    let next = tmp.path().join("next.txt");
+    write_file(&next, b"Amount paid USD 8.00\n");
+    let witness = tmp.path().join("witness.json");
+    let (code, failed) = inject_fragment(&vault, "later", &next, "publish_tx", &witness);
+    assert_eq!(code, 15, "{failed}");
+    assert_eq!(failed["reason"], "injected_enospc");
+    assert_eq!(failed["inject_point"], "publish_tx");
+    let later_hash = failed["content_sha256"].as_str().unwrap().to_string();
+    assert_source_kept(&failed, &later_hash);
+    assert_eq!(object_bytes(&vault, &first), old_object);
+    let later_object = sql(
+        &vault,
+        &format!("SELECT object_id FROM sources WHERE content_sha256='{later_hash}';"),
+    );
+    assert_eq!(
+        fs::read(vault.join("objects").join(later_object)).unwrap(),
+        fs::read(&next).unwrap()
+    );
+    let listed = candidates(&vault);
+    let rows = listed["candidates"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["candidate_id"], old_id);
+    assert_eq!(rows[0]["content_sha256"], old_hash);
+    let opened = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(opened.0, 0, "{}", opened.1);
+    assert!(opened.1["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|source| {
+            source["content_sha256"] == old_hash && source["preservation"] == "preserved"
+        }));
+    assert!(opened.1["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|source| {
+            source["content_sha256"] == later_hash && source["preservation"] == "preserved"
+        }));
+    let (code, retried) = fragment(&vault, "later", &next);
+    assert_eq!(code, 0, "{retried}");
+    assert_eq!(retried["outcome"], "Committed");
+    assert_eq!(retried["attempt_no"], 2);
+    assert_eq!(retried["candidate_count"], 1);
+    assert_eq!(object_bytes(&vault, &first), old_object);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "2");
+
+    let early = Tmp::new("pre-commit");
+    let early_vault = init(&early);
+    let note = early.path().join("note.txt");
+    write_file(&note, b"Amount paid USD 4.00\n");
+    let early_witness = early.path().join("witness.json");
+    let (code, refused) =
+        inject_fragment(&early_vault, "schema", &note, "body_schema", &early_witness);
+    assert_eq!(code, 15, "{refused}");
+    assert_eq!(refused["reason"], "injected_enospc");
+    assert_eq!(refused["preservation"], "not_preserved");
+    assert_eq!(
+        sql(
+            &early_vault,
+            "SELECT count(*) FROM sqlite_master WHERE name='candidates';"
+        ),
+        "0"
+    );
+    assert!(
+        run(&["open", "--vault", early_vault.to_str().unwrap()]).1["sources"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn publish_stages_keep_the_stored_source_and_the_old_success() {
+    let tmp = Tmp::new("stages");
+    let vault = init(&tmp);
+    let old = tmp.path().join("old.txt");
+    write_file(&old, b"Amount paid USD 15.99\n");
+    let (code, first) = fragment(&vault, "old", &old);
+    assert_eq!(code, 0, "{first}");
+    let old_bytes = object_bytes(&vault, &first);
+    let old_id = first["candidate_ids"][0].clone();
+
+    let wide = tmp.path().join("wide.txt");
+    write_file(&wide, &vec![b'a'; 1025]);
+    let witness = tmp.path().join("witness.json");
+    let (code, status) = inject_fragment(&vault, "wide", &wide, "extract_status", &witness);
+    assert_eq!(code, 15, "{status}");
+    assert_eq!(status["inject_point"], "extract_status");
+    assert_source_kept(&status, status["content_sha256"].as_str().unwrap());
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT status FROM extraction_attempts WHERE command_id='wide';"
+        ),
+        "running"
+    );
+    assert!(status.get("attempt_update").is_none());
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "1");
+    let (code, over) = fragment(&vault, "wide", &wide);
+    assert_eq!(code, 16, "{over}");
+    assert_eq!(over["reason"], "over_line");
+    assert_eq!(over["preservation"], "preserved");
+    assert_eq!(over["candidates_published"], false);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT status FROM extraction_attempts WHERE command_id='wide' ORDER BY attempt_no;"
+        ),
+        "abandoned\nfailed"
+    );
+
+    let encoded = tmp.path().join("encoded.txt");
+    write_file(&encoded, b"Amount paid USD 6.00\n");
+    let (code, encode) = inject_fragment(&vault, "encode", &encoded, "result_encode", &witness);
+    assert_eq!(code, 15, "{encode}");
+    assert_eq!(encode["inject_point"], "result_encode");
+    assert_source_kept(&encode, encode["content_sha256"].as_str().unwrap());
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT status || ':' || published FROM extraction_attempts WHERE command_id='encode';"
+        ),
+        "failed:0"
+    );
+    assert!(encode.get("attempt_update").is_none());
+    let (code, encode_ok) = fragment(&vault, "encode", &encoded);
+    assert_eq!(code, 0, "{encode_ok}");
+    assert_eq!(encode_ok["attempt_no"], 2);
+    assert_eq!(encode_ok["candidate_count"], 1);
+
+    let (code, replay) = inject_fragment(&vault, "replay", &old, "replay_tx", &witness);
+    assert_eq!(code, 15, "{replay}");
+    assert_eq!(replay["inject_point"], "replay_tx");
+    assert_source_kept(&replay, &first["content_sha256"].as_str().unwrap());
+    let (code, replay_encode) =
+        inject_fragment(&vault, "replay-encode", &old, "result_encode", &witness);
+    assert_eq!(code, 15, "{replay_encode}");
+    assert_eq!(replay_encode["inject_point"], "result_encode");
+    assert_source_kept(&replay_encode, &first["content_sha256"].as_str().unwrap());
+    let listed = candidates(&vault);
+    let old_rows: Vec<_> = listed["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["candidate_id"] == old_id)
+        .collect();
+    assert_eq!(old_rows.len(), 1);
+    let (code, again) = fragment(&vault, "replay", &old);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again["outcome"], "AlreadyPublished");
+    assert_eq!(again["candidate_ids"][0], old_id);
+    assert_eq!(object_bytes(&vault, &first), old_bytes);
+
+    let blocked = tmp.path().join("blocked.txt");
+    write_file(&blocked, b"Amount paid USD 7.00\n");
+    sql(
+        &vault,
+        "CREATE TRIGGER block_candidate BEFORE INSERT ON candidates BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+    );
+    let (code, db_fail) = fragment(&vault, "blocked", &blocked);
+    assert_eq!(code, 15, "{db_fail}");
+    assert_eq!(db_fail["reason"], "db_error");
+    assert_eq!(db_fail["during"], "insert_candidate");
+    assert_eq!(db_fail["injected"], false);
+    assert_source_kept(&db_fail, db_fail["content_sha256"].as_str().unwrap());
+    assert_eq!(object_bytes(&vault, &first), old_bytes);
+    sql(&vault, "DROP TRIGGER block_candidate;");
+    let (code, unblocked) = fragment(&vault, "blocked", &blocked);
+    assert_eq!(code, 0, "{unblocked}");
+    assert_eq!(unblocked["attempt_no"], 2);
+    assert_eq!(unblocked["candidate_count"], 1);
+    assert_eq!(object_bytes(&vault, &first), old_bytes);
+}
+
+#[test]
+fn a_failed_status_write_is_not_reported_as_cleanup() {
+    let tmp = Tmp::new("cleanup");
+    let vault = init(&tmp);
+    let old = tmp.path().join("old.txt");
+    write_file(&old, b"Amount paid USD 15.99\n");
+    let (code, first) = fragment(&vault, "old", &old);
+    assert_eq!(code, 0, "{first}");
+    let old_bytes = object_bytes(&vault, &first);
+    let old_id = first["candidate_ids"][0].clone();
+
+    let total = tmp.path().join("total.txt");
+    write_file(
+        &total,
+        b"Total USD 15.99\nThis Total is an order total whose payment nature is not stated.\n",
+    );
+    sql(
+        &vault,
+        "CREATE TRIGGER block_attempt BEFORE UPDATE ON extraction_attempts WHEN NEW.status != 'succeeded' BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+    );
+    sql(
+        &vault,
+        "CREATE TRIGGER block_run BEFORE UPDATE ON extraction_runs WHEN NEW.status != 'succeeded' BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+    );
+    let witness = tmp.path().join("witness.json");
+    let (code, failed) = inject_fragment(&vault, "disk", &total, "db_commit", &witness);
+    assert_eq!(code, 3, "{failed}");
+    assert_eq!(failed["outcome"], "NotPublished");
+    assert_eq!(failed["injected"], true);
+    assert_eq!(failed["inject_point"], "db_commit");
+    assert_source_kept(&failed, failed["content_sha256"].as_str().unwrap());
+    assert_eq!(failed["attempt_update"], "failed");
+    assert_eq!(failed["run_update"], "failed");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT status FROM extraction_attempts WHERE command_id='disk';"
+        ),
+        "running"
+    );
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "1");
+    let opened = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(opened.0, 0, "{}", opened.1);
+    let incomplete = opened.1["incomplete_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["command_id"] == "disk")
+        .unwrap();
+    assert_eq!(incomplete["state"], "object_ready");
+    assert_eq!(incomplete["preservation"], "preserved");
+    assert_eq!(incomplete["candidates_published"], false);
+    assert_eq!(object_bytes(&vault, &first), old_bytes);
+    sql(
+        &vault,
+        "DROP TRIGGER block_attempt; DROP TRIGGER block_run;",
+    );
+    let (code, retried) = fragment(&vault, "disk", &total);
+    assert_eq!(code, 0, "{retried}");
+    assert_eq!(retried["attempt_no"], 2);
+    assert_eq!(retried["candidate_count"], 1);
+    let listed = candidates(&vault);
+    assert!(listed["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["candidate_id"] == old_id));
+    assert_eq!(object_bytes(&vault, &first), old_bytes);
+}
+
 fn wait_stopped(child: &mut std::process::Child, checkpoint: &Path) {
     let start = Instant::now();
     loop {
