@@ -50,7 +50,7 @@ python3 synthetic/generate_corpus.py --check
 | 10 | 不是库。缺失路径不会被创建 |
 | 11 | 另一个进程持有写锁 |
 | 12 | 需要恢复：对象缺失或哈希不符、悬空引用、无法读取的 journal、成功回执不是 JSON 对象。单独 `read` 或重放某一个读不出的托管对象也是 12，`object_unreadable`，那条回执不写 `preservation` |
-| 13 | 只读损坏。打开和取消都不重建、不覆盖。`sqlite_header` 表示文件头字节已经读到，但不是 16 字节的 `SQLite format 3\0`；读到的长度不足 16 字节，包括 0 字节文件，也是这个 reason。文件打不开，或读操作本身失败，不是 13，那是 21 的 `vault_unreadable`。同一退出码还有版本检查的只读连接打不开（`sqlite_unreadable`）、`user_version` 读失败（`user_version_unreadable`）、读到的 `user_version` 不是 1 且不高于 1（`unexpected_user_version`）、`schema_version` 那一行读失败（`meta_unreadable`）。读到的 `schema_version` 不是 `1` 是退出码 12；高于 1 的 `user_version` 是退出码 14。行为测试跑过的是坏头和 0 字节文件的打开与取消。其余四个 reason 没有单独触发 |
+| 13 | 只读损坏。打开和取消都不重建、不覆盖。`sqlite_header` 表示文件头字节已经读到，但不是 16 字节的 `SQLite format 3\0`；读到的长度不足 16 字节，包括 0 字节文件，也是这个 reason。文件打不开，或读操作本身失败，不是 13，那是 21 的 `vault_unreadable`。同一退出码还有版本检查的只读连接打不开（`sqlite_unreadable`）、`user_version` 读失败（`user_version_unreadable`）、读到的 `user_version` 不是 1 且不高于 1（`unexpected_user_version`）、`schema_version` 那一行读失败（`meta_unreadable`）。读到的 `schema_version` 不是 `1` 是退出码 12；高于 1 的 `user_version` 是退出码 14。行为测试跑过坏头和 0 字节文件的打开与取消。独立复核还实跑过合法的 16 字节 `SQLite format 3\0` 头：打开返回退出码 13，reason 是 `user_version_unreadable`，文件字节保持不变。`sqlite_unreadable`、`unexpected_user_version`，以及版本检查里只读连接的 `meta_unreadable`，没有单独触发 |
 | 14 | `user_version` 高于 1。打开和取消都不迁移、不覆盖 |
 | 15 | 没有保全。只用于这次命令还没有提交成功，包括新导入、新标记、未提交取消、真实 IO 错误和测试注入。回执带 `preservation=not_preserved`。已经核对过的历史、还没看到来源行的打开，都不用 15 |
 | 16 | 拒绝。载荷冲突、代次不符，或提取取消。`read --out` 的最后一级已经存在时也是 16，reason 是 `output_exists`，包括普通文件、目录和符号链接；悬空符号链接不跟随，链接目标不被创建。不写托管对象、外部原件和已有输出。只在 Linux 上核对 |
