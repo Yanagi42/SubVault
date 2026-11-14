@@ -57,11 +57,36 @@ const RECOGNIZED_INJECTS: &[&str] = &["after_staging_fsync", "object_fsync", "db
 const INIT_STOPS: &[&str] = &[
     "version_set",
     "version_checkpoint",
+    "before_checkpoint",
+    "before_main_verify",
     "before_publish",
+    "before_final_set",
+    "before_sync_vault_db",
+    "before_sync_synthetic_only",
+    "before_sync_writer_lock",
+    "before_sync_objects",
+    "before_sync_staging",
+    "before_sync_journal",
+    "before_sync_control",
+    "before_sync_stage",
     "before_dir_publish",
     "after_publish",
 ];
-const INIT_INJECTS: &[&str] = &["version_checkpoint", "version_verify", "publish_dir_fsync"];
+const INIT_INJECTS: &[&str] = &[
+    "version_checkpoint",
+    "version_verify",
+    "checkpoint_unexpected",
+    "writer_close",
+    "verify_close",
+    "publish_dir_fsync",
+];
+const FORMAT_1_EXCLUDED_STOPS: &[&str] = &[
+    "version_set",
+    "version_checkpoint",
+    "before_publish",
+    "after_publish",
+];
+const FORMAT_1_EXCLUDED_INJECTS: &[&str] = &["version_checkpoint", "version_verify"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InjectAction {
@@ -283,8 +308,16 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     if format == 1 {
         let stop = hooks.stop_at.as_deref();
         let point = hooks.inject_point.as_deref();
-        let stop_ok = matches!(stop, None | Some("before_dir_publish"));
-        let inject_ok = matches!(point, None | Some("publish_dir_fsync"));
+        let stop_ok = match stop {
+            None => true,
+            Some(name) => INIT_STOPS.contains(&name) && !FORMAT_1_EXCLUDED_STOPS.contains(&name),
+        };
+        let inject_ok = match point {
+            None => true,
+            Some(name) => {
+                INIT_INJECTS.contains(&name) && !FORMAT_1_EXCLUDED_INJECTS.contains(&name)
+            }
+        };
         if !stop_ok || !inject_ok {
             return Err(
                 Fail::new(EXIT_USAGE, "Usage", "format_1_has_no_version_hook")
@@ -323,49 +356,30 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
         store::configure(&conn).map_err(|err| db_fail(err, "init_pragma"))?;
         let vault_id = ids::random_id("vlt_").map_err(|err| io_fail(err, "random"))?;
         store::init_schema(&conn, &vault_id).map_err(|err| db_fail(err, "init_schema"))?;
-        if format == 1 {
-            store::checkpoint(&conn).map_err(|err| db_fail(err, "init_checkpoint"))?;
-            return Ok(vault_id);
-        }
-        let format_text = format.to_string();
-        conn.execute_batch(&format!("PRAGMA user_version = {format};"))
-            .map_err(|err| db_fail(err, "init_version"))?;
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('vault_format', ?1)",
-            [&format_text],
-        )
-        .map_err(|err| db_fail(err, "init_version"))?;
-        if format == 3 {
-            conn.execute_batch(store::BODY_DDL)
-                .map_err(|err| db_fail(err, "init_schema"))?;
+        if format != 1 {
+            let format_text = format.to_string();
+            conn.execute_batch(&format!("PRAGMA user_version = {format};"))
+                .map_err(|err| db_fail(err, "init_version"))?;
             conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('body_schema', ?1)",
-                [store::BODY_SCHEMA],
+                "INSERT INTO meta(key, value) VALUES ('vault_format', ?1)",
+                [&format_text],
             )
-            .map_err(|err| db_fail(err, "init_schema"))?;
-            conn.execute_batch(store::FACT_DDL)
+            .map_err(|err| db_fail(err, "init_version"))?;
+            if format == 3 {
+                conn.execute_batch(store::BODY_DDL)
+                    .map_err(|err| db_fail(err, "init_schema"))?;
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('body_schema', ?1)",
+                    [store::BODY_SCHEMA],
+                )
                 .map_err(|err| db_fail(err, "init_schema"))?;
+                conn.execute_batch(store::FACT_DDL)
+                    .map_err(|err| db_fail(err, "init_schema"))?;
+            }
+            hooks.stop("version_set", init_point(false, format))?;
+            hooks.inject("version_checkpoint", init_point(false, format))?;
         }
-        hooks.stop("version_set", init_point(false, format))?;
-        hooks.inject("version_checkpoint", init_point(false, format))?;
-        publish_checkpoint(&conn)?;
-        drop(conn);
-        hooks.stop("version_checkpoint", init_point(false, format))?;
-        let (seen, companion, schema) = visible_main_format(&scratch.join("vault.db"))?;
-        if seen != format as i64
-            || companion.as_deref() != Some(format_text.as_str())
-            || schema.as_deref() != Some("1")
-        {
-            return Err(
-                Fail::new(EXIT_VERSION, "VersionUnsupported", "version_not_in_main_db")
-                    .extra("schema_version_found", json!(seen))
-                    .extra("vault_format_seen", json!(companion))
-                    .extra("created_new_vault", json!(false))
-                    .extra("published", json!(false)),
-            );
-        }
-        hooks.inject("version_verify", init_point(false, format))?;
-        hooks.stop("before_publish", init_point(false, format))?;
+        seal_init_stage(&mut hooks, &scratch, conn, format, &vault_id)?;
         Ok(vault_id)
     })();
     let vault_id = match built {
@@ -433,6 +447,8 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             },
         ));
     }
+    // The directory is already renamed. This error stays on that published path;
+    // it is not the pre-publish receipt and is not reclassified here.
     hooks.stop("after_publish", init_point(true, format))?;
     Ok(init_ready(&vault_id, format, magic))
 }
@@ -564,23 +580,378 @@ fn init_point(published: bool, format: u8) -> Map<String, Value> {
     ])
 }
 
-fn publish_checkpoint(conn: &Connection) -> Result<(), Fail> {
-    match store::checkpoint_for_publish(conn) {
-        Ok(()) => Ok(()),
-        Err(store::CheckpointFailure::Sqlite(err)) => Err(db_fail(err, "init_checkpoint")
-            .extra("created_new_vault", json!(false))
-            .extra("published", json!(false))),
-        Err(store::CheckpointFailure::Busy(busy)) => {
-            Err(
-                Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "checkpoint_busy")
-                    .extra("during", json!("init_checkpoint"))
-                    .extra("checkpoint_busy", json!(busy))
-                    .extra("injected", json!(false))
-                    .extra("created_new_vault", json!(false))
-                    .extra("published", json!(false)),
-            )
+fn unpublished(fail: Fail) -> Fail {
+    fail.extra("created_new_vault", json!(false))
+        .extra("published", json!(false))
+}
+
+fn seal_init_stage(
+    hooks: &mut HookRun,
+    scratch: &Path,
+    conn: Connection,
+    format: u8,
+    vault_id: &str,
+) -> Result<(), Fail> {
+    let mode = match store::read_journal_mode(&conn) {
+        store::SqlAnswer::Value(mode) if mode == "wal" => mode,
+        other => return Err(journal_mode_fail(other)),
+    };
+    hooks.stop("before_checkpoint", init_point(false, format))?;
+    if let Some(fail) = injected_checkpoint_row(hooks, format)? {
+        return Err(fail);
+    }
+    let row = match store::read_truncate_checkpoint(&conn) {
+        store::SqlAnswer::Value(row) => row,
+        other => return Err(checkpoint_read_fail(other)),
+    };
+    match store::judge_truncate_checkpoint(&mode, row) {
+        store::TruncateVerdict::Complete => {}
+        store::TruncateVerdict::Busy(row) => {
+            return Err(checkpoint_row_fail(row, "checkpoint_busy"))
+        }
+        store::TruncateVerdict::Abnormal(row) => {
+            return Err(checkpoint_row_fail(row, "checkpoint_status_unexpected"));
         }
     }
+    hooks
+        .inject("writer_close", init_point(false, format))
+        .map_err(|fail| fail.extra("during", json!("writer_close")))?;
+    close_checked(conn, "writer_close")?;
+
+    hooks.stop("before_main_verify", init_point(false, format))?;
+    if format != 1 {
+        hooks.stop("version_checkpoint", init_point(false, format))?;
+    }
+    let verify = open_immutable(&scratch.join("vault.db"))?;
+    let verdict = read_main_meta(&verify).and_then(|main| compare_main(format, vault_id, &main));
+    if let Err(fail) = verdict {
+        return Err(prefer_verify_error(verify, fail));
+    }
+    hooks
+        .inject("verify_close", init_point(false, format))
+        .map_err(|fail| fail.extra("during", json!("verify_close")))?;
+    close_checked(verify, "verify_close")?;
+    if format != 1 {
+        hooks.inject("version_verify", init_point(false, format))?;
+        hooks.stop("before_publish", init_point(false, format))?;
+    }
+    hooks.stop("before_final_set", init_point(false, format))?;
+    require_final_set(scratch)?;
+    for (stop, during, name) in [
+        ("before_sync_vault_db", "sync_vault_db", "vault.db"),
+        (
+            "before_sync_synthetic_only",
+            "sync_synthetic_only",
+            "SYNTHETIC_ONLY",
+        ),
+        ("before_sync_writer_lock", "sync_writer_lock", "writer.lock"),
+    ] {
+        hooks.stop(stop, init_point(false, format))?;
+        sync_regular_file(&scratch.join(name), during)?;
+    }
+    for (stop, during, name) in [
+        ("before_sync_objects", "sync_objects", "objects"),
+        ("before_sync_staging", "sync_staging", "staging"),
+        ("before_sync_journal", "sync_journal", "journal"),
+        ("before_sync_control", "sync_control", "control"),
+    ] {
+        hooks.stop(stop, init_point(false, format))?;
+        sync_directory(&scratch.join(name), during)?;
+    }
+    hooks.stop("before_sync_stage", init_point(false, format))?;
+    sync_directory(scratch, "sync_stage")
+}
+
+fn journal_mode_fail(answer: store::SqlAnswer<String>) -> Fail {
+    match answer {
+        store::SqlAnswer::Sqlite(err) => unpublished(db_fail(err, "journal_mode")),
+        store::SqlAnswer::Shape(shape) => unpublished(Fail::new(
+            EXIT_NOT_PRESERVED,
+            "NotPreserved",
+            "journal_mode_status_unexpected",
+        ))
+        .extra("during", json!("journal_mode"))
+        .extra("injected", json!(false))
+        .extra("journal_mode_shape", json!(shape)),
+        store::SqlAnswer::Value(mode) => unpublished(Fail::new(
+            EXIT_NOT_PRESERVED,
+            "NotPreserved",
+            "journal_mode_not_wal",
+        ))
+        .extra("during", json!("journal_mode"))
+        .extra("injected", json!(false))
+        .extra("journal_mode", json!(mode)),
+    }
+}
+
+fn checkpoint_row_fail(row: store::CheckpointRow, reason: &'static str) -> Fail {
+    unpublished(Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", reason))
+        .extra("during", json!("init_checkpoint"))
+        .extra("injected", json!(false))
+        .extra("checkpoint_busy", json!(row.busy))
+        .extra("checkpoint_log", json!(row.log))
+        .extra("checkpoint_checkpointed", json!(row.checkpointed))
+}
+
+fn checkpoint_read_fail(answer: store::SqlAnswer<store::CheckpointRow>) -> Fail {
+    match answer {
+        store::SqlAnswer::Sqlite(err) => unpublished(db_fail(err, "init_checkpoint")),
+        store::SqlAnswer::Shape(shape) => unpublished(Fail::new(
+            EXIT_NOT_PRESERVED,
+            "NotPreserved",
+            "checkpoint_status_unexpected",
+        ))
+        .extra("during", json!("init_checkpoint"))
+        .extra("injected", json!(false))
+        .extra("checkpoint_shape", json!(shape)),
+        store::SqlAnswer::Value(row) => checkpoint_row_fail(row, "checkpoint_status_unexpected"),
+    }
+}
+
+/// The row is chosen here so the judge runs on a non-success TRUNCATE shape.
+/// It is not a row SQLite returned.
+fn injected_checkpoint_row(hooks: &mut HookRun, format: u8) -> Result<Option<Fail>, Fail> {
+    if !hooks.note_inject("checkpoint_unexpected", init_point(false, format))? {
+        return Ok(None);
+    }
+    let row = store::CheckpointRow {
+        busy: 0,
+        log: 1,
+        checkpointed: 0,
+    };
+    let fail = match store::judge_truncate_checkpoint("wal", row) {
+        store::TruncateVerdict::Abnormal(row) => {
+            checkpoint_row_fail(row, "checkpoint_status_unexpected")
+        }
+        store::TruncateVerdict::Busy(row) => checkpoint_row_fail(row, "checkpoint_busy"),
+        store::TruncateVerdict::Complete => {
+            return Err(Fail::new(
+                EXIT_USAGE,
+                "Usage",
+                "checkpoint_injection_not_abnormal",
+            ));
+        }
+    };
+    Ok(Some(
+        fail.extra("injected", json!(true))
+            .extra("inject_point", json!("checkpoint_unexpected"))
+            .extra(
+                "note",
+                json!("injected checkpoint status row, not a return from SQLite"),
+            ),
+    ))
+}
+
+/// `Connection::close` reports the first `sqlite3_close` result. On failure the
+/// connection is returned and dropped; that later drop is not a second success.
+fn close_checked(conn: Connection, during: &'static str) -> Result<(), Fail> {
+    match conn.close() {
+        Ok(()) => Ok(()),
+        Err((conn, err)) => {
+            drop(conn);
+            Err(unpublished(db_fail(err, during)))
+        }
+    }
+}
+
+fn prefer_verify_error(conn: Connection, main: Fail) -> Fail {
+    match conn.close() {
+        Ok(()) => main,
+        Err((conn, err)) => {
+            drop(conn);
+            main.extra("verify_close_error", json!(err.to_string()))
+        }
+    }
+}
+
+fn open_immutable(db: &Path) -> Result<Connection, Fail> {
+    let uri = readonly_uri(db)?;
+    Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|_| {
+        unpublished(Fail::new(
+            EXIT_DAMAGED,
+            "ReadOnlyDamaged",
+            "sqlite_unreadable",
+        ))
+        .extra("during", json!("init_verify"))
+    })
+}
+
+struct MainMeta {
+    version: i64,
+    values: Vec<(&'static str, Option<String>)>,
+}
+
+fn read_main_meta(conn: &Connection) -> Result<MainMeta, Fail> {
+    let version =
+        store::user_version(conn).map_err(|_| verify_damaged("user_version_unreadable"))?;
+    let mut values = Vec::new();
+    for key in [
+        "schema_version",
+        "vault_format",
+        "vault_id",
+        "synthetic_only",
+        "disposable",
+        "protection",
+        "primary_input",
+        "slice",
+        "body_schema",
+    ] {
+        let value = store::meta(conn, key).map_err(|_| verify_damaged("meta_unreadable"))?;
+        values.push((key, value));
+    }
+    Ok(MainMeta { version, values })
+}
+
+fn verify_damaged(reason: &'static str) -> Fail {
+    unpublished(Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", reason))
+        .extra("during", json!("init_verify"))
+}
+
+fn meta_value<'a>(values: &'a [(&'static str, Option<String>)], key: &str) -> Option<&'a str> {
+    values
+        .iter()
+        .find(|(name, _)| *name == key)
+        .and_then(|(_, value)| value.as_deref())
+}
+
+fn compare_main(format: u8, vault_id: &str, main: &MainMeta) -> Result<(), Fail> {
+    let schema = meta_value(&main.values, "schema_version");
+    let companion = meta_value(&main.values, "vault_format");
+    let format_text = format.to_string();
+    let format_ok = format == 1 || companion == Some(format_text.as_str());
+    if main.version != i64::from(format) || schema != Some("1") || !format_ok {
+        return Err(unpublished(Fail::new(
+            EXIT_VERSION,
+            "VersionUnsupported",
+            "version_not_in_main_db",
+        ))
+        .extra("during", json!("init_verify"))
+        .extra("schema_version_found", json!(main.version))
+        .extra("vault_format_seen", json!(companion)));
+    }
+    for (key, expected) in [
+        ("vault_id", vault_id),
+        ("synthetic_only", "true"),
+        ("disposable", "true"),
+        ("protection", "unanswered_synthetic_plaintext"),
+        ("primary_input", "unanswered"),
+        ("slice", "T1"),
+    ] {
+        let seen = meta_value(&main.values, key);
+        if seen == Some(expected) {
+            continue;
+        }
+        let reason = if key == "vault_id" {
+            "vault_id_mismatch"
+        } else {
+            "meta_mismatch"
+        };
+        return Err(
+            unpublished(Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", reason))
+                .extra("during", json!("init_verify"))
+                .extra("meta_key", json!(key))
+                .extra("meta_seen", json!(seen)),
+        );
+    }
+    if format == 3 {
+        let seen = meta_value(&main.values, "body_schema");
+        if seen != Some(store::BODY_SCHEMA) {
+            return Err(unpublished(Fail::new(
+                EXIT_NOT_PRESERVED,
+                "NotPreserved",
+                "body_schema_mismatch",
+            ))
+            .extra("during", json!("init_verify"))
+            .extra("meta_key", json!("body_schema"))
+            .extra("meta_seen", json!(seen)));
+        }
+    }
+    Ok(())
+}
+
+fn require_final_set(scratch: &Path) -> Result<(), Fail> {
+    let mut seen = Vec::new();
+    for entry in fs::read_dir(scratch).map_err(|err| unpublished(io_fail(err, "final_set")))? {
+        let entry = entry.map_err(|err| unpublished(io_fail(err, "final_set")))?;
+        seen.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    seen.sort();
+    let expected = [
+        "SYNTHETIC_ONLY",
+        "control",
+        "journal",
+        "objects",
+        "staging",
+        "vault.db",
+        "writer.lock",
+    ];
+    let mut unexpected: Vec<String> = seen
+        .iter()
+        .filter(|name| !expected.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    let missing: Vec<String> = expected
+        .iter()
+        .filter(|name| !seen.iter().any(|got| got == *name))
+        .map(|name| (*name).to_string())
+        .collect();
+    for name in ["SYNTHETIC_ONLY", "vault.db", "writer.lock"] {
+        if missing.iter().any(|item| item == name) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(scratch.join(name))
+            .map_err(|err| unpublished(io_fail(err, "final_set")))?;
+        if !meta.file_type().is_file() {
+            unexpected.push(format!("{name}:not_a_file"));
+        }
+    }
+    for name in ["objects", "staging", "journal", "control"] {
+        if missing.iter().any(|item| item == name) {
+            continue;
+        }
+        let path = scratch.join(name);
+        let meta =
+            fs::symlink_metadata(&path).map_err(|err| unpublished(io_fail(err, "final_set")))?;
+        if !meta.file_type().is_dir() {
+            unexpected.push(format!("{name}:not_a_directory"));
+            continue;
+        }
+        let mut nested = Vec::new();
+        for entry in fs::read_dir(&path).map_err(|err| unpublished(io_fail(err, "final_set")))? {
+            let entry = entry.map_err(|err| unpublished(io_fail(err, "final_set")))?;
+            nested.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        nested.sort();
+        for child in nested {
+            unexpected.push(format!("{name}/{child}"));
+        }
+    }
+    if unexpected.is_empty() && missing.is_empty() {
+        return Ok(());
+    }
+    Err(unpublished(Fail::new(
+        EXIT_NOT_PRESERVED,
+        "NotPreserved",
+        "stage_set_mismatch",
+    ))
+    .extra("during", json!("final_set"))
+    .extra("injected", json!(false))
+    .extra("unexpected", json!(unexpected))
+    .extra("missing", json!(missing)))
+}
+
+fn sync_regular_file(path: &Path, during: &'static str) -> Result<(), Fail> {
+    let file = File::open(path).map_err(|err| unpublished(io_fail(err, during)))?;
+    file.sync_all()
+        .map_err(|err| unpublished(io_fail(err, during)))
+}
+
+fn sync_directory(path: &Path, during: &'static str) -> Result<(), Fail> {
+    fsutil::fsync_dir(path).map_err(|err| unpublished(io_fail(err, during)))
 }
 
 pub fn open_vault(path: &Path) -> Report {

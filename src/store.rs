@@ -231,21 +231,120 @@ pub fn checkpoint(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub enum CheckpointFailure {
-    Sqlite(rusqlite::Error),
-    Busy(i64),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointRow {
+    pub busy: i64,
+    pub log: i64,
+    pub checkpointed: i64,
 }
 
-/// Truncate the WAL into the main database. A busy result is an error.
-/// The caller must not publish when this returns Err.
-pub fn checkpoint_for_publish(conn: &Connection) -> Result<(), CheckpointFailure> {
-    let busy: i64 = conn
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
-        .map_err(CheckpointFailure::Sqlite)?;
-    if busy != 0 {
-        return Err(CheckpointFailure::Busy(busy));
+#[derive(Debug)]
+pub enum SqlAnswer<T> {
+    Value(T),
+    Sqlite(rusqlite::Error),
+    Shape(&'static str),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TruncateVerdict {
+    Complete,
+    Busy(CheckpointRow),
+    Abnormal(CheckpointRow),
+}
+
+/// One row from bundled SQLite 3.46 `PRAGMA journal_mode`.
+/// The mode name is the lowercase string from `sqlite3JournalModename`.
+pub fn read_journal_mode(conn: &Connection) -> SqlAnswer<String> {
+    let mut stmt = match conn.prepare("PRAGMA journal_mode") {
+        Ok(stmt) => stmt,
+        Err(err) => return SqlAnswer::Sqlite(err),
+    };
+    if stmt.column_count() != 1 {
+        return SqlAnswer::Shape("column_count");
     }
-    Ok(())
+    let mut rows = match stmt.query([]) {
+        Ok(rows) => rows,
+        Err(err) => return SqlAnswer::Sqlite(err),
+    };
+    let mode = match rows.next() {
+        Ok(Some(row)) => match row.get(0) {
+            Ok(mode) => mode,
+            Err(_) => return SqlAnswer::Shape("mode"),
+        },
+        Ok(None) => return SqlAnswer::Shape("no_row"),
+        Err(err) => return SqlAnswer::Sqlite(err),
+    };
+    match rows.next() {
+        Ok(None) => SqlAnswer::Value(mode),
+        Ok(Some(_)) => SqlAnswer::Shape("extra_row"),
+        Err(err) => SqlAnswer::Sqlite(err),
+    }
+}
+
+/// One `PRAGMA wal_checkpoint(TRUNCATE)` row: busy, log, checkpointed.
+/// `SQLITE_BUSY` is a row with busy=1, not a statement error.
+pub fn read_truncate_checkpoint(conn: &Connection) -> SqlAnswer<CheckpointRow> {
+    let mut stmt = match conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)") {
+        Ok(stmt) => stmt,
+        Err(err) => return SqlAnswer::Sqlite(err),
+    };
+    if stmt.column_count() != 3 {
+        return SqlAnswer::Shape("column_count");
+    }
+    let mut rows = match stmt.query([]) {
+        Ok(rows) => rows,
+        Err(err) => return SqlAnswer::Sqlite(err),
+    };
+    let row = match rows.next() {
+        Ok(Some(row)) => row,
+        Ok(None) => return SqlAnswer::Shape("no_row"),
+        Err(err) => return SqlAnswer::Sqlite(err),
+    };
+    let busy = match row.get(0) {
+        Ok(value) => value,
+        Err(_) => return SqlAnswer::Shape("busy"),
+    };
+    let log = match row.get(1) {
+        Ok(value) => value,
+        Err(_) => return SqlAnswer::Shape("log"),
+    };
+    let checkpointed = match row.get(2) {
+        Ok(value) => value,
+        Err(_) => return SqlAnswer::Shape("checkpointed"),
+    };
+    let row = CheckpointRow {
+        busy,
+        log,
+        checkpointed,
+    };
+    match rows.next() {
+        Ok(None) => SqlAnswer::Value(row),
+        Ok(Some(_)) => SqlAnswer::Shape("extra_row"),
+        Err(err) => SqlAnswer::Sqlite(err),
+    }
+}
+
+/// Judge a TRUNCATE row for the journal mode that was actually read back.
+///
+/// WAL success is busy=0, log=0, checkpointed=0: SQLite's TRUNCATE note says
+/// both frame counts are zero because the log was truncated to zero bytes.
+/// Non-WAL success is busy=0, log=-1, checkpointed=-1. All-zero is not success
+/// in that mode. busy!=0 is blocked even when the other columns are not zero.
+/// A statement that returned `Ok` is not itself a completed checkpoint.
+pub fn judge_truncate_checkpoint(journal_mode: &str, row: CheckpointRow) -> TruncateVerdict {
+    if row.busy != 0 {
+        return TruncateVerdict::Busy(row);
+    }
+    if journal_mode == "wal" {
+        if row.log == 0 && row.checkpointed == 0 {
+            return TruncateVerdict::Complete;
+        }
+        return TruncateVerdict::Abnormal(row);
+    }
+    if row.log == -1 && row.checkpointed == -1 {
+        return TruncateVerdict::Complete;
+    }
+    TruncateVerdict::Abnormal(row)
 }
 
 fn map_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
@@ -456,4 +555,108 @@ pub fn update_marker(
         "UPDATE sources SET user_marker = ?1 WHERE source_id = ?2",
         params![marker, source_id],
     )
+}
+
+#[cfg(test)]
+mod checkpoint_contract {
+    use super::{
+        judge_truncate_checkpoint, read_journal_mode, read_truncate_checkpoint, CheckpointRow,
+        SqlAnswer, TruncateVerdict,
+    };
+    use rusqlite::Connection;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn row(busy: i64, log: i64, checkpointed: i64) -> CheckpointRow {
+        CheckpointRow {
+            busy,
+            log,
+            checkpointed,
+        }
+    }
+
+    #[test]
+    fn truncate_rows_follow_the_bundled_sqlite_contract() {
+        // Static rows from sqlite 3.46 OP_Checkpoint / wal_checkpoint_v2.
+        // These are not a live fault and not an injection.
+        assert_eq!(
+            judge_truncate_checkpoint("wal", row(0, 0, 0)),
+            TruncateVerdict::Complete
+        );
+        assert_eq!(
+            judge_truncate_checkpoint("wal", row(1, 4, 2)),
+            TruncateVerdict::Busy(row(1, 4, 2))
+        );
+        assert_eq!(
+            judge_truncate_checkpoint("wal", row(0, 4, 4)),
+            TruncateVerdict::Abnormal(row(0, 4, 4))
+        );
+        assert_eq!(
+            judge_truncate_checkpoint("delete", row(0, -1, -1)),
+            TruncateVerdict::Complete
+        );
+        assert_eq!(
+            judge_truncate_checkpoint("delete", row(0, 0, 0)),
+            TruncateVerdict::Abnormal(row(0, 0, 0))
+        );
+        assert_eq!(
+            judge_truncate_checkpoint("WAL", row(0, 0, 0)),
+            TruncateVerdict::Abnormal(row(0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn bundled_sqlite_returns_wal_truncate_zeros_and_non_wal_negatives() {
+        // Live answers from the bundled library. Not a power loss and not an injection.
+        let dir = std::env::temp_dir().join(format!(
+            "subvault-checkpoint-contract-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("wal.db");
+        let delete_path = dir.join("delete.db");
+
+        let wal = Connection::open(&wal_path).unwrap();
+        wal.pragma_update(None, "journal_mode", "WAL").unwrap();
+        wal.busy_timeout(std::time::Duration::from_millis(0))
+            .unwrap();
+        match read_journal_mode(&wal) {
+            SqlAnswer::Value(mode) => assert_eq!(mode, "wal"),
+            other => panic!("journal_mode read was not the wal string: {other:?}"),
+        }
+        wal.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        match read_truncate_checkpoint(&wal) {
+            SqlAnswer::Value(got) => assert_eq!(got, row(0, 0, 0)),
+            other => panic!("WAL TRUNCATE did not return one complete row: {other:?}"),
+        }
+        wal.close().unwrap();
+        assert!(
+            !companion(&wal_path, "-wal"),
+            "writer close left a wal file"
+        );
+        assert!(
+            !companion(&wal_path, "-shm"),
+            "writer close left an shm file"
+        );
+
+        let plain = Connection::open(&delete_path).unwrap();
+        match read_journal_mode(&plain) {
+            SqlAnswer::Value(mode) => assert_eq!(mode, "delete"),
+            other => panic!("default journal_mode was not delete: {other:?}"),
+        }
+        match read_truncate_checkpoint(&plain) {
+            SqlAnswer::Value(got) => assert_eq!(got, row(0, -1, -1)),
+            other => panic!("non-WAL TRUNCATE did not return 0,-1,-1: {other:?}"),
+        }
+        plain.close().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn companion(db: &PathBuf, suffix: &str) -> bool {
+        let mut name = db.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name).exists()
+    }
 }
