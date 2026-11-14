@@ -10,6 +10,8 @@ mod lockfile;
 mod model;
 mod store;
 
+pub use model::EXIT_UNCERTAIN;
+
 pub fn execute(args: Vec<String>) -> model::Report {
     cli::execute(args)
 }
