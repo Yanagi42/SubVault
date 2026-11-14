@@ -6,7 +6,7 @@ use serde_json::{json, Map, Value};
 
 use crate::fsutil::atomic_write;
 use crate::ids::{is_command_id, is_lower_hex, is_prefixed_id};
-use crate::model::{self, io_fail, Fail, EXIT_NOT_PRESERVED};
+use crate::model::{io_fail, unseen_db, Fail, EXIT_NOT_PRESERVED};
 use crate::store;
 
 // One field list is the journal codec. Unknown JSON keys are ignored.
@@ -195,22 +195,52 @@ pub(crate) struct Scan {
     pub valid: Vec<Journal>,
     pub invalid: Vec<String>,
     pub unexpected: Vec<String>,
+    /// Directory listing failed. `valid` stays empty so callers do not invent
+    /// incomplete commands from a listing they do not have.
+    pub unlisted: Option<String>,
 }
 
-pub(crate) fn scan(root: &Path) -> Result<Scan, Fail> {
+pub(crate) struct SideNotice {
+    pub code: &'static str,
+    pub during: &'static str,
+    pub os_error: String,
+}
+
+pub(crate) struct Reconcile {
+    pub misses: Vec<LabelMiss>,
+    pub journal_unlisted: Option<String>,
+}
+
+pub(crate) fn scan(root: &Path) -> Scan {
     let mut scan = Scan {
         valid: Vec::new(),
         invalid: Vec::new(),
         unexpected: Vec::new(),
+        unlisted: None,
     };
     let dir = root.join("journal");
     if !dir.exists() {
-        return Ok(scan);
+        return scan;
     }
     let mut names = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|err| io_fail(err, "read_journal"))? {
-        let entry = entry.map_err(|err| io_fail(err, "read_journal"))?;
-        names.push(entry.file_name().to_string_lossy().to_string());
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            scan.unlisted = Some(err.to_string());
+            return scan;
+        }
+    };
+    for entry in entries {
+        match entry {
+            Ok(entry) => names.push(entry.file_name().to_string_lossy().to_string()),
+            Err(err) => {
+                scan.unlisted = Some(err.to_string());
+                scan.valid.clear();
+                scan.invalid.clear();
+                scan.unexpected.clear();
+                return scan;
+            }
+        }
     }
     names.sort();
     for name in names {
@@ -231,7 +261,7 @@ pub(crate) fn scan(root: &Path) -> Result<Scan, Fail> {
             _ => scan.invalid.push(name),
         }
     }
-    Ok(scan)
+    scan
 }
 
 pub(crate) struct LabelMiss {
@@ -243,14 +273,21 @@ pub(crate) struct LabelMiss {
 /// Rewrite a journal label only when that command row is already committed.
 /// A failed rewrite is returned to the caller. It is not a verdict that the
 /// committed row or its hosted bytes were lost.
-pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<Vec<LabelMiss>, Fail> {
+pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<Reconcile, Fail> {
+    let found = scan(root);
+    if found.unlisted.is_some() {
+        return Ok(Reconcile {
+            misses: Vec::new(),
+            journal_unlisted: found.unlisted,
+        });
+    }
     let mut missed = Vec::new();
-    for journal in scan(root)?.valid {
+    for journal in found.valid {
         if journal.state == "committed" {
             continue;
         }
         if store::command(conn, &journal.command_id)
-            .map_err(|err| model::db_fail(err, "reconcile"))?
+            .map_err(|err| unseen_db(err, "reconcile"))?
             .is_some()
         {
             let mut journal = journal;
@@ -275,41 +312,113 @@ pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<Vec<LabelMiss>
             }
         }
     }
-    Ok(missed)
+    Ok(Reconcile {
+        misses: missed,
+        journal_unlisted: None,
+    })
 }
 
-pub(crate) fn clean_temps(root: &Path) -> Result<(), Fail> {
-    let staging = root.join("staging");
-    if staging.is_dir() {
-        for entry in fs::read_dir(&staging).map_err(|err| io_fail(err, "read_staging"))? {
-            let entry = entry.map_err(|err| io_fail(err, "read_staging"))?;
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path).map_err(|err| io_fail(err, "staging_meta"))?;
-            if meta.is_file() || meta.file_type().is_symlink() {
-                fs::remove_file(&path).map_err(|err| io_fail(err, "remove_staging"))?;
-            }
-        }
-    }
-    let journal = root.join("journal");
-    if journal.is_dir() {
-        for entry in fs::read_dir(&journal).map_err(|err| io_fail(err, "read_journal"))? {
-            let entry = entry.map_err(|err| io_fail(err, "read_journal"))?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".json.tmp") || (name.starts_with('.') && name.ends_with(".tmp")) {
-                let meta =
-                    fs::symlink_metadata(entry.path()).map_err(|err| io_fail(err, "tmp_meta"))?;
-                if meta.is_file() || meta.file_type().is_symlink() {
-                    fs::remove_file(entry.path()).map_err(|err| io_fail(err, "remove_tmp"))?;
-                }
-            }
-        }
-    }
-    Ok(())
+pub(crate) fn clean_temps(root: &Path) -> Vec<SideNotice> {
+    let mut notices = Vec::new();
+    collect_dir(
+        &root.join("staging"),
+        &mut notices,
+        "staging_unlisted",
+        "read_staging",
+        true,
+    );
+    collect_dir(
+        &root.join("journal"),
+        &mut notices,
+        "journal_unlisted",
+        "read_journal",
+        false,
+    );
+    notices
 }
 
-pub(crate) fn count_staging(root: &Path) -> i64 {
-    let Ok(rd) = fs::read_dir(root.join("staging")) else {
-        return 0;
+fn collect_dir(
+    dir: &Path,
+    notices: &mut Vec<SideNotice>,
+    list_code: &'static str,
+    list_during: &'static str,
+    every_file: bool,
+) {
+    if !dir.is_dir() {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            notices.push(SideNotice {
+                code: list_code,
+                during: list_during,
+                os_error: err.to_string(),
+            });
+            return;
+        }
     };
-    rd.filter_map(|entry| entry.ok()).count() as i64
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                notices.push(SideNotice {
+                    code: list_code,
+                    during: list_during,
+                    os_error: err.to_string(),
+                });
+                return;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let temporary =
+            name.ends_with(".json.tmp") || (name.starts_with('.') && name.ends_with(".tmp"));
+        if !every_file && !temporary {
+            continue;
+        }
+        let meta = match fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            Err(err) => {
+                notices.push(SideNotice {
+                    code: if every_file {
+                        "staging_unreadable"
+                    } else {
+                        "journal_tmp_unreadable"
+                    },
+                    during: if every_file {
+                        "staging_meta"
+                    } else {
+                        "tmp_meta"
+                    },
+                    os_error: err.to_string(),
+                });
+                continue;
+            }
+        };
+        if meta.is_file() || meta.file_type().is_symlink() {
+            if let Err(err) = fs::remove_file(entry.path()) {
+                notices.push(SideNotice {
+                    code: if every_file {
+                        "staging_not_removed"
+                    } else {
+                        "journal_tmp_not_removed"
+                    },
+                    during: if every_file {
+                        "remove_staging"
+                    } else {
+                        "remove_tmp"
+                    },
+                    os_error: err.to_string(),
+                });
+            }
+        }
+    }
+}
+
+pub(crate) fn count_staging(root: &Path) -> Option<i64> {
+    match fs::read_dir(root.join("staging")) {
+        Ok(rd) => Some(rd.filter_map(|entry| entry.ok()).count() as i64),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(_) => None,
+    }
 }

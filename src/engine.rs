@@ -21,11 +21,11 @@ use crate::journal::{
 };
 use crate::lockfile::{self, sigstop, VaultLock, LOCK_TEXT};
 use crate::model::{
-    capabilities, db_fail, honesty, io_fail, platform_limits, Fail, Report, EXIT_DAMAGED,
-    EXIT_FAULT_MISSED, EXIT_INTEGRITY, EXIT_LOCKED, EXIT_NOT_PRESERVED, EXIT_NOT_SYNTHETIC,
-    EXIT_NOT_VAULT, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_STOP_MISSED, EXIT_UNCERTAIN,
-    EXIT_UNSUPPORTED_FS, EXIT_USAGE, EXIT_VERSION, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE,
-    PRESERVED, VAULT_BANNER,
+    capabilities, db_fail, honesty, io_fail, platform_limits, unseen_db, unseen_io, Fail, Report,
+    EXIT_DAMAGED, EXIT_FAULT_MISSED, EXIT_INTEGRITY, EXIT_LOCKED, EXIT_NOT_PRESERVED,
+    EXIT_NOT_SYNTHETIC, EXIT_NOT_VAULT, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_STOP_MISSED,
+    EXIT_UNCERTAIN, EXIT_UNSUPPORTED_FS, EXIT_USAGE, EXIT_VERSION, NOT_ARRANGED, NOT_PRESERVED,
+    NOT_SEARCHABLE, PRESERVED, VAULT_BANNER,
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
@@ -202,7 +202,7 @@ pub fn version_report() -> Report {
 pub fn init_vault(path: &Path) -> Report {
     match init_inner(path) {
         Ok(report) => report,
-        Err(fail) => fail.into_report(),
+        Err(fail) => note_uncommitted(fail).into_report(),
     }
 }
 
@@ -285,24 +285,39 @@ pub fn recover_vault(path: &Path) -> Report {
 fn reopen(path: &Path) -> Report {
     match reopen_inner(path) {
         Ok(report) => report,
-        Err(fail) => fail.into_report(),
+        Err(fail) => demote_unscoped(fail).into_report(),
     }
 }
 
 fn reopen_inner(path: &Path) -> Result<Report, Fail> {
     let session = open_session(path)?;
-    journal::clean_temps(&session.root)?;
-    let label_misses = journal::reconcile(&session.root, &session.conn)?;
+    let notices = journal::clean_temps(&session.root);
+    let reconciled = journal::reconcile(&session.root, &session.conn)?;
     let mut inspection = crate::inspect::report(&session.root, &session.conn, session.magic)?;
-    apply_label_misses(&mut inspection, &label_misses);
-    store::checkpoint(&session.conn).map_err(|err| db_fail(err, "checkpoint"))?;
+    for notice in notices {
+        attach_notice(
+            &mut inspection,
+            notice.code,
+            notice.during,
+            &notice.os_error,
+        );
+    }
+    apply_label_misses(&mut inspection, &reconciled.misses);
+    if let Err(err) = store::checkpoint(&session.conn) {
+        attach_notice(
+            &mut inspection,
+            "checkpoint_failed",
+            "checkpoint",
+            &err.to_string(),
+        );
+    }
     Ok(inspection)
 }
 
 pub fn hold_vault(path: &Path, hooks: Hooks) -> Report {
     match hold_inner(path, hooks) {
         Ok(report) => report,
-        Err(fail) => fail.into_report(),
+        Err(fail) => demote_unscoped(fail).into_report(),
     }
 }
 
@@ -345,7 +360,7 @@ pub fn import_file(req: ImportRequest) -> Report {
             code: EXIT_OK,
             body,
         },
-        Err(fail) => fail.into_report(),
+        Err(fail) => note_uncommitted(fail).into_report(),
     }
 }
 
@@ -369,13 +384,21 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
         }
     }
     let session = open_session(&req.vault)?;
-    let label_misses = journal::reconcile(&session.root, &session.conn)?;
+    let reconciled = journal::reconcile(&session.root, &session.conn)?;
+    let journal_unlisted = reconciled.journal_unlisted.clone();
+    let label_misses = reconciled.misses;
     if let Some(existing) = store::command(&session.conn, &req.command_id)
-        .map_err(|err| db_fail(err, "command_lookup"))?
+        .map_err(|err| unseen_db(err, "command_lookup"))?
     {
         return match replay_committed(&session, &req, &existing) {
-            Ok(body) => Ok(stamp_label_misses_value(body, &label_misses)),
-            Err(fail) => Err(stamp_label_misses_fail(fail, &label_misses)),
+            Ok(body) => Ok(stamp_journal_list(
+                stamp_label_misses_value(body, &label_misses),
+                journal_unlisted.as_deref(),
+            )),
+            Err(fail) => Err(stamp_journal_list_fail(
+                stamp_label_misses_fail(fail, &label_misses),
+                journal_unlisted.as_deref(),
+            )),
         };
     }
     let meta = require_new_source(&req.source)?;
@@ -435,7 +458,7 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
         meta.len(),
     );
     match result {
-        Ok(value) => Ok(value),
+        Ok(value) => Ok(stamp_journal_list(value, journal_unlisted.as_deref())),
         Err(fail) => Err(unwind(&session.root, &mut journal, &phase, fail)?),
     }
 }
@@ -673,7 +696,7 @@ pub fn set_marker(req: MarkerRequest) -> Report {
             code: EXIT_OK,
             body,
         },
-        Err(fail) => fail.into_report(),
+        Err(fail) => note_uncommitted(fail).into_report(),
     }
 }
 
@@ -694,7 +717,7 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
     let session = open_session(&req.vault)?;
     let fingerprint = fingerprint(&["marker", &req.source_id, &req.value]);
     if let Some(existing) = store::command(&session.conn, &req.command_id)
-        .map_err(|err| db_fail(err, "command_lookup"))?
+        .map_err(|err| unseen_db(err, "command_lookup"))?
     {
         if req.hooks.inject_point.is_some() || req.hooks.stop_at.is_some() {
             return Err(Fail::new(
@@ -707,7 +730,7 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
             .extra("command_id", json!(req.command_id)));
         }
         let source = store::source_by_id(&session.conn, &req.source_id)
-            .map_err(|err| db_fail(err, "source_lookup"))?
+            .map_err(|err| unseen_db(err, "source_lookup"))?
             .ok_or_else(|| {
                 Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_row_missing")
                     .extra("new_effect", json!(false))
@@ -719,7 +742,7 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
         return already_committed(&existing);
     }
     let source = store::source_by_id(&session.conn, &req.source_id)
-        .map_err(|err| db_fail(err, "source_lookup"))?
+        .map_err(|err| unseen_db(err, "source_lookup"))?
         .ok_or_else(|| {
             Fail::new(EXIT_REJECTED, "Rejected", "unknown_source")
                 .extra("source_id", json!(req.source_id))
@@ -810,7 +833,7 @@ pub fn read_source(req: ReadRequest) -> Report {
             code: EXIT_OK,
             body,
         },
-        Err(fail) => fail.into_report(),
+        Err(fail) => demote_unscoped(fail).into_report(),
     }
 }
 
@@ -820,7 +843,7 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
     }
     let session = open_session(&req.vault)?;
     let source = store::source_by_id(&session.conn, &req.source_id)
-        .map_err(|err| db_fail(err, "source_lookup"))?
+        .map_err(|err| unseen_db(err, "source_lookup"))?
         .ok_or_else(|| Fail::new(EXIT_REJECTED, "Rejected", "unknown_source"))?;
     let object = lookup_object(&session, &source.object_id)?;
     let facts = facts::object_facts(
@@ -877,7 +900,20 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
             ));
         }
     }
-    fs::copy(&file_path, &req.out).map_err(|err| io_fail(err, "read_copy"))?;
+    if let Err(err) = fs::copy(&file_path, &req.out) {
+        let _ = fs::remove_file(&req.out);
+        return Err(Fail::new(EXIT_INTEGRITY, "IntegrityAlert", "io_error")
+            .extra("during", json!("read_copy"))
+            .extra("os_error", json!(err.to_string()))
+            .extra("preservation", json!(PRESERVED))
+            .extra("object_intact", json!(true))
+            .extra("new_effect", json!(false))
+            .extra("injected", json!(false))
+            .extra("output_written", json!(false))
+            .extra("source_id", json!(source.source_id))
+            .extra("object_id", json!(source.object_id))
+            .extra("content_sha256", json!(hash)));
+    }
     let mut body = honesty("Read");
     body.insert("source_id".into(), json!(source.source_id));
     body.insert("object_id".into(), json!(source.object_id));
@@ -902,7 +938,7 @@ pub struct CancelRequest {
 pub fn cancel_command(req: CancelRequest) -> Report {
     match cancel_inner(req) {
         Ok(report) => report,
-        Err(fail) => fail.into_report(),
+        Err(fail) => note_uncommitted(fail).into_report(),
     }
 }
 
@@ -925,7 +961,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
     }
     guard_vault(&req.vault)?;
     let lock = match lockfile::VaultLock::try_acquire(&req.vault.join("writer.lock"))
-        .map_err(|err| io_fail(err, "lock"))?
+        .map_err(|err| unseen_io(err, "lock"))?
     {
         Some(lock) => lock,
         None => return cancel_without_lock(&req),
@@ -933,7 +969,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
     let _lock = lock;
     let conn = open_writer(&req.vault)?;
     if let Some(existing) =
-        store::command(&conn, &req.command_id).map_err(|err| db_fail(err, "command_lookup"))?
+        store::command(&conn, &req.command_id).map_err(|err| unseen_db(err, "command_lookup"))?
     {
         let generation = result_generation(&existing.result_json)?;
         if generation != req.generation {
@@ -995,7 +1031,7 @@ fn guard_vault(path: &Path) -> Result<i64, Fail> {
         return Err(Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_header")
             .extra("created_new_vault", json!(false)));
     }
-    let magic = filesystem_magic(path).map_err(|err| io_fail(err, "statfs"))?;
+    let magic = filesystem_magic(path).map_err(|err| unseen_io(err, "statfs"))?;
     if network_filesystem(magic) {
         return Err(unsupported_fs(magic));
     }
@@ -1006,7 +1042,7 @@ fn guard_vault(path: &Path) -> Result<i64, Fail> {
 fn open_session(path: &Path) -> Result<Session, Fail> {
     let magic = guard_vault(path)?;
     let lock = lockfile::VaultLock::try_acquire(&path.join("writer.lock"))
-        .map_err(|err| io_fail(err, "lock"))?
+        .map_err(|err| unseen_io(err, "lock"))?
         .ok_or_else(|| {
             Fail::new(EXIT_LOCKED, "Locked", "writer_busy").extra("created_new_vault", json!(false))
         })?;
@@ -1115,7 +1151,7 @@ fn inspect_version_readonly(path: &Path) -> Result<(), Fail> {
 fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
     let abs = path
         .canonicalize()
-        .map_err(|err| io_fail(err, "canonicalize"))?;
+        .map_err(|err| unseen_io(err, "canonicalize"))?;
     let text = abs.to_string_lossy();
     if text.contains('?') || text.contains('#') {
         return Err(Fail::new(
@@ -1138,8 +1174,8 @@ fn wal_visible_uri(path: &Path) -> Result<String, Fail> {
 }
 
 fn open_writer(path: &Path) -> Result<Connection, Fail> {
-    let conn = Connection::open(path.join("vault.db")).map_err(|err| db_fail(err, "open"))?;
-    store::configure(&conn).map_err(|err| db_fail(err, "pragma"))?;
+    let conn = Connection::open(path.join("vault.db")).map_err(|err| unseen_db(err, "open"))?;
+    store::configure(&conn).map_err(|err| unseen_db(err, "pragma"))?;
     Ok(conn)
 }
 
@@ -1295,7 +1331,7 @@ fn find_orphan_with_hash(
 
 fn lookup_object(session: &Session, object_id: &str) -> Result<ObjectRow, Fail> {
     store::object_by_id(&session.conn, object_id)
-        .map_err(|err| db_fail(err, "object_lookup"))?
+        .map_err(|err| unseen_db(err, "object_lookup"))?
         .ok_or_else(|| Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_row_missing"))
 }
 
@@ -1685,7 +1721,7 @@ fn replay_committed(
             .extra("new_effect", json!(false))
         })?;
     let source = store::source_by_id(&session.conn, source_id)
-        .map_err(|err| db_fail(err, "source_lookup"))?
+        .map_err(|err| unseen_db(err, "source_lookup"))?
         .ok_or_else(|| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_row_missing")
                 .extra("new_effect", json!(false))
@@ -1752,7 +1788,7 @@ fn confirm_source_bytes(
     command_id: &str,
 ) -> Result<(), Fail> {
     let object = store::object_by_id(&session.conn, &source.object_id)
-        .map_err(|err| db_fail(err, "object_lookup"))?
+        .map_err(|err| unseen_db(err, "object_lookup"))?
         .ok_or_else(|| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_row_missing")
                 .extra("new_effect", json!(false))
@@ -1897,6 +1933,69 @@ fn stamp_label_misses_fail(fail: Fail, misses: &[journal::LabelMiss]) -> Fail {
     }
     fail.extra("journal_label_update", json!("failed"))
         .extra("journal_write_errors", label_miss_json(misses))
+}
+
+/// This command has no committed row. Exit 15 may say so. Any preservation
+/// value already chosen by a replay stays as it is.
+fn note_uncommitted(fail: Fail) -> Fail {
+    if fail.code != EXIT_NOT_PRESERVED || fail.extra.contains_key("preservation") {
+        return fail;
+    }
+    fail.extra("preservation", json!(NOT_PRESERVED))
+}
+
+/// An exit 15 that never learned whether history was committed must not keep
+/// the NotPreserved outcome. Callers that already set preservation are left alone.
+fn demote_unscoped(mut fail: Fail) -> Fail {
+    if fail.code != EXIT_NOT_PRESERVED || fail.extra.contains_key("preservation") {
+        return fail;
+    }
+    fail.code = EXIT_UNCERTAIN;
+    fail.outcome = "Uncertain";
+    fail.reason = "vault_unseen".into();
+    fail.extra.insert("new_effect".into(), Value::Null);
+    fail
+}
+
+fn stamp_journal_list(mut body: Value, message: Option<&str>) -> Value {
+    let Some(message) = message else {
+        return body;
+    };
+    if let Some(map) = body.as_object_mut() {
+        map.insert("journal_list".into(), json!("failed"));
+        map.insert("journal_list_error".into(), json!(message));
+    }
+    body
+}
+
+fn stamp_journal_list_fail(fail: Fail, message: Option<&str>) -> Fail {
+    let Some(message) = message else {
+        return fail;
+    };
+    fail.extra("journal_list", json!("failed"))
+        .extra("journal_list_error", json!(message))
+}
+
+fn attach_notice(report: &mut Report, code: &str, during: &str, os_error: &str) {
+    let Some(body) = report.body.as_object_mut() else {
+        return;
+    };
+    if let Some(alerts) = body
+        .entry("alerts")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+    {
+        alerts.push(json!({
+            "code": code,
+            "during": during,
+            "os_error": os_error,
+        }));
+    }
+    body.insert("new_effect".into(), json!(false));
+    if report.code == EXIT_OK {
+        report.code = EXIT_INTEGRITY;
+        body.insert("outcome".into(), json!("IntegrityAlert"));
+    }
 }
 
 fn apply_label_misses(report: &mut Report, misses: &[journal::LabelMiss]) {

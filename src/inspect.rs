@@ -9,19 +9,26 @@ use crate::fsutil::sha256_file;
 use crate::ids::is_prefixed_id;
 use crate::journal;
 use crate::model::{
-    capabilities, db_fail, honesty, platform_limits, Fail, Report, EXIT_INTEGRITY, EXIT_OK,
+    capabilities, honesty, platform_limits, unseen_db, Fail, Report, EXIT_INTEGRITY, EXIT_OK,
     EXIT_RECOVERY, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE, PRESERVED,
 };
 use crate::store;
 
 pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Report, Fail> {
-    let sources = store::list_sources(conn).map_err(|err| db_fail(err, "list_sources"))?;
-    let objects = store::list_objects(conn).map_err(|err| db_fail(err, "list_objects"))?;
+    let sources = store::list_sources(conn).map_err(|err| unseen_db(err, "list_sources"))?;
+    let objects = store::list_objects(conn).map_err(|err| unseen_db(err, "list_objects"))?;
     let occurrences =
-        store::list_occurrences(conn).map_err(|err| db_fail(err, "list_occurrences"))?;
-    let commands = store::list_commands(conn).map_err(|err| db_fail(err, "list_commands"))?;
-    let journals = journal::scan(root)?;
+        store::list_occurrences(conn).map_err(|err| unseen_db(err, "list_occurrences"))?;
+    let commands = store::list_commands(conn).map_err(|err| unseen_db(err, "list_commands"))?;
+    let journals = journal::scan(root);
     let mut alerts = Vec::new();
+    if let Some(message) = &journals.unlisted {
+        alerts.push(json!({
+            "code": "journal_unlisted",
+            "during": "read_journal",
+            "os_error": message,
+        }));
+    }
     let mut dangling = Vec::new();
     for name in &journals.unexpected {
         alerts.push(json!({"code": "unexpected_journal_name", "name": name}));
@@ -175,23 +182,26 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
     let command_ids: std::collections::BTreeSet<&str> =
         commands.iter().map(|row| row.command_id.as_str()).collect();
     let mut incomplete = Vec::new();
-    for journal in &journals.valid {
-        if command_ids.contains(journal.command_id.as_str()) {
-            continue;
+    if journals.unlisted.is_none() {
+        for journal in &journals.valid {
+            if command_ids.contains(journal.command_id.as_str()) {
+                continue;
+            }
+            incomplete.push(json!({
+                "command_id": journal.command_id,
+                "kind": journal.kind,
+                "state": journal.state,
+                "reason": journal.reason,
+                "content_sha256": journal.content_sha256,
+                "byte_length": journal.byte_length,
+                "preservation": NOT_PRESERVED,
+                "source_id": null,
+                "purchase_id": null
+            }));
         }
-        incomplete.push(json!({
-            "command_id": journal.command_id,
-            "kind": journal.kind,
-            "state": journal.state,
-            "reason": journal.reason,
-            "content_sha256": journal.content_sha256,
-            "byte_length": journal.byte_length,
-            "preservation": NOT_PRESERVED,
-            "source_id": null,
-            "purchase_id": null
-        }));
     }
-    let invalid_journal = !journals.invalid.is_empty() || !journals.unexpected.is_empty();
+    let invalid_journal = journals.unlisted.is_none()
+        && (!journals.invalid.is_empty() || !journals.unexpected.is_empty());
     let (code, outcome) = if !dangling.is_empty() || invalid_journal {
         (EXIT_RECOVERY, "RecoveryRequired")
     } else if !alerts.is_empty() {
@@ -199,11 +209,34 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
     } else {
         (EXIT_OK, "Ready")
     };
-    let vault_id = store::meta(conn, "vault_id")
-        .map_err(|err| db_fail(err, "meta"))?
-        .unwrap_or_default();
+    let mut code = code;
+    let mut outcome = outcome;
+    let vault_id = match store::meta(conn, "vault_id") {
+        Ok(value) => value.unwrap_or_default(),
+        Err(err) => {
+            alerts.push(json!({
+                "code": "meta_unreadable",
+                "during": "meta",
+                "os_error": err.to_string(),
+            }));
+            if code == EXIT_OK {
+                code = EXIT_INTEGRITY;
+                outcome = "IntegrityAlert";
+            }
+            String::new()
+        }
+    };
+    let vault_id_json = if vault_id.is_empty()
+        && alerts
+            .iter()
+            .any(|alert| alert["code"] == "meta_unreadable")
+    {
+        Value::Null
+    } else {
+        json!(vault_id)
+    };
     let mut body = honesty(outcome);
-    body.insert("vault_id".into(), json!(vault_id));
+    body.insert("vault_id".into(), vault_id_json);
     body.insert("disposable".into(), json!(true));
     body.insert("protection".into(), json!("unanswered_synthetic_plaintext"));
     body.insert("primary_input".into(), json!("unanswered"));
@@ -247,7 +280,13 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
     let read_unknown = alerts.iter().any(|alert| {
         matches!(
             alert.get("code").and_then(|value| value.as_str()),
-            Some("object_unreadable" | "objects_unlisted" | "orphan_unreadable")
+            Some(
+                "object_unreadable"
+                    | "objects_unlisted"
+                    | "orphan_unreadable"
+                    | "journal_unlisted"
+                    | "meta_unreadable",
+            )
         )
     });
     body.insert("alerts".into(), Value::Array(alerts));
@@ -256,7 +295,10 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
     }
     body.insert(
         "temporary_file_count".into(),
-        json!(journal::count_staging(root)),
+        match journal::count_staging(root) {
+            Some(count) => json!(count),
+            None => Value::Null,
+        },
     );
     body.insert("created_new_vault".into(), json!(false));
     Ok(Report {

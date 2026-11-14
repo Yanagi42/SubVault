@@ -116,7 +116,6 @@ pub(crate) fn io_fail(err: std::io::Error, during: &str) -> Fail {
     .extra("injected", Value::Bool(false))
     .extra("during", Value::String(during.into()))
     .extra("os_error", Value::String(err.to_string()))
-    .extra("preservation", Value::String(NOT_PRESERVED.into()))
     .extra("new_effect", Value::Bool(false))
 }
 
@@ -133,8 +132,25 @@ pub(crate) fn db_fail(err: rusqlite::Error, during: &str) -> Fail {
     .extra("injected", Value::Bool(false))
     .extra("during", Value::String(during.into()))
     .extra("os_error", Value::String(err.to_string()))
-    .extra("preservation", Value::String(NOT_PRESERVED.into()))
     .extra("new_effect", Value::Bool(false))
+}
+
+/// The call has not seen the historical rows, so it must not call them preserved
+/// or not preserved. `during` names the step. There is no source list.
+pub(crate) fn unseen_io(err: std::io::Error, during: &str) -> Fail {
+    unseen(during, err.to_string())
+}
+
+pub(crate) fn unseen_db(err: rusqlite::Error, during: &str) -> Fail {
+    unseen(during, err.to_string())
+}
+
+fn unseen(during: &str, detail: String) -> Fail {
+    Fail::new(EXIT_UNCERTAIN, "Uncertain", "vault_unseen")
+        .extra("during", Value::String(during.into()))
+        .extra("os_error", Value::String(detail))
+        .extra("new_effect", Value::Null)
+        .extra("injected", Value::Bool(false))
 }
 
 pub fn platform_limits(magic: Option<i64>) -> Value {

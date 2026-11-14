@@ -4103,3 +4103,342 @@ fn assert_hosted(status: &Value, command_id: &str, media: &str, marker: &str) {
     assert!(source["purchase_id"].is_null(), "{source}");
     assert!(source["entitlement_id"].is_null(), "{source}");
 }
+
+fn alert_during(status: &Value, during: &str) -> bool {
+    status["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|alert| alert["during"] == during)
+}
+
+fn assert_overview_keeps_history(status: &Value) {
+    assert_eq!(status["outcome"], "IntegrityAlert", "{status}");
+    assert_eq!(status["new_effect"], false, "{status}");
+    assert!(status.get("preservation").is_none(), "{status}");
+    assert!(
+        status["incomplete_commands"].as_array().unwrap().is_empty(),
+        "{status}"
+    );
+    assert_hosted(status, "old", "application/pdf", "human-edit-v1");
+    assert_hosted(status, "csv", "text/csv", "");
+}
+
+#[test]
+fn side_failures_do_not_rewrite_known_history() {
+    let tmp = Tmp::new("side-fail");
+    vault_init(&tmp);
+    let pdf = import(
+        &tmp,
+        "old",
+        "application/pdf",
+        &corpus().join("originals/v-2026-09-receipt.pdf"),
+    );
+    mark_old(&tmp, pdf["source_id"].as_str().unwrap());
+    let csv = import(
+        &tmp,
+        "csv",
+        "text/csv",
+        &corpus().join("originals/store-export-work.csv"),
+    );
+    let pdf_path = vault(&tmp)
+        .join("objects")
+        .join(pdf["object_id"].as_str().unwrap());
+    let csv_path = vault(&tmp)
+        .join("objects")
+        .join(csv["object_id"].as_str().unwrap());
+    let pdf_bytes = fs::read(&pdf_path).unwrap();
+    let csv_bytes = fs::read(&csv_path).unwrap();
+    let pdf_source = corpus().join("originals/v-2026-09-receipt.pdf");
+
+    let journal_dir = vault(&tmp).join("journal");
+    let journal_mode = fs::metadata(&journal_dir).unwrap().mode();
+    fs::set_permissions(&journal_dir, fs::Permissions::from_mode(0o0)).unwrap();
+    let _restore_journal = RestoreMode {
+        path: journal_dir.clone(),
+        mode: journal_mode,
+    };
+    let open = run(
+        "side-journal-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    let verify = run(
+        "side-journal-verify",
+        &["verify", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    let recover = run(
+        "side-journal-recover",
+        &["recover", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(open.code, Some(3), "{}", open.stdout);
+    assert_eq!(verify.stdout, open.stdout);
+    assert_eq!(recover.stdout, open.stdout);
+    let body = parse(&open);
+    assert_overview_keeps_history(&body);
+    assert!(alert_during(&body, "read_journal"), "{body}");
+    let read = run(
+        "side-journal-read",
+        &[
+            "read",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--source-id",
+            pdf["source_id"].as_str().unwrap(),
+            "--out",
+            tmp.path().join("journal-read.pdf").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(read.code, Some(0), "{}", read.stdout);
+    assert_eq!(parse(&read)["preservation"], "preserved");
+    assert_eq!(
+        fs::read(tmp.path().join("journal-read.pdf")).unwrap(),
+        pdf_bytes
+    );
+    let replay = run(
+        "side-journal-replay",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "old",
+            "--media-type",
+            "application/pdf",
+            "--source",
+            pdf_source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(replay.code, Some(0), "{}", replay.stdout);
+    let replay_body = parse(&replay);
+    assert_eq!(replay_body["outcome"], "AlreadyCommitted");
+    assert_eq!(replay_body["preservation"], "preserved");
+    assert_eq!(replay_body["new_effect"], false);
+    assert_eq!(replay_body["journal_list"], "failed");
+    fs::set_permissions(&journal_dir, fs::Permissions::from_mode(journal_mode)).unwrap();
+
+    let tmp_journal = journal_dir.join("old.json.tmp");
+    fs::write(&tmp_journal, "{}\n").unwrap();
+    fs::set_permissions(&journal_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let tmp_open = run(
+        "side-tmp-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(tmp_open.code, Some(3), "{}", tmp_open.stdout);
+    let tmp_body = parse(&tmp_open);
+    assert_overview_keeps_history(&tmp_body);
+    assert!(alert_during(&tmp_body, "remove_tmp"), "{tmp_body}");
+    assert!(tmp_journal.is_file());
+    fs::set_permissions(&journal_dir, fs::Permissions::from_mode(journal_mode)).unwrap();
+    fs::remove_file(&tmp_journal).unwrap();
+
+    let staging = vault(&tmp).join("staging");
+    let staging_mode = fs::metadata(&staging).unwrap().mode();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o0)).unwrap();
+    let _restore_staging = RestoreMode {
+        path: staging.clone(),
+        mode: staging_mode,
+    };
+    let staging_open = run(
+        "side-staging-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(staging_open.code, Some(3), "{}", staging_open.stdout);
+    let staging_body = parse(&staging_open);
+    assert_overview_keeps_history(&staging_body);
+    assert!(
+        alert_during(&staging_body, "read_staging"),
+        "{staging_body}"
+    );
+    assert!(
+        staging_body["temporary_file_count"].is_null(),
+        "{staging_body}"
+    );
+    fs::set_permissions(&staging, fs::Permissions::from_mode(staging_mode)).unwrap();
+
+    let leftover = staging.join("leftover");
+    fs::write(&leftover, b"temp\n").unwrap();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o555)).unwrap();
+    let leftover_open = run(
+        "side-leftover-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(leftover_open.code, Some(3), "{}", leftover_open.stdout);
+    let leftover_body = parse(&leftover_open);
+    assert_overview_keeps_history(&leftover_body);
+    assert!(
+        alert_during(&leftover_body, "remove_staging"),
+        "{leftover_body}"
+    );
+    assert_eq!(fs::read(&leftover).unwrap(), b"temp\n");
+    fs::set_permissions(&staging, fs::Permissions::from_mode(staging_mode)).unwrap();
+    fs::remove_file(&leftover).unwrap();
+
+    let blocked = tmp.path().join("blocked");
+    fs::create_dir(&blocked).unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o555)).unwrap();
+    let copy = run(
+        "side-read-copy",
+        &[
+            "read",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--source-id",
+            pdf["source_id"].as_str().unwrap(),
+            "--out",
+            blocked.join("out.pdf").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(copy.code, Some(3), "{}", copy.stdout);
+    let copy_body = parse(&copy);
+    assert_eq!(copy_body["outcome"], "IntegrityAlert");
+    assert_eq!(copy_body["during"], "read_copy");
+    assert_eq!(copy_body["preservation"], "preserved");
+    assert_eq!(copy_body["object_intact"], true);
+    assert_eq!(copy_body["new_effect"], false);
+    assert_eq!(copy_body["output_written"], false);
+    assert_eq!(copy_body["content_sha256"], pdf["content_sha256"]);
+    assert!(!blocked.join("out.pdf").exists());
+    assert_eq!(fs::read(&pdf_path).unwrap(), pdf_bytes);
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+    let copied = tmp.path().join("copied.pdf");
+    let copied_read = run(
+        "side-read-ok",
+        &[
+            "read",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--source-id",
+            pdf["source_id"].as_str().unwrap(),
+            "--out",
+            copied.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(copied_read.code, Some(0), "{}", copied_read.stdout);
+    assert_eq!(parse(&copied_read)["preservation"], "preserved");
+    assert_eq!(fs::read(&copied).unwrap(), pdf_bytes);
+
+    let lock = vault(&tmp).join("writer.lock");
+    let lock_mode = fs::metadata(&lock).unwrap().mode();
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o0)).unwrap();
+    let _restore_lock = RestoreMode {
+        path: lock.clone(),
+        mode: lock_mode,
+    };
+    let locked = run(
+        "side-lock-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(locked.code, Some(21), "{}", locked.stdout);
+    let locked_body = parse(&locked);
+    assert_eq!(locked_body["outcome"], "Uncertain");
+    assert_eq!(locked_body["reason"], "vault_unseen");
+    assert_eq!(locked_body["during"], "lock");
+    assert!(locked_body["new_effect"].is_null(), "{locked_body}");
+    assert!(locked_body.get("preservation").is_none(), "{locked_body}");
+    assert!(locked_body.get("sources").is_none(), "{locked_body}");
+    fs::set_permissions(&lock, fs::Permissions::from_mode(lock_mode)).unwrap();
+
+    let vault_dir = vault(&tmp);
+    let dir_mode = fs::metadata(&vault_dir).unwrap().mode();
+    fs::set_permissions(&vault_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore_dir = RestoreMode {
+        path: vault_dir.clone(),
+        mode: dir_mode,
+    };
+    let readonly = run(
+        "side-dir-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(readonly.code, Some(21), "{}", readonly.stdout);
+    let readonly_body = parse(&readonly);
+    assert_eq!(readonly_body["outcome"], "Uncertain");
+    assert_eq!(readonly_body["reason"], "vault_unseen");
+    assert_eq!(readonly_body["during"], "pragma");
+    assert!(readonly_body["new_effect"].is_null(), "{readonly_body}");
+    assert!(
+        readonly_body.get("preservation").is_none(),
+        "{readonly_body}"
+    );
+    assert!(readonly_body.get("sources").is_none(), "{readonly_body}");
+    fs::set_permissions(&vault_dir, fs::Permissions::from_mode(dir_mode)).unwrap();
+
+    let missing = run(
+        "side-missing-import",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "gone",
+            "--media-type",
+            "application/pdf",
+            "--source",
+            tmp.path().join("no-such.pdf").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(missing.code, Some(15), "{}", missing.stdout);
+    let missing_body = parse(&missing);
+    assert_eq!(missing_body["outcome"], "NotPreserved");
+    assert_eq!(missing_body["reason"], "source_missing");
+    assert_eq!(missing_body["preservation"], "not_preserved");
+    assert_eq!(missing_body["new_effect"], false);
+
+    fs::remove_file(&csv_path).unwrap();
+    let damaged = run(
+        "side-missing-object",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(damaged.code, Some(12), "{}", damaged.stdout);
+    let damaged_body = parse(&damaged);
+    assert_eq!(damaged_body["outcome"], "RecoveryRequired");
+    assert_hosted(&damaged_body, "old", "application/pdf", "human-edit-v1");
+    let csv_source = command_source(&damaged_body, "csv");
+    assert_eq!(csv_source["preservation"], "preserved");
+    assert_eq!(csv_source["object_intact"], false);
+    assert!(damaged_body["dangling_references"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["reason"] == "object_missing" && row["source_id"] == csv["source_id"]));
+    fs::write(&csv_path, &csv_bytes).unwrap();
+
+    let (code, ready) = open_vault(&tmp);
+    assert_eq!(code, 0, "{ready}");
+    assert_eq!(ready["outcome"], "Ready");
+    assert_hosted(&ready, "old", "application/pdf", "human-edit-v1");
+    assert_hosted(&ready, "csv", "text/csv", "");
+    assert_eq!(fs::read(&pdf_path).unwrap(), pdf_bytes);
+    assert_eq!(fs::read(&csv_path).unwrap(), csv_bytes);
+}
+
+#[test]
+fn catalog_query_failure_does_not_invent_preservation() {
+    let tmp = Tmp::new("catalog");
+    vault_init(&tmp);
+    let old = import(
+        &tmp,
+        "old",
+        "application/pdf",
+        &corpus().join("originals/v-2026-09-receipt.pdf"),
+    );
+    mark_old(&tmp, old["source_id"].as_str().unwrap());
+    let db = vault(&tmp).join("vault.db");
+    let altered = Command::new("sqlite3")
+        .arg(&db)
+        .arg("ALTER TABLE sources DROP COLUMN user_marker;")
+        .status()
+        .unwrap();
+    assert!(altered.success());
+    let open = run(
+        "catalog-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(open.code, Some(21), "{}", open.stdout);
+    let body = parse(&open);
+    assert_eq!(body["outcome"], "Uncertain");
+    assert_eq!(body["reason"], "vault_unseen");
+    assert_eq!(body["during"], "list_sources");
+    assert!(body["new_effect"].is_null(), "{body}");
+    assert!(body.get("preservation").is_none(), "{body}");
+    assert!(body.get("sources").is_none(), "{body}");
+}
