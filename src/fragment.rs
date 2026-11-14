@@ -199,6 +199,7 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
         }
         return replay_command(&session, &req, &existing);
     }
+    super::decide::reject_if_t3_command(&session.conn, &req.command_id)?;
     let format = store::user_version(&session.conn).map_err(|err| db_fail(err, "user_version"))?;
     if format == 3 {
         super::decide::require_fact_tables(&session.conn)?;

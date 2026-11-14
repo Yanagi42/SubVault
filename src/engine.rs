@@ -36,7 +36,7 @@ mod decide;
 #[path = "fragment.rs"]
 mod fragment;
 
-pub use decide::query_facts;
+pub use decide::{correct_fact, query_facts, undo_decision, CorrectRequest, UndoRequest};
 pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
 
 const IMPORT_STOPS: &[&str] = &[
@@ -169,7 +169,7 @@ pub fn help_report() -> Report {
     let mut body = honesty("Help");
     body.insert(
         "note".into(),
-        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. On a new format 3 vault, that same publish also records a stated paid amount and a stated service period as facts. Those facts are source statements, not verified payments, purchases, or account links. PDF extraction is not available. Security is not complete. This is not a user-ready product."),
+        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. On a new format 3 vault, that same publish also records a stated paid amount and a stated service period as facts. Those facts are source statements, not verified payments, purchases, or account links. correct can replace the stated USD amount text, and undo appends a compensating decision. PDF extraction is not available. Security is not complete. This is not a user-ready product."),
     );
     body.insert(
         "commands".into(),
@@ -185,6 +185,8 @@ pub fn help_report() -> Report {
             "fragment --vault PATH --command-id ID --fragment PATH [--batch-id ID]",
             "candidates --vault PATH [--source-id ID]",
             "facts --vault PATH [--source-id ID] [--fact-id ID]",
+            "correct --vault PATH --command-id ID --fact-id ID --expected-revision N --amount-text TEXT --actor-id ID",
+            "undo --vault PATH --command-id ID --decision-id ID --expected-revision N --actor-id ID",
             "cancel --vault PATH --command-id ID --generation N [--kind preservation|fragment|extraction]",
             "recover --vault PATH",
             "hold --vault PATH --stop-at lock_held --checkpoint PATH"
@@ -405,6 +407,7 @@ fn reopen_inner(path: &Path) -> Result<Report, Fail> {
     let session = open_session(path)?;
     let notices = journal::clean_temps(&session.root);
     let reconciled = journal::reconcile(&session.root, &session.conn)?;
+    let decision_misses = decide::reconcile_decision_journals(&session.root, &session.conn)?;
     let mut inspection = crate::inspect::report(&session.root, &session.conn, session.magic)?;
     for notice in notices {
         attach_notice(
@@ -414,7 +417,9 @@ fn reopen_inner(path: &Path) -> Result<Report, Fail> {
             &notice.os_error,
         );
     }
-    apply_label_misses(&mut inspection, &reconciled.misses);
+    let mut label_misses = reconciled.misses;
+    label_misses.extend(decision_misses);
+    apply_label_misses(&mut inspection, &label_misses);
     if let Err(err) = store::checkpoint(&session.conn) {
         attach_notice(
             &mut inspection,
@@ -513,6 +518,7 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
             )),
         };
     }
+    decide::reject_if_t3_command(&session.conn, &req.command_id)?;
     let meta = require_new_source(&req.source)?;
     let display_default = req
         .source
@@ -868,12 +874,26 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
         }
         return already_committed(&existing);
     }
+    decide::reject_if_t3_command(&session.conn, &req.command_id)?;
     let source = store::source_by_id(&session.conn, &req.source_id)
         .map_err(|err| unseen_db(err, "source_lookup"))?
         .ok_or_else(|| {
             Fail::new(EXIT_REJECTED, "Rejected", "unknown_source")
                 .extra("source_id", json!(req.source_id))
         })?;
+    let existing_journal = journal::path(&session.root, &req.command_id);
+    if existing_journal.exists() {
+        let existing = journal::read_file(&existing_journal).map_err(|_| {
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
+                .extra("new_effect", json!(false))
+        })?;
+        if existing.kind != "marker" {
+            return Err(
+                Fail::new(EXIT_REJECTED, "Rejected", "command_kind_conflict")
+                    .extra("new_effect", json!(false)),
+            );
+        }
+    }
     let mut journal = Journal {
         command_id: req.command_id.clone(),
         kind: "marker".into(),
@@ -1336,7 +1356,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
-    if journal.kind == "fragment" {
+    if journal.kind == "fragment" || journal.kind == "decision" {
         return Err(fragment_journal_conflict());
     }
     if journal.generation != req.generation {
@@ -2044,7 +2064,7 @@ fn map_of(pairs: &[(&str, Value)]) -> Map<String, Value> {
         .collect()
 }
 
-fn fingerprint(parts: &[&str]) -> String {
+pub(super) fn fingerprint(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for (index, part) in parts.iter().enumerate() {
         if index > 0 {
@@ -2092,7 +2112,7 @@ fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
-    if journal.kind == "fragment" {
+    if journal.kind == "fragment" || journal.kind == "decision" {
         return Err(fragment_journal_conflict());
     }
     if journal.generation != req.generation {

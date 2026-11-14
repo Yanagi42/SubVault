@@ -1040,3 +1040,907 @@ fn source_can_be_preserved_before_the_fact_transaction_commits() {
     assert_eq!(broken["new_effect"], false);
     let _ = listed;
 }
+
+const ACTOR: &str = "act_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ACTOR_B: &str = "act_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+// Public CLI only. SIGKILL is not a power cut or an fsync proof.
+// `--inject` returns before COMMIT, so it is not a COMMIT-visibility failure.
+// Power loss, a real full disk, a real SQLite COMMIT error, Windows, and PDF are not covered.
+
+fn correct_amount(
+    vault: &Path,
+    command: &str,
+    fact_id: &str,
+    revision: &str,
+    amount: &str,
+    actor: &str,
+) -> (i32, Value) {
+    run(&[
+        "correct",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        command,
+        "--fact-id",
+        fact_id,
+        "--expected-revision",
+        revision,
+        "--amount-text",
+        amount,
+        "--actor-id",
+        actor,
+    ])
+}
+
+fn undo_at(
+    vault: &Path,
+    command: &str,
+    decision_id: &str,
+    revision: &str,
+    actor: &str,
+) -> (i32, Value) {
+    run(&[
+        "undo",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        command,
+        "--decision-id",
+        decision_id,
+        "--expected-revision",
+        revision,
+        "--actor-id",
+        actor,
+    ])
+}
+
+fn journal_file(vault: &Path, command: &str) -> PathBuf {
+    vault.join("journal").join(format!("{command}.json"))
+}
+
+fn journal_value(vault: &Path, command: &str) -> Value {
+    serde_json::from_slice(&fs::read(journal_file(vault, command)).unwrap()).unwrap()
+}
+
+fn paid_for<'a>(listed: &'a Value, source_id: &str) -> &'a Value {
+    of_type(listed, "stated_amount_paid")
+        .into_iter()
+        .find(|fact| fact["source_id"] == source_id)
+        .unwrap()
+}
+
+fn stated_file(tmp: &Tmp) -> (PathBuf, PathBuf) {
+    let vault = init3(tmp);
+    let file = write_note(
+        tmp,
+        "stated.txt",
+        "Amount paid USD 15.99\nService period: 2026-09-01 through 2026-09-30\n",
+    );
+    (vault, file)
+}
+
+#[test]
+fn correct_then_a_new_source_then_undo_restores_the_first_stated_amount() {
+    let tmp = Tmp::new("abc");
+    let (vault, file) = stated_file(&tmp);
+    let original = fs::read(&file).unwrap();
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let source_a = published["source_id"].as_str().unwrap().to_string();
+    let listed = facts(&vault);
+    let paid = paid_for(&listed, &source_a);
+    assert_eq!(paid["revision"], 1);
+    assert_eq!(paid["value"]["amount_text"], "15.99");
+    assert!(paid["value"]["amount_text"].is_string());
+    assert_eq!(
+        sql(
+            &vault,
+            &format!(
+                "SELECT typeof(json_extract(value_json, '$.amount_text')) FROM facts WHERE fact_id='{}';",
+                paid["fact_id"].as_str().unwrap()
+            )
+        ),
+        "text"
+    );
+    let period = of_type(&listed, "stated_service_period");
+    assert_eq!(period.len(), 1);
+    assert_eq!(period[0]["revision"], 1);
+    assert_eq!(paid["locator"]["excerpt"], "Amount paid USD 15.99");
+    assert_eq!(sql(&vault, "SELECT DISTINCT adopted FROM candidates;"), "0");
+    let fact_id = paid["fact_id"].as_str().unwrap().to_string();
+    let candidate_id = paid["candidate_id"].as_str().unwrap().to_string();
+
+    let (code, corrected) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{corrected}");
+    assert_eq!(corrected["outcome"], "Committed");
+    assert_eq!(corrected["new_effect"], true);
+    assert_eq!(corrected["revision"], 2);
+    assert_eq!(corrected["amount_text"], "10.00");
+    assert!(corrected["amount_text"].is_string());
+    assert_eq!(corrected["actor_kind"], "human");
+    assert_eq!(corrected["actor_id"], ACTOR);
+    assert!(corrected["rule_version"].is_null());
+    assert!(corrected["target_decision_id"].is_null());
+    assert!(corrected["observed_at"].is_null());
+    assert_eq!(corrected["current_status"], "unknown");
+    assert_eq!(corrected["time_status"], "unknown");
+    assert_eq!(corrected["payment_verified"], false);
+    assert!(corrected["purchase_id"].is_null());
+    assert!(corrected["account_id"].is_null());
+    assert_eq!(corrected["payload_version"], "t3-payload-1");
+    let decision_b = corrected["decision_id"].as_str().unwrap();
+    let canonical = sql(
+        &vault,
+        "SELECT canonical_payload FROM t3_receipts WHERE command_id='b';",
+    );
+    assert!(
+        canonical.starts_with("t3-payload-1\ncorrect\n"),
+        "{canonical}"
+    );
+    assert!(
+        canonical.contains(&format!("fact_id={fact_id}\n")),
+        "{canonical}"
+    );
+    assert!(canonical.contains("expected_revision=1\n"), "{canonical}");
+    assert!(canonical.contains("amount_text=10.00\n"), "{canonical}");
+    assert!(
+        canonical.ends_with(&format!("actor_id={ACTOR}")),
+        "{canonical}"
+    );
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT payload_version FROM t3_receipts WHERE command_id='b';"
+        ),
+        "t3-payload-1"
+    );
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM commands WHERE command_id='b';"
+        ),
+        "0"
+    );
+    let listed = facts(&vault);
+    let paid = paid_for(&listed, published["source_id"].as_str().unwrap());
+    assert_eq!(paid["revision"], 2);
+    assert_eq!(paid["value"]["amount_text"], "10.00");
+    assert!(paid["observed_at"].is_null());
+    assert_eq!(paid["current_status"], "unknown");
+    assert!(paid["account_id"].is_null());
+    assert_eq!(paid["locator"]["excerpt"], "Amount paid USD 15.99");
+    assert_eq!(paid["decisions"].as_array().unwrap().len(), 2);
+    let human = &paid["decisions"][1];
+    assert_eq!(human["decision_id"], decision_b);
+    assert_eq!(human["kind"], "human_correct");
+    assert_eq!(human["actor_kind"], "human");
+    assert_eq!(human["actor_id"], ACTOR);
+    assert!(human["rule_version"].is_null());
+    assert!(human["target_decision_id"].is_null());
+    assert_eq!(human["prior_value"]["amount_text"], "15.99");
+    assert_eq!(human["new_value"]["amount_text"], "10.00");
+    assert!(human["recorded_at"].as_i64().unwrap() > 0);
+    assert!(human["recorded_at"] != paid["observed_at"]);
+    assert_eq!(of_type(&listed, "stated_service_period")[0]["revision"], 1);
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    assert_eq!(opened["has_incomplete"], false, "{opened}");
+    assert_eq!(fs::read(&file).unwrap(), original);
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT excerpt FROM candidates WHERE candidate_id='{candidate_id}';")
+        ),
+        "Amount paid USD 15.99"
+    );
+
+    let later = write_note(
+        &tmp,
+        "later.txt",
+        "Amount paid USD 15.99\nService period: 2026-10-01 through 2026-10-31\nA later source, not a new purchase.\n",
+    );
+    let (code, source_c) = fragment(&vault, "c", &later);
+    assert_eq!(code, 0, "{source_c}");
+    let source_c_id = source_c["source_id"].as_str().unwrap().to_string();
+    assert_ne!(source_c_id, source_a);
+    let listed = facts(&vault);
+    let kept = paid_for(&listed, &source_a);
+    let independent = paid_for(&listed, &source_c_id);
+    assert_eq!(kept["revision"], 2);
+    assert_eq!(kept["value"]["amount_text"], "10.00");
+    assert_eq!(kept["fact_id"], fact_id);
+    assert_eq!(independent["revision"], 1);
+    assert_eq!(independent["value"]["amount_text"], "15.99");
+    assert_ne!(independent["fact_id"], fact_id);
+    assert!(independent["purchase_id"].is_null());
+    assert_eq!(independent["decisions"].as_array().unwrap().len(), 1);
+    assert_eq!(independent["decisions"][0]["kind"], "rule_adopt");
+
+    let (code, undone) = undo_at(&vault, "undo-b", decision_b, "2", ACTOR);
+    assert_eq!(code, 0, "{undone}");
+    assert_eq!(undone["outcome"], "Committed");
+    assert_eq!(undone["new_effect"], true);
+    assert_eq!(undone["revision"], 3);
+    assert_eq!(undone["amount_text"], "15.99");
+    assert_eq!(undone["target_decision_id"], decision_b);
+    assert_eq!(undone["actor_kind"], "human");
+    assert!(undone["observed_at"].is_null());
+    assert_eq!(undone["current_status"], "unknown");
+    assert!(undone["account_id"].is_null());
+    assert_eq!(undone["payment_verified"], false);
+    let listed = facts(&vault);
+    let restored = paid_for(&listed, &source_a);
+    let still_c = paid_for(&listed, &source_c_id);
+    assert_eq!(restored["revision"], 3);
+    assert_eq!(restored["value"]["amount_text"], "15.99");
+    assert_eq!(restored["locator"]["excerpt"], "Amount paid USD 15.99");
+    assert_eq!(restored["decisions"].as_array().unwrap().len(), 3);
+    assert_eq!(restored["decisions"][1]["decision_id"], decision_b);
+    assert_eq!(restored["decisions"][2]["kind"], "undo");
+    assert_eq!(restored["decisions"][2]["target_decision_id"], decision_b);
+    assert_eq!(
+        restored["decisions"][2]["prior_value"]["amount_text"],
+        "10.00"
+    );
+    assert_eq!(
+        restored["decisions"][2]["new_value"]["amount_text"],
+        "15.99"
+    );
+    assert!(restored["decisions"][2].get("supersedes").is_none());
+    assert_eq!(still_c["revision"], 1);
+    assert_eq!(still_c["value"]["amount_text"], "15.99");
+    assert_eq!(still_c["fact_id"], independent["fact_id"]);
+    assert_eq!(of_type(&listed, "stated_service_period").len(), 2);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM commands;"), "2");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM commands WHERE command_id='b';"
+        ),
+        "0"
+    );
+    assert_eq!(sql(&vault, "SELECT count(*) FROM t3_receipts;"), "4");
+    assert_eq!(fs::read(&file).unwrap(), original);
+    assert_eq!(sql(&vault, "SELECT DISTINCT adopted FROM candidates;"), "0");
+    let decisions_sql = sql(
+        &vault,
+        "SELECT sql FROM sqlite_master WHERE name='decisions';",
+    );
+    assert!(
+        decisions_sql.contains("target_decision_id"),
+        "{decisions_sql}"
+    );
+    assert!(!decisions_sql.contains("supersedes"), "{decisions_sql}");
+    assert!(!decisions_sql.contains("keep"), "{decisions_sql}");
+
+    let (code, replay) = undo_at(&vault, "undo-b", decision_b, "2", ACTOR);
+    assert_eq!(code, 0, "{replay}");
+    assert_eq!(replay["outcome"], "AlreadyCommitted");
+    assert_eq!(replay["new_effect"], false);
+    assert_eq!(replay["decision_id"], undone["decision_id"]);
+    assert_eq!(replay["revision"], 3);
+    assert_eq!(
+        sql(&vault, "SELECT count(*) FROM decisions WHERE kind='undo';"),
+        "1"
+    );
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT revision FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "3"
+    );
+}
+
+#[test]
+fn strict_amount_unknown_status_and_local_actor_are_refused_before_a_journal() {
+    let tmp = Tmp::new("strict");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let listed = facts(&vault);
+    let paid = paid_for(&listed, published["source_id"].as_str().unwrap());
+    let fact_id = paid["fact_id"].as_str().unwrap();
+    let period_id = of_type(&listed, "stated_service_period")[0]["fact_id"]
+        .as_str()
+        .unwrap();
+    for (command, amount) in [
+        ("bad-whole", "10"),
+        ("bad-tenth", "10.0"),
+        ("bad-milli", "10.000"),
+        ("bad-comma", "10,00"),
+        ("bad-symbol", "$10.00"),
+        ("bad-suffix", "10.00 USD"),
+        ("bad-space", " 10.00"),
+        ("bad-long", "15.990"),
+    ] {
+        let (code, refused) = correct_amount(&vault, command, fact_id, "1", amount, ACTOR);
+        assert_eq!(code, 16, "{amount} {refused}");
+        assert_eq!(refused["reason"], "amount_text_rejected");
+        assert_eq!(refused["new_effect"], false);
+        assert_eq!(refused["decision_committed"], false);
+        assert!(!journal_file(&vault, command).exists(), "{command}");
+    }
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT revision FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "1"
+    );
+    let (code, rule) = correct_amount(
+        &vault,
+        "rule",
+        fact_id,
+        "1",
+        "10.00",
+        "act_00000000000000000000000000000001",
+    );
+    assert_eq!(code, 16, "{rule}");
+    assert_eq!(rule["reason"], "actor_not_human");
+    assert!(!journal_file(&vault, "rule").exists());
+    let (code, period) = correct_amount(&vault, "period", period_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 16, "{period}");
+    assert_eq!(period["reason"], "not_amount_fact");
+    assert!(!journal_file(&vault, "period").exists());
+    let (code, missing) = correct_amount(
+        &vault,
+        "missing",
+        "fact_00000000000000000000000000000000",
+        "1",
+        "10.00",
+        ACTOR,
+    );
+    assert_eq!(code, 16, "{missing}");
+    assert_eq!(missing["reason"], "unknown_fact");
+    assert!(!journal_file(&vault, "missing").exists());
+    for revision in ["0", "02", "-1", "1.0"] {
+        let (code, bad) = correct_amount(&vault, "rev", fact_id, revision, "10.00", ACTOR);
+        assert_eq!(code, 2, "{revision} {bad}");
+        assert_eq!(bad["reason"], "bad_revision");
+    }
+    assert!(!journal_file(&vault, "rev").exists());
+    assert_eq!(sql(&vault, "SELECT count(*) FROM decisions;"), "2");
+}
+
+#[test]
+fn payload_is_checked_before_revision_and_a_conflict_does_not_write() {
+    let tmp = Tmp::new("payload");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_for(&facts(&vault), published["source_id"].as_str().unwrap())["fact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, corrected) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{corrected}");
+    let journal_before = fs::read(journal_file(&vault, "b")).unwrap();
+    let (code, again) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again["outcome"], "AlreadyCommitted");
+    assert_eq!(again["new_effect"], false);
+    assert_eq!(again["decision_id"], corrected["decision_id"]);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE kind='human_correct';"
+        ),
+        "1"
+    );
+    assert!(sql(
+        &vault,
+        &format!("UPDATE facts SET revision=9 WHERE fact_id='{fact_id}';")
+    )
+    .is_empty());
+    let (code, replay) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{replay}");
+    assert_eq!(replay["outcome"], "AlreadyCommitted");
+    assert_eq!(replay["new_effect"], false);
+    assert_eq!(replay["revision"], 2);
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT revision FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "9"
+    );
+    assert_eq!(
+        sql(&vault, &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")),
+        "10.00"
+    );
+    let (code, conflict) = correct_amount(&vault, "b", &fact_id, "9", "11.00", ACTOR);
+    assert_eq!(code, 16, "{conflict}");
+    assert_eq!(conflict["reason"], "payload_conflict");
+    assert_eq!(conflict["new_effect"], false);
+    assert_eq!(fs::read(journal_file(&vault, "b")).unwrap(), journal_before);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE kind='human_correct';"
+        ),
+        "1"
+    );
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM t3_receipts WHERE command_id='b';"
+        ),
+        "1"
+    );
+    let (code, revision) = correct_amount(&vault, "other", &fact_id, "2", "11.00", ACTOR);
+    assert_eq!(code, 16, "{revision}");
+    assert_eq!(revision["reason"], "revision_conflict");
+    assert!(!journal_file(&vault, "other").exists());
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT revision FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "9"
+    );
+}
+
+#[test]
+fn undo_of_an_earlier_decision_is_a_conflict_when_a_later_human_edit_exists() {
+    let tmp = Tmp::new("successor");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_for(&facts(&vault), published["source_id"].as_str().unwrap())["fact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, first) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{first}");
+    let (code, second) = correct_amount(&vault, "later", &fact_id, "2", "11.00", ACTOR_B);
+    assert_eq!(code, 0, "{second}");
+    assert_eq!(second["actor_id"], ACTOR_B);
+    let before = sql(&vault, "SELECT count(*) FROM decisions;");
+    let (code, blocked) = undo_at(
+        &vault,
+        "undo-b",
+        first["decision_id"].as_str().unwrap(),
+        "3",
+        ACTOR,
+    );
+    assert_eq!(code, 16, "{blocked}");
+    assert_eq!(blocked["reason"], "successor_conflict");
+    assert_eq!(blocked["new_effect"], false);
+    assert_eq!(blocked["facts_changed"], false);
+    assert!(!journal_file(&vault, "undo-b").exists());
+    assert_eq!(sql(&vault, "SELECT count(*) FROM decisions;"), before);
+    assert_eq!(
+        sql(&vault, &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")),
+        "11.00"
+    );
+    let (code, undone) = undo_at(
+        &vault,
+        "undo-later",
+        second["decision_id"].as_str().unwrap(),
+        "3",
+        ACTOR,
+    );
+    assert_eq!(code, 0, "{undone}");
+    assert_eq!(undone["revision"], 4);
+    assert_eq!(undone["amount_text"], "10.00");
+    assert_eq!(undone["target_decision_id"], second["decision_id"]);
+    let listed = facts(&vault);
+    let paid = paid_for(&listed, published["source_id"].as_str().unwrap());
+    assert_eq!(paid["revision"], 4);
+    assert_eq!(paid["value"]["amount_text"], "10.00");
+    assert_eq!(paid["decisions"].as_array().unwrap().len(), 4);
+    assert_eq!(paid["decisions"][1]["decision_id"], first["decision_id"]);
+}
+
+#[test]
+fn format_1_and_format_2_refuse_correct_and_undo_without_fact_tables() {
+    let tmp = Tmp::new("old-format");
+    let v2 = tmp.path().join("v2");
+    let (code, body) = run(&["init", "--vault", v2.to_str().unwrap(), "--format", "2"]);
+    assert_eq!(code, 0, "{body}");
+    let (code, refused) = correct_amount(
+        &v2,
+        "b",
+        "fact_00000000000000000000000000000000",
+        "1",
+        "10.00",
+        ACTOR,
+    );
+    assert_eq!(code, 14, "{refused}");
+    assert_eq!(refused["reason"], "facts_require_format_3");
+    assert_eq!(refused["new_effect"], false);
+    let (code, undo) = undo_at(&v2, "u", "dec_00000000000000000000000000000000", "1", ACTOR);
+    assert_eq!(code, 14, "{undo}");
+    assert_eq!(undo["reason"], "facts_require_format_3");
+    assert!(!journal_file(&v2, "b").exists());
+    assert!(!journal_file(&v2, "u").exists());
+    assert_eq!(
+        sql(
+            &v2,
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('facts','decisions','t3_receipts');"
+        ),
+        "0"
+    );
+    let v1 = tmp.path().join("v1");
+    let (code, body) = run(&["init", "--vault", v1.to_str().unwrap()]);
+    assert_eq!(code, 0, "{body}");
+    let (code, refused) = correct_amount(
+        &v1,
+        "b",
+        "fact_00000000000000000000000000000000",
+        "1",
+        "10.00",
+        ACTOR,
+    );
+    assert_eq!(code, 14, "{refused}");
+    assert_eq!(refused["outcome"], "NeedsUpgrade");
+    assert_eq!(refused["reason"], "needs_upgrade");
+    assert!(!journal_file(&v1, "b").exists());
+    assert_eq!(
+        sql(
+            &v1,
+            "SELECT count(*) FROM sqlite_master WHERE name='facts';"
+        ),
+        "0"
+    );
+}
+
+#[test]
+fn an_injected_receipt_read_does_not_decide_that_the_command_failed() {
+    let tmp = Tmp::new("receipt-read");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_for(&facts(&vault), published["source_id"].as_str().unwrap())["fact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let witness = tmp.path().join("witness.json");
+    let (code, unseen) = run(&[
+        "correct",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "b",
+        "--fact-id",
+        &fact_id,
+        "--expected-revision",
+        "1",
+        "--amount-text",
+        "10.00",
+        "--actor-id",
+        ACTOR,
+        "--inject",
+        "io_error:receipt_read",
+        "--witness",
+        witness.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 12, "{unseen}");
+    assert_eq!(unseen["reason"], "t3_receipt_unseen");
+    assert_eq!(unseen["injected"], true);
+    assert_eq!(unseen["new_effect"], false);
+    assert_eq!(unseen["decision_committed"], false);
+    assert!(unseen["note"]
+        .as_str()
+        .unwrap()
+        .contains("not a failed read"));
+    assert!(!journal_file(&vault, "b").exists());
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT revision FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "1"
+    );
+    let (code, corrected) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{corrected}");
+    assert_eq!(corrected["revision"], 2);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE kind='human_correct';"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn injected_decision_faults_roll_back_and_are_not_commit_visibility() {
+    let tmp = Tmp::new("decision-inject");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_for(&facts(&vault), published["source_id"].as_str().unwrap())["fact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (command, point) in [("tx", "decision_tx"), ("commit", "db_commit")] {
+        let witness = tmp.path().join(format!("{command}.json"));
+        let revision = sql(
+            &vault,
+            &format!("SELECT revision FROM facts WHERE fact_id='{fact_id}';"),
+        );
+        let (code, failed) = run(&[
+            "correct",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            command,
+            "--fact-id",
+            &fact_id,
+            "--expected-revision",
+            &revision,
+            "--amount-text",
+            "10.00",
+            "--actor-id",
+            ACTOR,
+            "--inject",
+            &format!("io_error:{point}"),
+            "--witness",
+            witness.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 15, "{point} {failed}");
+        assert_eq!(failed["injected"], true);
+        assert_eq!(failed["decision_committed"], false);
+        assert_eq!(failed["facts_changed"], false);
+        assert!(failed["note"]
+            .as_str()
+            .unwrap()
+            .contains("not a COMMIT visibility result"));
+        assert_eq!(journal_value(&vault, command)["state"], "started");
+        assert_eq!(
+            sql(
+                &vault,
+                &format!("SELECT count(*) FROM t3_receipts WHERE command_id='{command}';")
+            ),
+            "0"
+        );
+        assert_eq!(
+            sql(
+                &vault,
+                &format!("SELECT revision FROM facts WHERE fact_id='{fact_id}';")
+            ),
+            revision
+        );
+        let (code, opened) = run(&["recover", "--vault", vault.to_str().unwrap()]);
+        assert_eq!(code, 0, "{opened}");
+        let journal = journal_value(&vault, command);
+        assert_eq!(journal["state"], "aborted");
+        assert_eq!(journal["reason"], "uncommitted");
+        let (code, retried) = correct_amount(&vault, command, &fact_id, &revision, "10.00", ACTOR);
+        assert_eq!(code, 0, "{retried}");
+        assert_eq!(retried["new_effect"], true);
+        assert_eq!(
+            sql(
+                &vault,
+                &format!("SELECT count(*) FROM decisions WHERE command_id='{command}';")
+            ),
+            "1"
+        );
+    }
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE kind='human_correct';"
+        ),
+        "2"
+    );
+}
+
+#[test]
+fn sigkill_before_the_decision_transaction_is_not_power_loss() {
+    let tmp = Tmp::new("decision-kill");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_for(&facts(&vault), published["source_id"].as_str().unwrap())["fact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let checkpoint = tmp.path().join("stop.json");
+    let mut child = Command::new(bin())
+        .args([
+            "correct",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            "b",
+            "--fact-id",
+            &fact_id,
+            "--expected-revision",
+            "1",
+            "--amount-text",
+            "10.00",
+            "--actor-id",
+            ACTOR,
+            "--stop-at",
+            "before_decision_commit",
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_stopped(&mut child, &checkpoint);
+    kill_stopped(&mut child);
+    let killed = child.wait_with_output().unwrap();
+    assert_eq!(killed.status.code(), None);
+    assert!(killed.stdout.is_empty());
+    assert_eq!(journal_value(&vault, "b")["state"], "started");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM t3_receipts WHERE command_id='b';"
+        ),
+        "0"
+    );
+    assert_eq!(
+        sql(&vault, &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")),
+        "15.99"
+    );
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    let journal = journal_value(&vault, "b");
+    assert_eq!(journal["state"], "aborted");
+    assert_eq!(journal["reason"], "uncommitted");
+    let (code, retried) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{retried}");
+    assert_eq!(retried["revision"], 2);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE command_id='b';"
+        ),
+        "1"
+    );
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM t3_receipts WHERE command_id='b';"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn an_unreadable_t3_receipt_stays_in_recovery_without_aborting_the_journal() {
+    let tmp = Tmp::new("unreadable");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_for(&facts(&vault), published["source_id"].as_str().unwrap())["fact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, corrected) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{corrected}");
+    let journal_before = fs::read(journal_file(&vault, "b")).unwrap();
+    assert!(sql(
+        &vault,
+        "UPDATE t3_receipts SET result_json='{' WHERE command_id='b';"
+    )
+    .is_empty());
+    let (code, broken) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 12, "{broken}");
+    assert_eq!(broken["reason"], "t3_receipt_unreadable");
+    assert_eq!(broken["new_effect"], false);
+    assert_eq!(broken["decision_committed"], false);
+    assert_eq!(fs::read(journal_file(&vault, "b")).unwrap(), journal_before);
+    assert_eq!(journal_value(&vault, "b")["state"], "committed");
+    assert_eq!(
+        sql(&vault, &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")),
+        "10.00"
+    );
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 12, "{opened}");
+    assert_eq!(opened["reason"], "t3_receipt_unreadable");
+    assert_eq!(fs::read(journal_file(&vault, "b")).unwrap(), journal_before);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE kind='human_correct';"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn cancel_and_marker_do_not_rewrite_a_decision_journal() {
+    let tmp = Tmp::new("guard");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_for(&facts(&vault), published["source_id"].as_str().unwrap())["fact_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, corrected) = correct_amount(&vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{corrected}");
+    let before = fs::read(journal_file(&vault, "b")).unwrap();
+    let (code, cancel) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "b",
+        "--generation",
+        "1",
+        "--kind",
+        "preservation",
+    ]);
+    assert_eq!(code, 16, "{cancel}");
+    assert_eq!(cancel["reason"], "command_kind_conflict");
+    assert_eq!(cancel["cancel_applied"], false);
+    assert_eq!(fs::read(journal_file(&vault, "b")).unwrap(), before);
+    let (code, marker) = run(&[
+        "marker",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "b",
+        "--source-id",
+        published["source_id"].as_str().unwrap(),
+        "--value",
+        "not a decision",
+    ]);
+    assert_eq!(code, 16, "{marker}");
+    assert_eq!(marker["reason"], "command_kind_conflict");
+    assert_eq!(fs::read(journal_file(&vault, "b")).unwrap(), before);
+    assert_eq!(
+        sql(&vault, &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")),
+        "10.00"
+    );
+    let _ = corrected;
+}
+
+#[test]
+fn the_previous_binary_has_no_correct_command_and_does_not_write_a_format_3_vault() {
+    let tmp = Tmp::new("old-bin");
+    let vault = init3(&tmp);
+    let before = fs::read(vault.join("vault.db")).unwrap();
+    let (code, bare) = run_at(baseline_bin(), &["correct"]);
+    assert_eq!(code, 2, "{bare}");
+    assert_eq!(bare["reason"], "unknown_command");
+    let (code, flagged) = run_at(
+        baseline_bin(),
+        &[
+            "correct",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            "b",
+            "--fact-id",
+            "fact_00000000000000000000000000000000",
+            "--expected-revision",
+            "1",
+            "--amount-text",
+            "10.00",
+            "--actor-id",
+            ACTOR,
+        ],
+    );
+    assert_eq!(code, 2, "{flagged}");
+    assert_eq!(flagged["reason"], "unknown_flag");
+    assert_eq!(fs::read(vault.join("vault.db")).unwrap(), before);
+    assert!(!journal_file(&vault, "b").exists());
+}
+
+#[test]
+fn help_names_correct_and_undo_without_claiming_a_finished_product() {
+    let (code, help) = run(&["help"]);
+    assert_eq!(code, 0, "{help}");
+    let note = help["note"].as_str().unwrap();
+    assert!(note.contains("not a user-ready product"));
+    assert!(note.contains("Security is not complete"));
+    let commands = help["commands"].as_array().unwrap();
+    assert!(commands
+        .iter()
+        .any(|command| command.as_str().unwrap().starts_with("correct ")));
+    assert!(commands
+        .iter()
+        .any(|command| command.as_str().unwrap().starts_with("undo ")));
+}

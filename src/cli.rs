@@ -26,6 +26,10 @@ struct Flags {
     fragment: Option<PathBuf>,
     format: Option<u8>,
     fact_id: Option<String>,
+    decision_id: Option<String>,
+    expected_revision: Option<String>,
+    amount_text: Option<String>,
+    actor_id: Option<String>,
 }
 
 impl Flags {
@@ -49,6 +53,10 @@ impl Flags {
             fragment: None,
             format: None,
             fact_id: None,
+            decision_id: None,
+            expected_revision: None,
+            amount_text: None,
+            actor_id: None,
         }
     }
 }
@@ -167,6 +175,61 @@ pub fn execute(args: Vec<String>) -> Report {
             };
             engine::query_facts(&vault, flags.source_id, flags.fact_id)
         }
+        "correct" => {
+            let (
+                Some(vault),
+                Some(command_id),
+                Some(fact_id),
+                Some(expected_revision),
+                Some(amount_text),
+                Some(actor_id),
+            ) = (
+                flags.vault,
+                flags.command_id,
+                flags.fact_id,
+                flags.expected_revision,
+                flags.amount_text,
+                flags.actor_id,
+            )
+            else {
+                return usage("correct_required_flags");
+            };
+            engine::correct_fact(engine::CorrectRequest {
+                vault,
+                command_id,
+                fact_id,
+                expected_revision,
+                amount_text,
+                actor_id,
+                hooks,
+            })
+        }
+        "undo" => {
+            let (
+                Some(vault),
+                Some(command_id),
+                Some(decision_id),
+                Some(expected_revision),
+                Some(actor_id),
+            ) = (
+                flags.vault,
+                flags.command_id,
+                flags.decision_id,
+                flags.expected_revision,
+                flags.actor_id,
+            )
+            else {
+                return usage("undo_required_flags");
+            };
+            engine::undo_decision(engine::UndoRequest {
+                vault,
+                command_id,
+                decision_id,
+                expected_revision,
+                actor_id,
+                hooks,
+            })
+        }
         "cancel" => {
             let (Some(vault), Some(command_id), Some(generation)) =
                 (flags.vault, flags.command_id, flags.generation)
@@ -217,6 +280,10 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
             "--witness" => flags.witness = Some(PathBuf::from(value)),
             "--fragment" => flags.fragment = Some(PathBuf::from(value)),
             "--fact-id" => flags.fact_id = Some(value),
+            "--decision-id" => flags.decision_id = Some(value),
+            "--expected-revision" => flags.expected_revision = Some(value),
+            "--amount-text" => flags.amount_text = Some(value),
+            "--actor-id" => flags.actor_id = Some(value),
             "--format" => {
                 flags.format = Some(match value.as_str() {
                     "1" => 1,

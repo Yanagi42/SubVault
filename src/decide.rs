@@ -1,13 +1,17 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Map, Value};
 
 use crate::body;
-use crate::ids::{self, is_prefixed_id};
+use crate::fsutil::atomic_write;
+use crate::ids::{self, is_command_id, is_prefixed_id};
+use crate::journal::{self, Journal, LabelMiss};
 use crate::model::{
-    db_fail, honesty, unseen_db, Fail, Report, EXIT_OK, EXIT_RECOVERY, EXIT_USAGE, EXIT_VERSION,
+    db_fail, honesty, unseen_db, Fail, Report, EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY,
+    EXIT_REJECTED, EXIT_USAGE, EXIT_VERSION,
 };
+use crate::store;
 
 pub(super) const PAYLOAD_VERSION: &str = "t3-payload-1";
 pub(super) const RULE_ACTOR_ID: &str = "act_00000000000000000000000000000001";
@@ -434,4 +438,851 @@ fn refuse_without_facts(version: i64) -> Result<(), Fail> {
         );
     }
     Ok(())
+}
+
+const DECISION_STOPS: &[&str] = &["before_decision_commit"];
+const DECISION_INJECTS: &[&str] = &["receipt_read", "decision_tx", "db_commit"];
+
+pub struct CorrectRequest {
+    pub vault: PathBuf,
+    pub command_id: String,
+    pub fact_id: String,
+    pub expected_revision: String,
+    pub amount_text: String,
+    pub actor_id: String,
+    pub hooks: super::Hooks,
+}
+
+pub struct UndoRequest {
+    pub vault: PathBuf,
+    pub command_id: String,
+    pub decision_id: String,
+    pub expected_revision: String,
+    pub actor_id: String,
+    pub hooks: super::Hooks,
+}
+
+pub fn correct_fact(req: CorrectRequest) -> Report {
+    match correct_inner(req) {
+        Ok(body) => tag(Report {
+            code: EXIT_OK,
+            body,
+        }),
+        Err(fail) => tag(fail.into_report()),
+    }
+}
+
+pub fn undo_decision(req: UndoRequest) -> Report {
+    match undo_inner(req) {
+        Ok(body) => tag(Report {
+            code: EXIT_OK,
+            body,
+        }),
+        Err(fail) => tag(fail.into_report()),
+    }
+}
+
+fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
+    super::validate_hook_names(
+        req.hooks.stop_at.as_deref(),
+        req.hooks.inject_point.as_deref(),
+        DECISION_STOPS,
+        DECISION_INJECTS,
+        DECISION_INJECTS,
+    )?;
+    if !is_command_id(&req.command_id) {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_command_id"));
+    }
+    if !is_prefixed_id(&req.fact_id, "fact_") {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
+    }
+    let revision = parse_revision(&req.expected_revision)?;
+    if !body::usd_amount_text(&req.amount_text) {
+        return Err(rejected("amount_text_rejected"));
+    }
+    let actor_id = human_actor(&req.actor_id)?;
+    let canonical = correct_canonical(
+        &req.fact_id,
+        &req.expected_revision,
+        &req.amount_text,
+        &actor_id,
+    );
+    require_decision_vault(&req.vault)?;
+    let session = super::open_session(&req.vault)?;
+    require_fact_tables(&session.conn)?;
+    let mut hooks = super::HookRun::new(req.hooks);
+    injected_receipt_read(&hooks)?;
+    if let Some(body) = take_committed(&session, &req.command_id, &canonical)? {
+        return Ok(body);
+    }
+    let hash = super::fingerprint(&[&canonical]);
+    let mut journal = prepare_journal(&session, &req.command_id, &hash)?;
+    let fact = load_fact(&session.conn, &req.fact_id)?.ok_or_else(|| rejected("unknown_fact"))?;
+    if fact.fact_type != "stated_amount_paid" {
+        return Err(rejected("not_amount_fact"));
+    }
+    if fact.revision != revision {
+        return Err(rejected("revision_conflict"));
+    }
+    journal.state = "started".into();
+    journal.payload_fingerprint = Some(hash);
+    journal.reason = None;
+    super::write_journal(&session.root, &journal)?;
+    hooks.stop(
+        "before_decision_commit",
+        super::checkpoint_map(&req.command_id, 0, None, None, false, false),
+    )?;
+    let tx = session
+        .conn
+        .unchecked_transaction()
+        .map_err(|err| db_fail(err, "begin"))?;
+    hooks
+        .inject(
+            "decision_tx",
+            super::checkpoint_map(&req.command_id, 0, None, None, false, false),
+        )
+        .map_err(decision_inject)?;
+    let fact = load_fact(&tx, &req.fact_id)?.ok_or_else(|| rejected("unknown_fact"))?;
+    if fact.revision != revision {
+        return Err(rejected("revision_conflict"));
+    }
+    if read_receipt(&tx, &req.command_id)?.is_ready() {
+        return Err(rejected("command_race"));
+    }
+    let mut value = fact.value.clone();
+    value.insert("amount_text".into(), json!(req.amount_text));
+    let new_json = Value::Object(value).to_string();
+    let decision_id = ids::random_id("dec_").map_err(|err| crate::model::io_fail(err, "random"))?;
+    let recorded_at = super::now_ms();
+    insert_human(
+        &tx,
+        &decision_id,
+        &fact,
+        &req.command_id,
+        "human_correct",
+        &actor_id,
+        recorded_at,
+        Some(&fact.value_json),
+        &new_json,
+        None,
+    )?;
+    let updated = tx
+        .execute(
+            "UPDATE facts SET value_json = ?2, revision = ?3 WHERE fact_id = ?1 AND revision = ?4",
+            params![fact.fact_id, new_json, fact.revision + 1, fact.revision],
+        )
+        .map_err(|err| db_fail(err, "update_fact"))?;
+    if updated != 1 {
+        return Err(rejected("revision_conflict"));
+    }
+    let mut body = decision_body("Committed", &req.command_id, &fact, fact.revision + 1);
+    body.insert("decision_id".into(), json!(decision_id));
+    body.insert("amount_text".into(), json!(req.amount_text));
+    body.insert("currency".into(), json!("USD"));
+    body.insert("actor_kind".into(), json!("human"));
+    body.insert("actor_id".into(), json!(actor_id));
+    body.insert("target_decision_id".into(), Value::Null);
+    body.insert("new_effect".into(), json!(true));
+    let result = Value::Object(body);
+    let encoded = serde_json::to_string(&result)
+        .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
+    insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+    hooks
+        .inject(
+            "db_commit",
+            super::checkpoint_map(&req.command_id, 0, None, None, false, false),
+        )
+        .map_err(decision_inject)?;
+    tx.commit().map_err(|err| db_fail(err, "db_commit"))?;
+    journal.state = "committed".into();
+    journal.reason = None;
+    finish_decision(&session.root, &journal, result)
+}
+
+fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
+    super::validate_hook_names(
+        req.hooks.stop_at.as_deref(),
+        req.hooks.inject_point.as_deref(),
+        DECISION_STOPS,
+        DECISION_INJECTS,
+        DECISION_INJECTS,
+    )?;
+    if !is_command_id(&req.command_id) {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_command_id"));
+    }
+    if !is_prefixed_id(&req.decision_id, "dec_") {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
+    }
+    let revision = parse_revision(&req.expected_revision)?;
+    let actor_id = human_actor(&req.actor_id)?;
+    let canonical = undo_canonical(&req.decision_id, &req.expected_revision, &actor_id);
+    require_decision_vault(&req.vault)?;
+    let session = super::open_session(&req.vault)?;
+    require_fact_tables(&session.conn)?;
+    let mut hooks = super::HookRun::new(req.hooks);
+    injected_receipt_read(&hooks)?;
+    if let Some(body) = take_committed(&session, &req.command_id, &canonical)? {
+        return Ok(body);
+    }
+    let hash = super::fingerprint(&[&canonical]);
+    let mut journal = prepare_journal(&session, &req.command_id, &hash)?;
+    let target = load_decision(&session.conn, &req.decision_id)?
+        .ok_or_else(|| rejected("unknown_decision"))?;
+    let fact = load_fact(&session.conn, &target.fact_id)?.ok_or_else(|| {
+        Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_missing")
+            .extra("new_effect", json!(false))
+    })?;
+    if fact.revision != revision {
+        return Err(rejected("revision_conflict"));
+    }
+    if successor_count(&session.conn, &fact.fact_id, &target.decision_id)? > 0
+        || fact.value_json != target.new_value_json
+    {
+        return Err(rejected("successor_conflict"));
+    }
+    journal.state = "started".into();
+    journal.payload_fingerprint = Some(hash);
+    journal.reason = None;
+    super::write_journal(&session.root, &journal)?;
+    hooks.stop(
+        "before_decision_commit",
+        super::checkpoint_map(&req.command_id, 0, None, None, false, false),
+    )?;
+    let tx = session
+        .conn
+        .unchecked_transaction()
+        .map_err(|err| db_fail(err, "begin"))?;
+    hooks
+        .inject(
+            "decision_tx",
+            super::checkpoint_map(&req.command_id, 0, None, None, false, false),
+        )
+        .map_err(decision_inject)?;
+    let target =
+        load_decision(&tx, &req.decision_id)?.ok_or_else(|| rejected("unknown_decision"))?;
+    let fact = load_fact(&tx, &target.fact_id)?.ok_or_else(|| {
+        Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_missing")
+            .extra("new_effect", json!(false))
+    })?;
+    if fact.revision != revision {
+        return Err(rejected("revision_conflict"));
+    }
+    if successor_count(&tx, &fact.fact_id, &target.decision_id)? > 0
+        || fact.value_json != target.new_value_json
+    {
+        return Err(rejected("successor_conflict"));
+    }
+    if read_receipt(&tx, &req.command_id)?.is_ready() {
+        return Err(rejected("command_race"));
+    }
+    let restored = match &target.prior_value_json {
+        Some(prior) => prior.clone(),
+        None => unknown_value(&fact).to_string(),
+    };
+    let decision_id = ids::random_id("dec_").map_err(|err| crate::model::io_fail(err, "random"))?;
+    let recorded_at = super::now_ms();
+    insert_human(
+        &tx,
+        &decision_id,
+        &fact,
+        &req.command_id,
+        "undo",
+        &actor_id,
+        recorded_at,
+        Some(&fact.value_json),
+        &restored,
+        Some(&target.decision_id),
+    )?;
+    let updated = tx
+        .execute(
+            "UPDATE facts SET value_json = ?2, revision = ?3 WHERE fact_id = ?1 AND revision = ?4",
+            params![fact.fact_id, restored, fact.revision + 1, fact.revision],
+        )
+        .map_err(|err| db_fail(err, "update_fact"))?;
+    if updated != 1 {
+        return Err(rejected("revision_conflict"));
+    }
+    let mut body = decision_body("Committed", &req.command_id, &fact, fact.revision + 1);
+    body.insert("decision_id".into(), json!(decision_id));
+    body.insert("target_decision_id".into(), json!(target.decision_id));
+    body.insert("actor_kind".into(), json!("human"));
+    body.insert("actor_id".into(), json!(actor_id));
+    body.insert(
+        "amount_text".into(),
+        serde_json::from_str::<Value>(&restored)
+            .ok()
+            .and_then(|value| value.get("amount_text").cloned())
+            .unwrap_or(Value::Null),
+    );
+    body.insert("new_effect".into(), json!(true));
+    let result = Value::Object(body);
+    let encoded = serde_json::to_string(&result)
+        .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
+    insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+    hooks
+        .inject(
+            "db_commit",
+            super::checkpoint_map(&req.command_id, 0, None, None, false, false),
+        )
+        .map_err(decision_inject)?;
+    tx.commit().map_err(|err| db_fail(err, "db_commit"))?;
+    journal.state = "committed".into();
+    journal.reason = None;
+    finish_decision(&session.root, &journal, result)
+}
+
+fn correct_canonical(fact_id: &str, revision: &str, amount: &str, actor_id: &str) -> String {
+    format!(
+        "{PAYLOAD_VERSION}\ncorrect\nfact_id={fact_id}\nexpected_revision={revision}\ncurrency=USD\namount_text={amount}\nactor_id={actor_id}\n"
+    )
+}
+
+fn undo_canonical(decision_id: &str, revision: &str, actor_id: &str) -> String {
+    format!(
+        "{PAYLOAD_VERSION}\nundo\ndecision_id={decision_id}\nexpected_revision={revision}\nactor_id={actor_id}\n"
+    )
+}
+
+fn parse_revision(text: &str) -> Result<i64, Fail> {
+    if text.is_empty()
+        || text.starts_with('+')
+        || text.starts_with('-')
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_revision"));
+    }
+    let revision = text
+        .parse::<i64>()
+        .map_err(|_| Fail::new(EXIT_USAGE, "Usage", "bad_revision"))?;
+    if revision < 1 {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_revision"));
+    }
+    Ok(revision)
+}
+
+fn human_actor(actor_id: &str) -> Result<String, Fail> {
+    if !is_prefixed_id(actor_id, "act_") {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_actor"));
+    }
+    if actor_id == RULE_ACTOR_ID {
+        return Err(rejected("actor_not_human"));
+    }
+    Ok(actor_id.to_string())
+}
+
+fn require_decision_vault(vault: &Path) -> Result<(), Fail> {
+    super::guard_vault(vault)?;
+    let version = super::inspect_version_readonly(vault)?;
+    refuse_without_facts(version)?;
+    Ok(())
+}
+
+fn rejected(reason: &str) -> Fail {
+    Fail::new(EXIT_REJECTED, "Rejected", reason)
+        .extra("new_effect", json!(false))
+        .extra("decision_committed", json!(false))
+        .extra("facts_changed", json!(false))
+}
+
+fn decision_inject(mut fail: Fail) -> Fail {
+    fail.extra.insert("decision_committed".into(), json!(false));
+    fail.extra.insert("facts_changed".into(), json!(false));
+    fail.extra.insert(
+        "note".into(),
+        json!("injected fault before commit; not a COMMIT visibility result"),
+    );
+    fail
+}
+
+fn injected_receipt_read(hooks: &super::HookRun) -> Result<(), Fail> {
+    if hooks.hooks.inject_point.as_deref() != Some("receipt_read") {
+        return Ok(());
+    }
+    let path = hooks.hooks.witness.clone().ok_or_else(|| {
+        Fail::new(EXIT_USAGE, "Usage", "witness_required").extra("point", json!("receipt_read"))
+    })?;
+    atomic_write(
+        &path,
+        br#"{"reached":true,"point":"receipt_read","action":"unseen"}"#,
+    )
+    .map_err(|err| crate::model::io_fail(err, "witness"))?;
+    Err(
+        Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unseen")
+            .extra("injected", json!(true))
+            .extra("inject_point", json!("receipt_read"))
+            .extra(
+                "note",
+                json!("injected fault, not a failed read and not a commit result"),
+            )
+            .extra("new_effect", json!(false))
+            .extra("decision_committed", json!(false)),
+    )
+}
+
+enum ReceiptRead {
+    Absent,
+    Ready {
+        canonical: String,
+        result_json: String,
+    },
+    Unreadable,
+}
+
+impl ReceiptRead {
+    fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+}
+
+fn read_receipt(conn: &Connection, command_id: &str) -> Result<ReceiptRead, Fail> {
+    let row = conn
+        .query_row(
+            "SELECT payload_version, canonical_payload, result_json FROM t3_receipts WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| {
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unseen")
+                .extra("during", json!("t3_receipt"))
+                .extra("new_effect", json!(false))
+                .extra("decision_committed", json!(false))
+        })?;
+    let Some((version, canonical, result_json)) = row else {
+        return Ok(ReceiptRead::Absent);
+    };
+    if version != PAYLOAD_VERSION {
+        return Ok(ReceiptRead::Unreadable);
+    }
+    match serde_json::from_str::<Value>(&result_json) {
+        Ok(Value::Object(_)) => Ok(ReceiptRead::Ready {
+            canonical,
+            result_json,
+        }),
+        _ => Ok(ReceiptRead::Unreadable),
+    }
+}
+
+fn take_committed(
+    session: &super::Session,
+    command_id: &str,
+    canonical: &str,
+) -> Result<Option<Value>, Fail> {
+    match read_receipt(&session.conn, command_id)? {
+        ReceiptRead::Unreadable => {
+            Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unreadable")
+                    .extra("new_effect", json!(false))
+                    .extra("decision_committed", json!(false)),
+            )
+        }
+        ReceiptRead::Absent => {
+            if store::command(&session.conn, command_id)
+                .map_err(|err| unseen_db(err, "command_lookup"))?
+                .is_some()
+            {
+                Err(rejected("command_kind_conflict"))
+            } else {
+                Ok(None)
+            }
+        }
+        ReceiptRead::Ready {
+            canonical: stored,
+            result_json,
+        } => {
+            if stored != canonical {
+                return Err(rejected("payload_conflict"));
+            }
+            let mut value: Value = serde_json::from_str(&result_json).map_err(|_| {
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unreadable")
+                    .extra("new_effect", json!(false))
+            })?;
+            let Some(map) = value.as_object_mut() else {
+                return Err(
+                    Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unreadable")
+                        .extra("new_effect", json!(false)),
+                );
+            };
+            map.insert("outcome".into(), json!("AlreadyCommitted"));
+            map.insert("new_effect".into(), json!(false));
+            if let Err(fail) = label_committed_if_present(&session.root, command_id) {
+                if fail.extra.get("during").and_then(Value::as_str) != Some("journal_write") {
+                    return Err(fail);
+                }
+                map.insert("post_commit_io".into(), json!(true));
+                map.insert("journal_label_update".into(), json!("failed"));
+            }
+            Ok(Some(value))
+        }
+    }
+}
+
+fn label_committed_if_present(root: &Path, command_id: &str) -> Result<(), Fail> {
+    let path = journal::path(root, command_id);
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut journal = journal::read_file(&path).map_err(|_| {
+        Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
+            .extra("new_effect", json!(false))
+    })?;
+    if journal.kind != "decision" {
+        return Err(rejected("command_kind_conflict"));
+    }
+    if journal.state == "committed" {
+        return Ok(());
+    }
+    journal.state = "committed".into();
+    journal.reason = None;
+    super::write_journal(root, &journal)?;
+    Ok(())
+}
+
+fn prepare_journal(
+    session: &super::Session,
+    command_id: &str,
+    hash: &str,
+) -> Result<Journal, Fail> {
+    require_fact_tables(&session.conn)?;
+    let path = journal::path(&session.root, command_id);
+    if !path.exists() {
+        return Ok(fresh_journal(command_id));
+    }
+    let journal = journal::read_file(&path).map_err(|_| {
+        Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
+            .extra("new_effect", json!(false))
+    })?;
+    if journal.kind != "decision" {
+        return Err(rejected("command_kind_conflict"));
+    }
+    if let Some(previous) = &journal.payload_fingerprint {
+        if previous != hash {
+            return Err(rejected("payload_conflict"));
+        }
+    }
+    match journal.state.as_str() {
+        "started" | "aborted" => Ok(journal),
+        "committed" => Err(
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_missing")
+                .extra("new_effect", json!(false))
+                .extra("decision_committed", json!(false)),
+        ),
+        _ => Err(
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "decision_journal_state")
+                .extra("new_effect", json!(false))
+                .extra("decision_committed", json!(false)),
+        ),
+    }
+}
+
+fn fresh_journal(command_id: &str) -> Journal {
+    Journal {
+        command_id: command_id.to_string(),
+        kind: "decision".into(),
+        generation: 1,
+        state: "started".into(),
+        batch_id: None,
+        display_name: None,
+        external_path: None,
+        media_type: None,
+        occurrence_id: None,
+        object_id: None,
+        content_sha256: None,
+        byte_length: None,
+        payload_fingerprint: None,
+        storage_reused: None,
+        reason: None,
+        marker_value: None,
+        source_id: None,
+    }
+}
+
+struct FactHead {
+    fact_id: String,
+    fact_type: String,
+    value_json: String,
+    value: Map<String, Value>,
+    revision: i64,
+    candidate_id: String,
+    source_id: String,
+}
+
+fn load_fact(conn: &Connection, fact_id: &str) -> Result<Option<FactHead>, Fail> {
+    let row = conn
+        .query_row(
+            "SELECT fact_id, fact_type, value_json, revision, candidate_id, source_id FROM facts WHERE fact_id = ?1",
+            [fact_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| unseen_db(err, "fact_lookup"))?;
+    let Some((fact_id, fact_type, value_json, revision, candidate_id, source_id)) = row else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(&value_json).map_err(|_| {
+        Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_value_unreadable")
+            .extra("fact_id", json!(fact_id))
+            .extra("new_effect", json!(false))
+    })?;
+    let Value::Object(value) = value else {
+        return Err(
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_value_unreadable")
+                .extra("fact_id", json!(fact_id))
+                .extra("new_effect", json!(false)),
+        );
+    };
+    Ok(Some(FactHead {
+        fact_id,
+        fact_type,
+        value_json,
+        value,
+        revision,
+        candidate_id,
+        source_id,
+    }))
+}
+
+struct DecisionHead {
+    decision_id: String,
+    fact_id: String,
+    new_value_json: String,
+    prior_value_json: Option<String>,
+}
+
+fn load_decision(conn: &Connection, decision_id: &str) -> Result<Option<DecisionHead>, Fail> {
+    let row = conn
+        .query_row(
+            "SELECT decision_id, fact_id, new_value_json, prior_value_json FROM decisions WHERE decision_id = ?1",
+            [decision_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| unseen_db(err, "decision_lookup"))?;
+    Ok(row.map(|row| DecisionHead {
+        decision_id: row.0,
+        fact_id: row.1,
+        new_value_json: row.2,
+        prior_value_json: row.3,
+    }))
+}
+
+fn successor_count(conn: &Connection, fact_id: &str, decision_id: &str) -> Result<i64, Fail> {
+    conn.query_row(
+        "SELECT count(*) FROM decisions WHERE fact_id = ?1 AND rowid > (SELECT rowid FROM decisions WHERE decision_id = ?2)",
+        params![fact_id, decision_id],
+        |row| row.get(0),
+    )
+    .map_err(|err| unseen_db(err, "successor_lookup"))
+}
+
+fn insert_human(
+    tx: &Transaction<'_>,
+    decision_id: &str,
+    fact: &FactHead,
+    command_id: &str,
+    kind: &str,
+    actor_id: &str,
+    recorded_at: i64,
+    prior: Option<&str>,
+    new_value: &str,
+    target: Option<&str>,
+) -> Result<(), Fail> {
+    tx.execute(
+        "INSERT INTO decisions(decision_id, fact_id, command_id, candidate_id, slot, kind, actor_kind, actor_id, recorded_at, rule_version, prior_value_json, new_value_json, target_decision_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'human', ?7, ?8, NULL, ?9, ?10, ?11)",
+        params![
+            decision_id,
+            fact.fact_id,
+            command_id,
+            fact.candidate_id,
+            fact.fact_type,
+            kind,
+            actor_id,
+            recorded_at,
+            prior,
+            new_value,
+            target
+        ],
+    )
+    .map_err(|err| db_fail(err, "insert_decision"))?;
+    Ok(())
+}
+
+fn unknown_value(fact: &FactHead) -> Value {
+    let mut value = Map::new();
+    value.insert("type".into(), json!(fact.fact_type));
+    value.insert("statement".into(), json!("unknown"));
+    value.insert("payment_verified".into(), json!(false));
+    value.insert("purchase_id".into(), Value::Null);
+    value.insert("account_id".into(), Value::Null);
+    value.insert("observed_at".into(), Value::Null);
+    value.insert("time_status".into(), json!("unknown"));
+    value.insert("current_status".into(), json!("unknown"));
+    if fact.fact_type == "stated_amount_paid" {
+        value.insert("currency".into(), json!("USD"));
+        value.insert("amount_text".into(), Value::Null);
+    } else {
+        value.insert("period_start".into(), Value::Null);
+        value.insert("period_end".into(), Value::Null);
+    }
+    Value::Object(value)
+}
+
+fn decision_body(
+    outcome: &str,
+    command_id: &str,
+    fact: &FactHead,
+    revision: i64,
+) -> Map<String, Value> {
+    let mut body = honesty(outcome);
+    body.insert("slice".into(), json!("T3-facts"));
+    body.insert("command_id".into(), json!(command_id));
+    body.insert("fact_id".into(), json!(fact.fact_id));
+    body.insert("source_id".into(), json!(fact.source_id));
+    body.insert("candidate_id".into(), json!(fact.candidate_id));
+    body.insert("revision".into(), json!(revision));
+    body.insert("observed_at".into(), Value::Null);
+    body.insert("time_status".into(), json!("unknown"));
+    body.insert("current_status".into(), json!("unknown"));
+    body.insert("payment_verified".into(), json!(false));
+    body.insert("account_id".into(), Value::Null);
+    body.insert("payload_version".into(), json!(PAYLOAD_VERSION));
+    body.insert("rule_version".into(), Value::Null);
+    body
+}
+
+fn finish_decision(root: &Path, journal: &Journal, mut result: Value) -> Result<Value, Fail> {
+    match super::write_journal(root, journal) {
+        Ok(()) => Ok(result),
+        Err(fail) => {
+            if let Some(map) = result.as_object_mut() {
+                map.insert("post_commit_io".into(), json!(true));
+                map.insert("journal_label_update".into(), json!("failed"));
+                map.insert("new_effect".into(), json!(true));
+                if let Some(during) = fail.extra.get("during") {
+                    map.insert("during".into(), during.clone());
+                }
+            }
+            Ok(result)
+        }
+    }
+}
+
+pub(super) fn reconcile_decision_journals(
+    root: &Path,
+    conn: &Connection,
+) -> Result<Vec<LabelMiss>, Fail> {
+    let found = journal::scan(root);
+    if found.unlisted.is_some() {
+        return Ok(Vec::new());
+    }
+    let pending = found.valid.iter().any(|journal| {
+        journal.kind == "decision" && journal.state != "committed" && journal.state != "aborted"
+    });
+    if pending {
+        require_fact_tables(conn)?;
+    }
+    for journal in &found.valid {
+        if journal.kind != "decision" {
+            continue;
+        }
+        if matches!(
+            read_receipt(conn, &journal.command_id)?,
+            ReceiptRead::Unreadable
+        ) {
+            return Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unreadable")
+                    .extra("command_id", json!(journal.command_id))
+                    .extra("new_effect", json!(false)),
+            );
+        }
+    }
+    let mut misses = Vec::new();
+    for journal in found.valid {
+        if journal.kind != "decision" || journal.state == "committed" || journal.state == "aborted"
+        {
+            continue;
+        }
+        if journal.state != "started" {
+            return Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "decision_journal_state")
+                    .extra("command_id", json!(journal.command_id))
+                    .extra("new_effect", json!(false)),
+            );
+        }
+        let mut journal = journal;
+        match read_receipt(conn, &journal.command_id)? {
+            ReceiptRead::Unreadable => {
+                return Err(
+                    Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unreadable")
+                        .extra("command_id", json!(journal.command_id))
+                        .extra("new_effect", json!(false)),
+                );
+            }
+            ReceiptRead::Ready { .. } => {
+                journal.state = "committed".into();
+                journal.reason = None;
+            }
+            ReceiptRead::Absent => {
+                journal.state = "aborted".into();
+                journal.reason = Some("uncommitted".into());
+            }
+        }
+        if let Err(fail) = super::write_journal(root, &journal) {
+            misses.push(LabelMiss {
+                command_id: journal.command_id,
+                during: fail
+                    .extra
+                    .get("during")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("journal_write")
+                    .to_string(),
+                os_error: fail
+                    .extra
+                    .get("os_error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(fail.reason.as_str())
+                    .to_string(),
+            });
+        }
+    }
+    Ok(misses)
+}
+
+pub(super) fn reject_if_t3_command(conn: &Connection, command_id: &str) -> Result<(), Fail> {
+    if !store::table_exists(conn, "t3_receipts").map_err(|err| unseen_db(err, "t3_receipt"))? {
+        return Ok(());
+    }
+    match read_receipt(conn, command_id)? {
+        ReceiptRead::Absent => Ok(()),
+        ReceiptRead::Unreadable => {
+            Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unreadable")
+                    .extra("new_effect", json!(false)),
+            )
+        }
+        ReceiptRead::Ready { .. } => Err(rejected("command_kind_conflict")),
+    }
 }

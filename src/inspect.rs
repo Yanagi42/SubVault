@@ -181,10 +181,13 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
     }
     let command_ids: std::collections::BTreeSet<&str> =
         commands.iter().map(|row| row.command_id.as_str()).collect();
+    let receipt_ids = t3_receipt_ids(conn)?;
     let mut incomplete = Vec::new();
     if journals.unlisted.is_none() {
         for journal in &journals.valid {
-            if command_ids.contains(journal.command_id.as_str()) {
+            if command_ids.contains(journal.command_id.as_str())
+                || receipt_ids.iter().any(|id| id == &journal.command_id)
+            {
                 continue;
             }
             let fragment_source = journal.kind == "fragment";
@@ -314,4 +317,21 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
         code,
         body: Value::Object(body),
     })
+}
+
+fn t3_receipt_ids(conn: &Connection) -> Result<Vec<String>, Fail> {
+    if !store::table_exists(conn, "t3_receipts").map_err(|err| unseen_db(err, "t3_receipt"))? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT command_id FROM t3_receipts")
+        .map_err(|err| unseen_db(err, "t3_receipt"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| unseen_db(err, "t3_receipt"))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row.map_err(|err| unseen_db(err, "t3_receipt"))?);
+    }
+    Ok(ids)
 }

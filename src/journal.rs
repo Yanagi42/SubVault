@@ -13,7 +13,7 @@ use crate::store;
 // A missing optional key and JSON null are both absent.
 // payload_fingerprint stays optional: an in-progress journal can be
 // written before the bytes are hashed, and a missing fingerprint is not
-// damage. kind is import, marker, or fragment. state is started, copying,
+// damage. kind is import, marker, fragment, or decision. state is started, copying,
 // object_ready, aborted, or committed. There is no second journal version.
 macro_rules! journal_ty {
     (req_str) => { String };
@@ -133,7 +133,11 @@ fn accept(journal: &Journal) -> Result<(), ()> {
     if !is_command_id(&journal.command_id) {
         return Err(());
     }
-    if journal.kind != "import" && journal.kind != "marker" && journal.kind != "fragment" {
+    if journal.kind != "import"
+        && journal.kind != "marker"
+        && journal.kind != "fragment"
+        && journal.kind != "decision"
+    {
         return Err(());
     }
     if journal.generation < 1 {
@@ -283,7 +287,7 @@ pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<Reconcile, Fai
     }
     let mut missed = Vec::new();
     for journal in found.valid {
-        if journal.state == "committed" {
+        if journal.state == "committed" || journal.kind == "decision" {
             continue;
         }
         if store::command(conn, &journal.command_id)
