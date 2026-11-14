@@ -1038,7 +1038,11 @@ fn require_vault_shape(path: &Path) -> Result<(), Fail> {
 }
 
 fn banner_exact(path: &Path) -> Result<bool, Fail> {
-    let bytes = fs::read(path.join("SYNTHETIC_ONLY")).map_err(|err| io_fail(err, "banner"))?;
+    // A failed read has not examined any object. That is the same class as an
+    // unreadable vault.db: unknown, with no preservation verdict. Bytes that
+    // were read and do not match stay NotSynthetic below, and are not rewritten.
+    let bytes = fs::read(path.join("SYNTHETIC_ONLY"))
+        .map_err(|err| vault_unreadable(&err, "banner_unreadable", "banner"))?;
     Ok(bytes == VAULT_BANNER.as_bytes())
 }
 
@@ -1049,18 +1053,18 @@ fn sqlite_header_ok(path: &Path) -> Result<bool, Fail> {
     // a damaged file, because those bytes were actually read.
     let mut file = match File::open(path) {
         Ok(file) => file,
-        Err(err) => return Err(vault_unreadable(&err, "sqlite_header")),
+        Err(err) => return Err(vault_unreadable(&err, "vault_unreadable", "sqlite_header")),
     };
     let mut buf = [0u8; 16];
     let n = match file.read(&mut buf) {
         Ok(n) => n,
-        Err(err) => return Err(vault_unreadable(&err, "sqlite_header")),
+        Err(err) => return Err(vault_unreadable(&err, "vault_unreadable", "sqlite_header")),
     };
     Ok(n == 16 && &buf == b"SQLite format 3\0")
 }
 
-fn vault_unreadable(err: &io::Error, during: &str) -> Fail {
-    Fail::new(EXIT_UNCERTAIN, "Uncertain", "vault_unreadable")
+fn vault_unreadable(err: &io::Error, reason: &'static str, during: &str) -> Fail {
+    Fail::new(EXIT_UNCERTAIN, "Uncertain", reason)
         .extra("during", json!(during))
         .extra("os_error", json!(err.to_string()))
         .extra("new_effect", Value::Null)

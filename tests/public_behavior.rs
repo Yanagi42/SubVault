@@ -3926,6 +3926,158 @@ fn journal_label_miss_survives_one_unreadable_object() {
     assert_eq!(journal["state"], "committed");
 }
 
+#[test]
+fn unreadable_banner_does_not_invent_a_preservation_verdict() {
+    let tmp = Tmp::new("banner-unreadable");
+    vault_init(&tmp);
+    let pdf = import(
+        &tmp,
+        "old",
+        "application/pdf",
+        &corpus().join("originals/v-2026-09-receipt.pdf"),
+    );
+    mark_old(&tmp, pdf["source_id"].as_str().unwrap());
+    import(
+        &tmp,
+        "csv",
+        "text/csv",
+        &corpus().join("originals/store-export-work.csv"),
+    );
+    let (before_code, before) = open_vault(&tmp);
+    assert_eq!(before_code, 0, "{before}");
+    let occurrences = before["occurrences"].as_array().unwrap().len();
+    let banner = vault(&tmp).join("SYNTHETIC_ONLY");
+    let banner_bytes = fs::read(&banner).unwrap();
+    let mode = fs::metadata(&banner).unwrap().mode();
+    fs::set_permissions(&banner, fs::Permissions::from_mode(0o0)).unwrap();
+    let _restore = RestoreMode {
+        path: banner.clone(),
+        mode,
+    };
+    let open = run(
+        "banner-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    let verify = run(
+        "banner-verify",
+        &["verify", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    let recover = run(
+        "banner-recover",
+        &["recover", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(open.code, Some(21), "{}", open.stdout);
+    assert_eq!(verify.stdout, open.stdout);
+    assert_eq!(recover.stdout, open.stdout);
+    let again = run(
+        "banner-open-again",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(again.stdout, open.stdout);
+    let body = parse(&open);
+    assert_eq!(body["outcome"], "Uncertain");
+    assert_eq!(body["reason"], "banner_unreadable");
+    assert_eq!(body["during"], "banner");
+    assert!(body["new_effect"].is_null(), "{body}");
+    assert!(body.get("preservation").is_none(), "{body}");
+    assert!(body.get("sources").is_none(), "{body}");
+    assert_eq!(body["injected"], false);
+    assert_denied(body["os_error"].as_str().unwrap());
+    assert_eq!(fs::metadata(&banner).unwrap().mode() & 0o777, 0);
+    assert_eq!(
+        fs::metadata(&banner).unwrap().len(),
+        banner_bytes.len() as u64
+    );
+    let out = tmp.path().join("blocked.pdf");
+    let read = run(
+        "banner-read",
+        &[
+            "read",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--source-id",
+            pdf["source_id"].as_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(read.code, Some(21), "{}", read.stdout);
+    let read_body = parse(&read);
+    assert_eq!(read_body["reason"], "banner_unreadable");
+    assert_eq!(read_body["during"], "banner");
+    assert!(read_body["new_effect"].is_null(), "{read_body}");
+    assert!(read_body.get("preservation").is_none(), "{read_body}");
+    assert!(!out.exists());
+    let replay = run(
+        "banner-replay",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "old",
+            "--media-type",
+            "application/pdf",
+            "--source",
+            corpus()
+                .join("originals/v-2026-09-receipt.pdf")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    assert_eq!(replay.code, Some(21), "{}", replay.stdout);
+    let replay_body = parse(&replay);
+    assert_eq!(replay_body["reason"], "banner_unreadable");
+    assert_eq!(replay_body["during"], "banner");
+    assert!(replay_body["new_effect"].is_null(), "{replay_body}");
+    assert!(replay_body.get("preservation").is_none(), "{replay_body}");
+    let cancel = run(
+        "banner-cancel",
+        &[
+            "cancel",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "old",
+            "--generation",
+            "1",
+        ],
+    );
+    assert_eq!(cancel.code, Some(21), "{}", cancel.stdout);
+    let cancel_body = parse(&cancel);
+    assert_eq!(cancel_body["reason"], "banner_unreadable");
+    assert_eq!(cancel_body["during"], "banner");
+    assert!(cancel_body["new_effect"].is_null(), "{cancel_body}");
+    assert!(cancel_body.get("preservation").is_none(), "{cancel_body}");
+    assert!(!vault(&tmp).join("control").join("old").exists());
+
+    fs::set_permissions(&banner, fs::Permissions::from_mode(mode)).unwrap();
+    assert_eq!(fs::read(&banner).unwrap(), banner_bytes);
+    let (code, ready) = open_vault(&tmp);
+    assert_eq!(code, 0, "{ready}");
+    assert_eq!(ready["outcome"], "Ready");
+    assert_hosted(&ready, "old", "application/pdf", "human-edit-v1");
+    assert_hosted(&ready, "csv", "text/csv", "");
+    assert_eq!(ready["occurrences"].as_array().unwrap().len(), occurrences);
+
+    fs::write(&banner, b"real data please\n").unwrap();
+    let refused = run(
+        "banner-mismatch",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(refused.code, Some(19), "{}", refused.stdout);
+    let refused_body = parse(&refused);
+    assert_eq!(refused_body["outcome"], "NotSynthetic");
+    assert_eq!(refused_body["reason"], "banner_mismatch");
+    assert!(refused_body.get("preservation").is_none(), "{refused_body}");
+    assert_eq!(fs::read(&banner).unwrap(), b"real data please\n");
+    fs::write(&banner, &banner_bytes).unwrap();
+    let (restored_code, restored) = open_vault(&tmp);
+    assert_eq!(restored_code, 0, "{restored}");
+    assert_eq!(restored["outcome"], "Ready");
+    assert_hosted(&restored, "old", "application/pdf", "human-edit-v1");
+}
+
 fn journal_snapshot(dir: &Path) -> std::collections::BTreeMap<String, String> {
     let mut files = std::collections::BTreeMap::new();
     for entry in fs::read_dir(dir).unwrap() {

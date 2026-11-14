@@ -29,6 +29,7 @@ python3 synthetic/generate_corpus.py --check
 - 回执里的 `preservation` 只有在 SQLite 提交成功并且这次调用核对过托管字节之后，才对那个源写成 `preserved`。提交成功后的 journal、检查点或回执写入失败仍返回 `Committed`，并带 `post_commit_io`；这不能再写成确定的 `NotPreserved`。`arrangement` 固定为 `not_arranged`，`searchability` 固定为 `not_searchable`。数据库约束也拒绝其他值。
 - 打开、`verify` 和 `recover` 共用一条路径。命令行已经存在而 journal 标签写不回去时，不把这次失败写成整个库 `NotPreserved`。各源仍按自己的行报告 `preservation=preserved` 和 `object_intact`。标签没写成是这次调用的另一件事：退出码 3，`IntegrityAlert`，`journal_label_update` 为 `failed`，`new_effect` 为 false。重复打开的回执相同，不改对象字节，journal 文件保持原文字。同一条已提交命令再次导入仍是 `AlreadyCommitted`，回执同时带上标签没能更新；这不是 `NotPreserved`。还没有命令行的 journal 不会被改写成已提交，那条未完成命令仍是 `not_preserved`，已经提交的源仍是 `preserved`。`vault.db` 这个文件读不出来时退出码 21，reason 是 `vault_unreadable`，`new_effect` 为 null，回执里没有 `preservation`。那是这次打不开数据库文件，不是 `COMMIT` 失败，也不是断电或坏盘。
 - 某一个已提交源的托管对象这次读不出来时，打开、`verify` 和 `recover` 仍列出每一个来源、旧 `user_marker`、出现记录和命令行。读得出的源是 `preservation=preserved`、`object_intact=true`。读不出的那条保留来源、对象身份、已保存的哈希、长度和媒体类型；它的 `preservation` 和 `object_intact` 是 null，表示历史提交还在、这次完整性不可核。这不是 `not_preserved`，也不是完整。告警是 `object_unreadable`，带 `during=hash_object` 和真实的 `os_error`。没有悬空引用时退出码是 3，`new_effect` 为 false。换一个对象读失败，回执里的两个来源都还在。重复打开的回执相同，对象字节不变。单独 `read` 或重放那个读不出的对象仍是退出码 12，回执不写 `preservation`。对象目录列不出来是告警 `objects_unlisted`（`during=read_objects`）；目录进不去时，来源按这次读失败处理，不写成对象缺失。未引用对象哈希读失败是告警 `orphan_unreadable`（`during=hash_orphan`），并且不给那个文件填一个哈希。这两条都不把已提交源改成未保全，也不把一个对象的未知扩大成整个库未知。journal 标签写失败仍叠在同一份报告上。
+- `SYNTHETIC_ONLY` 读不出来时，打开、`verify`、`recover`、`read`、已提交命令的再次导入和 `cancel` 都是退出码 21，reason 是 `banner_unreadable`，`during` 是 `banner`，`new_effect` 为 null，回执里没有 `preservation`。对象还没被查看，所以既不写成已保全，也不写成未保全，也不列出一份假的来源清单。横幅文件不被创建或改写。横幅内容确实读到了但不匹配，仍是退出码 19，`NotSynthetic`，文件保持读到的内容。
 
 `user_marker` 是一条已提交的观察用文本，用来确认后来的导入、失败和重试没有改掉旧值。它不是订阅事实。导入不会改写它。
 
@@ -50,9 +51,9 @@ python3 synthetic/generate_corpus.py --check
 | 16 | 拒绝。载荷冲突、代次不符，或提取取消 |
 | 17 | 请求的故障点在这次命令上不可能到达。命令不会假装成功 |
 | 18 | 文件系统被识别为 NFS 或 SMB/CIFS |
-| 19 | 横幅不是合成库横幅 |
+| 19 | 横幅内容已经读到，并且不是合成库横幅。不改写横幅文件 |
 | 20 | 请求的停止点没有到达 |
-| 21 | 提交结果无法确定，或这次读不到 `vault.db`。读不到文件时 reason 是 `vault_unreadable`，`new_effect` 为 null，不写 `preservation`。这是真实的权限错误，不是注入，也不是 `COMMIT` 或 WAL `fsync` 失败。后两条仍没有实测 |
+| 21 | 提交结果无法确定，或这次读不到 `vault.db` 或 `SYNTHETIC_ONLY`。读不到 `vault.db` 时 reason 是 `vault_unreadable`，`during` 是 `sqlite_header`。读不到横幅时 reason 是 `banner_unreadable`，`during` 是 `banner`。两种都不写 `preservation`，`new_effect` 为 null，也不创建或改写横幅。这是真实的权限错误，不是注入，也不是 `COMMIT` 或 WAL `fsync` 失败。后两条仍没有实测。横幅内容已经读到但不匹配，仍是退出码 19，不是 21 |
 
 `--stop-at during_copy` 在对象发布前停下，包括 0 字节、1 字节、2 字节，以及把第一次 `read` 强制成 1 字节的情况。多字节读取会留下短于全文的前缀。这个强制短读只作用于路径名含 `SHORTREAD-` 的文件，不是 ext4 自然短读，也不是故障注入。一次复制只停一次，恢复后把剩余字节写完。
 
