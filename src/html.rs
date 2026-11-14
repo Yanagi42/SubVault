@@ -103,12 +103,6 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
         confirm_object(&session.root, &source)?;
         return persist_reuse(&session, &req, &source, &hash);
     }
-    let sources = store::list_sources(&session.conn).map_err(|err| db_fail(err, "list_sources"))?;
-    if !sources.is_empty() {
-        return Err(Fail::new(EXIT_REJECTED, "Rejected", "one_html_document")
-            .extra("new_effect", json!(false))
-            .extra("preservation", json!(PRESERVED)));
-    }
     let mut journal = start_journal(&session.root, &req)?;
     let key = logical_key(&hash);
     journal.content_sha256 = Some(hash.clone());

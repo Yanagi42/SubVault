@@ -637,11 +637,16 @@ fn html_boundaries_do_not_wipe_or_invent_facts() {
 
     let other = write_source(&tmp, "other.html", b"<p>Amount paid USD 10.00</p>");
     let (code, second) = html(&replay, "other", &other);
-    assert_eq!(code, 16, "{second}");
-    assert_eq!(second["reason"], "one_html_document");
-    assert_eq!(second["new_effect"], false);
-    assert_eq!(sql(&replay, "SELECT count(*) FROM sources;"), "1");
+    assert_eq!(code, 0, "{second}");
+    assert_eq!(second["new_effect"], true);
+    assert_ne!(second["source_id"], first["source_id"]);
+    assert_ne!(second["object_id"], object_id);
+    assert_eq!(sql(&replay, "SELECT count(*) FROM sources;"), "2");
     assert_eq!(object_bytes(&replay, &object_id), BILL.as_bytes());
+    assert_eq!(
+        object_bytes(&replay, second["object_id"].as_str().unwrap()),
+        b"<p>Amount paid USD 10.00</p>"
+    );
 
     let facts_before = sql(&replay, "SELECT count(*) FROM facts;");
     let same = write_source(&tmp, "same.html", BILL.as_bytes());
@@ -653,7 +658,7 @@ fn html_boundaries_do_not_wipe_or_invent_facts() {
     assert_eq!(preserved["content_identity"], "same_bytes");
     assert_eq!(preserved["db_committed"], true);
     assert_eq!(preserved["source_id"], first["source_id"]);
-    assert_eq!(sql(&replay, "SELECT count(*) FROM sources;"), "1");
+    assert_eq!(sql(&replay, "SELECT count(*) FROM sources;"), "2");
     assert_eq!(sql(&replay, "SELECT count(*) FROM facts;"), facts_before);
     assert_eq!(
         sql(
@@ -682,7 +687,7 @@ fn html_boundaries_do_not_wipe_or_invent_facts() {
     assert_eq!(code, 16, "{again}");
     assert_eq!(again["reason"], "payload_conflict");
     assert_eq!(again["new_effect"], false);
-    assert_eq!(sql(&replay, "SELECT count(*) FROM sources;"), "1");
+    assert_eq!(sql(&replay, "SELECT count(*) FROM sources;"), "2");
     assert_eq!(sql(&replay, "SELECT count(*) FROM facts;"), facts_before);
     assert_eq!(object_bytes(&replay, &object_id), BILL.as_bytes());
 }
