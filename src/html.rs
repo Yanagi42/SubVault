@@ -11,7 +11,7 @@ use crate::ids::{self, canonical_object_relpath, hex_encode, is_command_id, is_d
 use crate::journal::{self, Journal};
 use crate::model::{
     db_fail, honesty, io_fail, unseen_db, Fail, Report, EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY,
-    EXIT_REJECTED, EXIT_USAGE, EXIT_VERSION, NOT_PRESERVED, PRESERVED,
+    EXIT_REJECTED, EXIT_USAGE, NOT_PRESERVED, PRESERVED,
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
@@ -73,19 +73,7 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
             return Err(Fail::new(EXIT_USAGE, "Usage", "bad_batch_id"));
         }
     }
-    match super::accept_wal_format(&req.vault.join("vault.db"))? {
-        4 => {}
-        version => {
-            return Err(
-                Fail::new(EXIT_VERSION, "VersionUnsupported", "html_requires_format_4")
-                    .extra("schema_version_found", json!(version))
-                    .extra("vault_format", json!(version))
-                    .extra("new_effect", json!(false))
-                    .extra("created_new_vault", json!(false)),
-            );
-        }
-    }
-    let session = super::open_session(&req.vault)?;
+    let session = super::open_html_session(&req.vault)?;
     if let Some(existing) = store::command(&session.conn, &req.command_id)
         .map_err(|err| unseen_db(err, "command_lookup"))?
     {

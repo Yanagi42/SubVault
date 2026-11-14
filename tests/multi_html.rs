@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 
 use serde_json::Value;
 
@@ -86,13 +87,7 @@ fn sql(vault: &Path, query: &str) -> String {
 
 fn init(tmp: &Tmp) -> PathBuf {
     let vault = tmp.path.join("vault");
-    let (code, body) = run(&[
-        "init",
-        "--vault",
-        vault.to_str().unwrap(),
-        "--format",
-        "4",
-    ]);
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "4"]);
     assert_eq!(code, 0, "{body}");
     vault
 }
@@ -177,12 +172,24 @@ fn two_documents_stay_separate_through_correction_and_a_new_file() {
     assert_eq!(object_bytes(&vault, &object_b), DOC_B.as_bytes());
 
     let listed = facts(&vault);
-    assert_eq!(amount_of(&listed, &source_a)["value"]["amount_text"], "15.99");
-    assert_eq!(amount_of(&listed, &source_b)["value"]["amount_text"], "15.99");
+    assert_eq!(
+        amount_of(&listed, &source_a)["value"]["amount_text"],
+        "15.99"
+    );
+    assert_eq!(
+        amount_of(&listed, &source_b)["value"]["amount_text"],
+        "15.99"
+    );
     assert_eq!(amount_of(&listed, &source_a)["revision"], 1);
     assert_eq!(amount_of(&listed, &source_b)["revision"], 1);
-    assert_eq!(period_of(&listed, &source_a)["value"]["period_start"], "2026-09-01");
-    assert_eq!(period_of(&listed, &source_b)["value"]["period_start"], "2024-01-02");
+    assert_eq!(
+        period_of(&listed, &source_a)["value"]["period_start"],
+        "2026-09-01"
+    );
+    assert_eq!(
+        period_of(&listed, &source_b)["value"]["period_start"],
+        "2024-01-02"
+    );
     assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "2");
     let (code, candidates) = run(&["candidates", "--vault", vault.to_str().unwrap()]);
     assert_eq!(code, 0, "{candidates}");
@@ -220,9 +227,15 @@ fn two_documents_stay_separate_through_correction_and_a_new_file() {
     assert_eq!(code, 0, "{corrected}");
     let decision = corrected["decision_id"].as_str().unwrap().to_string();
     let after_correct = facts(&vault);
-    assert_eq!(amount_of(&after_correct, &source_a)["value"]["amount_text"], "12.00");
+    assert_eq!(
+        amount_of(&after_correct, &source_a)["value"]["amount_text"],
+        "12.00"
+    );
     assert_eq!(amount_of(&after_correct, &source_a)["revision"], 2);
-    assert_eq!(amount_of(&after_correct, &source_b)["value"]["amount_text"], "15.99");
+    assert_eq!(
+        amount_of(&after_correct, &source_b)["value"]["amount_text"],
+        "15.99"
+    );
     assert_eq!(amount_of(&after_correct, &source_b)["revision"], 1);
     assert_eq!(
         sql(
@@ -256,9 +269,15 @@ fn two_documents_stay_separate_through_correction_and_a_new_file() {
     ]);
     assert_eq!(code, 0, "{undone}");
     let after_undo = facts(&vault);
-    assert_eq!(amount_of(&after_undo, &source_a)["value"]["amount_text"], "15.99");
+    assert_eq!(
+        amount_of(&after_undo, &source_a)["value"]["amount_text"],
+        "15.99"
+    );
     assert_eq!(amount_of(&after_undo, &source_a)["revision"], 3);
-    assert_eq!(amount_of(&after_undo, &source_b)["value"]["amount_text"], "15.99");
+    assert_eq!(
+        amount_of(&after_undo, &source_b)["value"]["amount_text"],
+        "15.99"
+    );
     assert_eq!(amount_of(&after_undo, &source_b)["revision"], 1);
     assert_eq!(
         sql(
@@ -291,4 +310,65 @@ fn two_documents_stay_separate_through_correction_and_a_new_file() {
     assert_eq!(clash["new_effect"], false);
     assert_eq!(object_bytes(&vault, &object_b), DOC_B.as_bytes());
     assert_eq!(amount_of(&facts(&vault), &source_b)["revision"], 1);
+}
+
+#[test]
+fn concurrent_html_keeps_one_fact_set_per_byte_sequence() {
+    let tmp = Tmp::new("race");
+    let vault = init(&tmp);
+    let left = write_file(&tmp, "left.html", DOC_A.as_bytes());
+    let right = write_file(&tmp, "right.html", DOC_B.as_bytes());
+    let same = write_file(&tmp, "same.html", DOC_A.as_bytes());
+    race(&vault, &left, &right, "race-a", "race-b");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "2");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "4");
+    race(&vault, &left, &same, "race-a2", "race-same");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "2");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "4");
+}
+
+fn race(vault: &Path, left: &Path, right: &Path, left_id: &str, right_id: &str) {
+    let vault_left = vault.to_path_buf();
+    let vault_right = vault.to_path_buf();
+    let left = left.to_path_buf();
+    let right = right.to_path_buf();
+    let left_id = left_id.to_string();
+    let right_id = right_id.to_string();
+    let first = thread::spawn(move || submit_until_stored(&vault_left, &left_id, &left));
+    let second = thread::spawn(move || submit_until_stored(&vault_right, &right_id, &right));
+    let left_body = first.join().unwrap();
+    let right_body = second.join().unwrap();
+    assert_ne!(left_body["reason"], "payload_conflict", "{left_body}");
+    assert_ne!(right_body["reason"], "payload_conflict", "{right_body}");
+}
+
+fn submit_until_stored(vault: &Path, command: &str, source: &Path) -> Value {
+    for _ in 0..40 {
+        let output = Command::new(bin())
+            .args([
+                "html",
+                "--vault",
+                vault.to_str().unwrap(),
+                "--command-id",
+                command,
+                "--source",
+                source.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let body: Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
+            panic!("stdout is not JSON ({err})\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        });
+        let code = output.status.code().unwrap_or(1);
+        if code == 11 {
+            assert_eq!(body["reason"], "writer_busy", "{stderr}");
+            thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        assert_eq!(code, 0, "{body}\nstderr:\n{stderr}");
+        return body;
+    }
+    panic!("writer stayed busy");
 }

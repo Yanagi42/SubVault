@@ -212,8 +212,8 @@ fn action_name(action: InjectAction) -> &'static str {
 
 struct Session {
     root: PathBuf,
-    _lock: VaultLock,
     conn: Connection,
+    _lock: VaultLock,
     magic: i64,
 }
 
@@ -2068,7 +2068,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
     })
 }
 
-fn guard_vault(path: &Path) -> Result<i64, Fail> {
+fn vault_shape(path: &Path) -> Result<i64, Fail> {
     require_vault_shape(path)?;
     if !banner_exact(path)? {
         return Err(
@@ -2084,18 +2084,50 @@ fn guard_vault(path: &Path) -> Result<i64, Fail> {
     if network_filesystem(magic) {
         return Err(unsupported_fs(magic));
     }
+    Ok(magic)
+}
+
+fn guard_vault(path: &Path) -> Result<i64, Fail> {
+    let magic = vault_shape(path)?;
     inspect_version_readonly(path)?;
     Ok(magic)
 }
 
-fn open_session(path: &Path) -> Result<Session, Fail> {
-    let magic = guard_vault(path)?;
-    let lock = lockfile::VaultLock::try_acquire(&path.join("writer.lock"))
+fn acquire_writer_lock(path: &Path) -> Result<lockfile::VaultLock, Fail> {
+    lockfile::VaultLock::try_acquire(&path.join("writer.lock"))
         .map_err(|err| unseen_io(err, "lock"))?
         .ok_or_else(|| {
             Fail::new(EXIT_LOCKED, "Locked", "writer_busy").extra("created_new_vault", json!(false))
-        })?;
+        })
+}
+
+fn open_session(path: &Path) -> Result<Session, Fail> {
+    let magic = vault_shape(path)?;
+    let lock = acquire_writer_lock(path)?;
+    inspect_version_readonly(path)?;
     accept_wal_format(&path.join("vault.db"))?;
+    finish_session(path, lock, magic)
+}
+
+fn open_html_session(path: &Path) -> Result<Session, Fail> {
+    let magic = vault_shape(path)?;
+    let lock = acquire_writer_lock(path)?;
+    match accept_wal_format(&path.join("vault.db"))? {
+        4 => {}
+        version => {
+            return Err(
+                Fail::new(EXIT_VERSION, "VersionUnsupported", "html_requires_format_4")
+                    .extra("schema_version_found", json!(version))
+                    .extra("vault_format", json!(version))
+                    .extra("new_effect", json!(false))
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
+    }
+    finish_session(path, lock, magic)
+}
+
+fn finish_session(path: &Path, lock: lockfile::VaultLock, magic: i64) -> Result<Session, Fail> {
     let conn = open_writer(path)?;
     Ok(Session {
         root: path.to_path_buf(),
