@@ -19,7 +19,10 @@ pub const EXTRACTOR: &str = "subvault-html";
 pub const EXTRACTOR_VERSION: &str = "1";
 pub const NORMALIZATION: &str = "html-static-text-1";
 pub const JOIN: &str = "html-block-1";
-pub const RULES_VERSION: &str = "stated-html-blocks-1";
+pub const RULES_VERSION: &str = "stated-html-blocks-2";
+const BLOCKS: &str = "p,div,li,h1,h2,h3,h4,h5,h6,blockquote,td,th";
+const CONTAINERS: &str = "html,body,ul,ol,table,thead,tbody,tfoot,tr";
+const INLINES: &str = "b,strong,i,em,span,br";
 pub const WHITESPACE: &str = "html-collapse-1";
 pub const MEDIA_TYPE: &str = "text/html;charset=utf-8";
 pub const ROLE: &str = "user_provided_html";
@@ -698,9 +701,9 @@ fn config_json() -> Value {
         "media_type": MEDIA_TYPE,
         "role": ROLE,
         "max_html_bytes": MAX_HTML_BYTES,
-        "blocks": "p,div,li,h1,h2,h3,h4,h5,h6,blockquote",
-        "inlines": "b,strong,i,em,span,br",
-        "containers": "html,body,ul,ol",
+        "blocks": BLOCKS,
+        "inlines": INLINES,
+        "containers": CONTAINERS,
         "excluded": "head,script,comment,hidden",
         "parser": PARSER,
         "parser_version": PARSER_VERSION,
@@ -720,8 +723,8 @@ fn logical_key(content_sha256: &str) -> String {
         OFFSET_UNIT,
         MEDIA_TYPE,
         ROLE,
-        "p,div,li,h1,h2,h3,h4,h5,h6,blockquote",
-        "b,strong,i,em,span,br",
+        BLOCKS,
+        INLINES,
         &MAX_HTML_BYTES.to_string(),
         content_sha256,
     ])
@@ -868,8 +871,11 @@ fn walk_tag(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Sca
         return;
     }
     match name.as_str() {
-        "html" | "body" | "ul" | "ol" => walk(&children, parser, source, scan),
-        "p" | "div" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" => {
+        "html" | "body" | "ul" | "ol" | "table" | "thead" | "tbody" | "tfoot" | "tr" => {
+            walk(&children, parser, source, scan)
+        }
+        "p" | "div" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" | "td"
+        | "th" => {
             match element_span(tag, parser, source) {
                 Some(span) => record_block(tag, parser, &name, span, scan),
                 None => scan.span_broken = true,
@@ -879,24 +885,11 @@ fn walk_tag(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Sca
                     continue;
                 };
                 let child_name = tag_name(child);
-                if matches!(
-                    child_name.as_str(),
-                    "p" | "div"
-                        | "li"
-                        | "h1"
-                        | "h2"
-                        | "h3"
-                        | "h4"
-                        | "h5"
-                        | "h6"
-                        | "blockquote"
-                        | "html"
-                        | "body"
-                        | "ul"
-                        | "ol"
-                        | "head"
-                        | "script"
-                ) {
+                if is_block(&child_name)
+                    || is_container(&child_name)
+                    || child_name == "head"
+                    || child_name == "script"
+                {
                     walk_tag(child, parser, source, scan);
                 }
             }
@@ -998,8 +991,7 @@ fn collect_inline(tag: &tl::HTMLTag, parser: &tl::Parser, scan: &mut Scan) -> St
                     "b" | "strong" | "i" | "em" | "span" => {
                         text.push_str(&collect_inline(child, parser, scan));
                     }
-                    "p" | "div" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote"
-                    | "html" | "body" | "ul" | "ol" => {}
+                    name if is_block(name) || is_container(name) => {}
                     _ => {
                         if scan.unknown.is_none() {
                             scan.unknown = Some(name);
@@ -1105,6 +1097,20 @@ fn decode_text(raw: &tl::Bytes) -> String {
     html_escape::decode_html_entities(&raw.as_utf8_str()).into_owned()
 }
 
+fn is_block(name: &str) -> bool {
+    matches!(
+        name,
+        "p" | "div" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" | "td" | "th"
+    )
+}
+
+fn is_container(name: &str) -> bool {
+    matches!(
+        name,
+        "html" | "body" | "ul" | "ol" | "table" | "thead" | "tbody" | "tfoot" | "tr"
+    )
+}
+
 fn tag_name(tag: &tl::HTMLTag) -> String {
     tag.name().as_utf8_str().to_ascii_lowercase()
 }
@@ -1157,5 +1163,34 @@ mod tests {
         );
         assert_eq!(&source[period.byte_start..period.byte_end], period.excerpt);
         assert!(period.excerpt.contains("<span>"));
+    }
+
+    #[test]
+    fn a_table_cell_keeps_the_existing_sentence_and_does_not_join_cells() {
+        let source = concat!(
+            "<table>",
+            "<tr><td>Amount paid USD <b>15&#46;99</b></td></tr>",
+            "<tr><td>Service period: <span>2026-09-01</span> through <span>2026-09-30</span></td></tr>",
+            "</table>"
+        );
+        let prepared = extract(source);
+        assert_eq!(
+            prepared.status,
+            "matched",
+            "{}",
+            prepared.reason.unwrap_or_default()
+        );
+        assert_eq!(prepared.hits[0].element, "td");
+        assert_eq!(prepared.hits[0].display, "Amount paid USD 15.99");
+        assert_eq!(
+            &source[prepared.hits[0].byte_start..prepared.hits[0].byte_end],
+            prepared.hits[0].excerpt
+        );
+        assert!(prepared.hits[0].excerpt.starts_with("<td>"));
+        assert!(prepared.hits[0].excerpt.contains("&#46;"));
+        let split = "<table><tr><th>Amount paid</th><td>USD 15.99</td></tr></table>";
+        let split_prepared = extract(split);
+        assert_eq!(split_prepared.status, "no_match");
+        assert!(split_prepared.hits.is_empty());
     }
 }
