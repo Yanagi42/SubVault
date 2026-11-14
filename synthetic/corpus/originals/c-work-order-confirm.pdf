@@ -1,0 +1,47 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 417 >>
+stream
+BT
+/F1 10 Tf
+54 760 Td
+13 TL
+(Paperlantern Cloud) Tj
+T* (Document: order confirmation) Tj
+T* (Document id: SYN-C-WORK-2026-OC-001) Tj
+T* (Order id: SYN-C-WORK-2026-031) Tj
+T* (Account: work) Tj
+T* (Account email: jordan.hale.example@paperlantern.example) Tj
+T* (Total USD 99.00) Tj
+T* (Currency: USD) Tj
+T* (Tax inclusion is not stated.) Tj
+T* (This Total is an order total whose payment nature is not stated.) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000714 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+784
+%%EOF

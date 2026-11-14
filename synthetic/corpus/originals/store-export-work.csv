@@ -1,0 +1,2 @@
+order_id,account_email,account_role,merchant,description,charged,currency,note
+SYN-C-WORK-2026-031,jordan.hale.example@paperlantern.example,work,Paperlantern Cloud,"annual plan, store export row",99.00,USD,"The charged cell is 99.00 and conflicts with invoice amount paid 107.91 for the same order. This export does not decide which figure is paid."

@@ -1,0 +1,341 @@
+{
+  "corpus_id": "subvault-synthetic-t0-v0",
+  "synthetic_only": true,
+  "disposable": true,
+  "not_user_data": true,
+  "protection_preference": "unanswered",
+  "primary_input_preference": "unanswered",
+  "review_anchor_date": "2026-11-14",
+  "t1_implements_these_judgments": false,
+  "scoring": "Future fact layer. Preserving the bytes in T1 does not pass these judgments and is not a user-ready product.",
+  "rejected_directions": [
+    "four forced status values",
+    "per-document approval queue",
+    "credential drawer as the product",
+    "folder copy treated as a complete export"
+  ],
+  "future_sequence": [
+    "preserve every original in this package",
+    "overview answers for the cases below",
+    "open the cited original in one step",
+    "correct or undo an assignment",
+    "reimport every original plus the renamed byte-identical copy",
+    "export a complete or explicitly partial copy"
+  ],
+  "cases": [
+    {
+      "id": "monthly-yearly",
+      "format_roles": ["text-pdf"],
+      "sources": [
+        "originals/v-2026-09-receipt.pdf",
+        "originals/v-2026-10-receipt.pdf",
+        "originals/c-personal-2026-invoice.pdf",
+        "originals/c-work-2026-invoice.pdf"
+      ],
+      "source_quotes": [
+        {
+          "path": "originals/v-2026-09-receipt.pdf",
+          "text": "Amount paid USD 15.99"
+        },
+        {
+          "path": "originals/v-2026-09-receipt.pdf",
+          "text": "Service period: 2026-09-01 through 2026-09-30"
+        },
+        {
+          "path": "originals/v-2026-10-receipt.pdf",
+          "text": "Amount paid USD 15.99"
+        },
+        {
+          "path": "originals/v-2026-10-receipt.pdf",
+          "text": "Service period: 2026-10-01 through 2026-10-31"
+        },
+        {
+          "path": "originals/c-personal-2026-invoice.pdf",
+          "text": "Amount paid USD 107.91"
+        },
+        {
+          "path": "originals/c-personal-2026-invoice.pdf",
+          "text": "Service period: 2026-03-01 through 2027-02-28"
+        },
+        {
+          "path": "originals/c-work-2026-invoice.pdf",
+          "text": "Amount paid USD 107.91"
+        }
+      ],
+      "future_judgment": {
+        "monthly": "Northline Video personal account has two monthly amount-paid statements, September and October 2026, USD 15.99 each. Collecting every later month is not required.",
+        "yearly": "Paperlantern Cloud has yearly amount-paid statements of USD 107.91 for service through 2027-02-28.",
+        "as_of_review_date": "On 2026-11-14 the October service period has ended. That does not by itself make the current status expired. Current status is unknown unless a later sourced statement says otherwise.",
+        "must_not": [
+          "treat September and October as one purchase because the amounts match",
+          "mark the video service currently expired only because 2026-10-31 is before 2026-11-14",
+          "require a credential for every missing month"
+        ]
+      }
+    },
+    {
+      "id": "same-merchant-two-accounts",
+      "format_roles": ["text-pdf"],
+      "sources": [
+        "originals/c-personal-2026-invoice.pdf",
+        "originals/c-work-2026-invoice.pdf"
+      ],
+      "source_quotes": [
+        {
+          "path": "originals/c-personal-2026-invoice.pdf",
+          "text": "Account email: mira.ellison.example@paperlantern.example"
+        },
+        {
+          "path": "originals/c-work-2026-invoice.pdf",
+          "text": "Account email: jordan.hale.example@paperlantern.example"
+        },
+        {
+          "path": "originals/c-personal-2026-invoice.pdf",
+          "text": "Document id: SYN-C-PERSONAL-2026-001"
+        },
+        {
+          "path": "originals/c-work-2026-invoice.pdf",
+          "text": "Document id: SYN-C-WORK-2026-001"
+        }
+      ],
+      "future_judgment": {
+        "keep_separate": "Same merchant, same amount, same service period, and same issue date stay two accounts because the account emails differ.",
+        "must_not": [
+          "merge the personal and work accounts by merchant similarity",
+          "merge them because both say Amount paid USD 107.91"
+        ]
+      }
+    },
+    {
+      "id": "onetime-original-scope",
+      "format_roles": ["text-pdf"],
+      "sources": ["originals/lumen-draft-onetime.pdf"],
+      "source_quotes": [
+        {
+          "path": "originals/lumen-draft-onetime.pdf",
+          "text": "Purchase kind: one-time"
+        },
+        {
+          "path": "originals/lumen-draft-onetime.pdf",
+          "text": "Amount paid USD 79.00"
+        },
+        {
+          "path": "originals/lumen-draft-onetime.pdf",
+          "text": "perpetual seat for one person to use Lumen Draft 4 on up to two devices they personally operate. Not transferable. No subscription term."
+        }
+      ],
+      "future_judgment": {
+        "path": "One-time purchase evidence. The license range is the original wording in the quote, not a subscription period and not a warranty record.",
+        "must_not": [
+          "widen the written seat and device limit because money was paid",
+          "invent a renewal date",
+          "store a license-key field that the document does not contain"
+        ]
+      }
+    },
+    {
+      "id": "total-refund",
+      "format_roles": ["text-pdf"],
+      "sources": [
+        "originals/v-2026-10-receipt.pdf",
+        "originals/v-2026-10-credit-note.pdf"
+      ],
+      "source_quotes": [
+        {
+          "path": "originals/v-2026-10-credit-note.pdf",
+          "text": "Total USD 15.99"
+        },
+        {
+          "path": "originals/v-2026-10-credit-note.pdf",
+          "text": "This Total is a credit-note total, not an amount paid."
+        },
+        {
+          "path": "originals/v-2026-10-credit-note.pdf",
+          "text": "Receipt of the refund is not stated."
+        },
+        {
+          "path": "originals/v-2026-10-receipt.pdf",
+          "text": "Amount paid USD 15.99"
+        }
+      ],
+      "future_judgment": {
+        "refund": "The credit note records a refund statement of USD 15.99. It does not prove the refund was received.",
+        "paid": "The October receipt remains an amount-paid statement of USD 15.99.",
+        "must_not": [
+          "treat the unique Total as amount paid",
+          "erase the October amount-paid statement because a credit note exists",
+          "replace both facts with a single net amount"
+        ]
+      }
+    },
+    {
+      "id": "unjudged-order-total",
+      "format_roles": ["text-pdf"],
+      "sources": [
+        "originals/c-work-order-confirm.pdf",
+        "originals/c-work-2026-invoice.pdf"
+      ],
+      "source_quotes": [
+        {
+          "path": "originals/c-work-order-confirm.pdf",
+          "text": "Total USD 99.00"
+        },
+        {
+          "path": "originals/c-work-order-confirm.pdf",
+          "text": "Tax inclusion is not stated."
+        },
+        {
+          "path": "originals/c-work-order-confirm.pdf",
+          "text": "This Total is an order total whose payment nature is not stated."
+        }
+      ],
+      "future_judgment": {
+        "order_total": "USD 99.00 is an order total of unjudged payment nature. It is not amount paid and it does not conflict with the invoice.",
+        "must_not": [
+          "call the order Total amount paid",
+          "open an amount conflict only because 99.00 differs from 107.91 on the invoice"
+        ]
+      }
+    },
+    {
+      "id": "period-ended-current-unknown",
+      "format_roles": ["text-pdf"],
+      "sources": ["originals/harbor-notes-2023-invoice.pdf"],
+      "source_quotes": [
+        {
+          "path": "originals/harbor-notes-2023-invoice.pdf",
+          "text": "Amount paid USD 48.00"
+        },
+        {
+          "path": "originals/harbor-notes-2023-invoice.pdf",
+          "text": "Service period: 2023-01-01 through 2023-12-31"
+        },
+        {
+          "path": "originals/harbor-notes-2023-invoice.pdf",
+          "text": "This document states the service period above and no status after 2023-12-31."
+        }
+      ],
+      "future_judgment": {
+        "sentence": "The invoice states service through 2023-12-31. Status after that is unconfirmed.",
+        "as_of_review_date": "2026-11-14 is after the stated period. Current status stays unknown.",
+        "must_not": [
+          "mark the service currently expired only because the stated period is in the past",
+          "use the import timestamp as an observation date"
+        ]
+      }
+    },
+    {
+      "id": "cancel-renewal-still-usable",
+      "format_roles": ["text-pdf"],
+      "sources": ["originals/c-cancel-notice-masked.pdf"],
+      "source_quotes": [
+        {
+          "path": "originals/c-cancel-notice-masked.pdf",
+          "text": "Notice date: 2026-10-20"
+        },
+        {
+          "path": "originals/c-cancel-notice-masked.pdf",
+          "text": "Automatic renewal has been cancelled."
+        },
+        {
+          "path": "originals/c-cancel-notice-masked.pdf",
+          "text": "The service remains usable through 2027-02-28."
+        },
+        {
+          "path": "originals/c-cancel-notice-masked.pdf",
+          "text": "This notice does not say the service ended on the notice date."
+        }
+      ],
+      "future_judgment": {
+        "usability": "Cancelling automatic renewal leaves the service usable through the stated 2027-02-28 date. It is not an immediate end on 2026-10-20.",
+        "must_not": [
+          "treat renewal cancellation as already unusable",
+          "invent a current expired status from the notice date"
+        ]
+      }
+    },
+    {
+      "id": "masked-unassigned",
+      "format_roles": ["text-pdf"],
+      "sources": ["originals/c-cancel-notice-masked.pdf"],
+      "source_quotes": [
+        {
+          "path": "originals/c-cancel-notice-masked.pdf",
+          "text": "Account email: j***@paperlantern.example"
+        },
+        {
+          "path": "originals/c-cancel-notice-masked.pdf",
+          "text": "This notice does not say which account owns the masked email."
+        }
+      ],
+      "future_judgment": {
+        "assignment": "The masked address is unassigned. It may be shown as an unassigned notice that could concern a Paperlantern account, without changing either account until a person decides.",
+        "must_not": [
+          "assign the notice to mira.ellison.example because the local part starts with j",
+          "assign the notice to jordan.hale.example because the merchant matches",
+          "treat merchant or sender similarity as an account link"
+        ]
+      }
+    },
+    {
+      "id": "amount-conflict",
+      "format_roles": ["utf-8-csv", "text-pdf"],
+      "sources": [
+        "originals/store-export-work.csv",
+        "originals/c-work-2026-invoice.pdf",
+        "originals/c-work-order-confirm.pdf"
+      ],
+      "source_quotes": [
+        {
+          "path": "originals/store-export-work.csv",
+          "text": "SYN-C-WORK-2026-031,jordan.hale.example@paperlantern.example,work,Paperlantern Cloud,\"annual plan, store export row\",99.00,USD,"
+        },
+        {
+          "path": "originals/store-export-work.csv",
+          "text": "The charged cell is 99.00 and conflicts with invoice amount paid 107.91 for the same order."
+        },
+        {
+          "path": "originals/c-work-2026-invoice.pdf",
+          "text": "Order id: SYN-C-WORK-2026-031"
+        },
+        {
+          "path": "originals/c-work-2026-invoice.pdf",
+          "text": "Amount paid USD 107.91"
+        }
+      ],
+      "future_judgment": {
+        "conflict": "For work-account order SYN-C-WORK-2026-031, the CSV charged cell USD 99.00 conflicts with the invoice amount paid USD 107.91. Do not pick a winner automatically.",
+        "not_part_of_conflict": "The order confirmation Total USD 99.00 stays an unjudged order total and does not join this conflict.",
+        "must_not": [
+          "auto-adopt 99.00 or 107.91 as the single paid amount",
+          "split the quoted CSV field on the comma inside annual plan, store export row"
+        ]
+      }
+    },
+    {
+      "id": "human-edit-reimport",
+      "format_roles": ["text-pdf", "utf-8-csv", "byte-canary"],
+      "sources": [
+        "originals/renamed/NLV-september-statement-copy.pdf",
+        "originals/v-2026-09-receipt.pdf"
+      ],
+      "source_quotes": [
+        {
+          "path": "originals/renamed/NLV-september-statement-copy.pdf",
+          "text": "Document id: SYN-V-2026-09-001"
+        }
+      ],
+      "future_judgment": {
+        "reimport": "Importing every original again, plus this renamed copy, records a new occurrence for the batch and does not create a purchase from the byte match.",
+        "human_edit": "A committed human decision on a source remains after reimport. The renamed September file is the same bytes as originals/v-2026-09-receipt.pdf under a different path and file name.",
+        "storage": "Identical bytes reuse stored bytes. Path and file name are not identity.",
+        "must_not": [
+          "mint a purchase id from the content hash",
+          "overwrite the human decision because the file was imported again",
+          "merge distinct purchases or entitlements because the bytes matched"
+        ]
+      },
+      "t1_observable_subset": "T1 may show storage reuse, a new occurrence, a stable source id that is not the hash, and an unchanged committed user_marker. T1 does not implement the human decision or entitlement model; the marker is only committed metadata."
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+SYNTHETIC-ONLY DISPOSABLE CORPUS
+This package is fictional SubVault T0 fixture data.
+It is not user data and it is not an approved store for real credentials.
+Protection and recovery preferences are unanswered.
+Primary input preference is unanswered.
+Do not import it into a real-data product.
+Preserving these bytes is not arrangement, search, or a completed product.

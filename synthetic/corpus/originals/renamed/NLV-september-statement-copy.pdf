@@ -1,0 +1,46 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 391 >>
+stream
+BT
+/F1 10 Tf
+54 760 Td
+13 TL
+(Northline Video) Tj
+T* (Document: receipt) Tj
+T* (Document id: SYN-V-2026-09-001) Tj
+T* (Account: personal) Tj
+T* (Account email: mira.ellison.example@northline.example) Tj
+T* (Amount paid USD 15.99) Tj
+T* (Currency: USD) Tj
+T* (Service period: 2026-09-01 through 2026-09-30) Tj
+T* (This document states a paid amount for the stated service period only.) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000000688 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+758
+%%EOF

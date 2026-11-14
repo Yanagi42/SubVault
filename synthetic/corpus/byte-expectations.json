@@ -1,0 +1,161 @@
+{
+  "corpus_id": "subvault-synthetic-t0-v0",
+  "synthetic_only": true,
+  "disposable": true,
+  "protection_preference": "unanswered",
+  "primary_input_preference": "unanswered",
+  "t1_must_not_interpret_documents": true,
+  "files": [
+    {
+      "path": "originals/c-cancel-notice-masked.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "265ab2d1af84da8ee116bdd325af5b132320b688ff64aaef5c1f6182330e9144",
+      "byte_length": 1018,
+      "scenario_ids": [
+        "cancel-renewal-still-usable",
+        "masked-unassigned"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/c-personal-2026-invoice.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "a8ec0b134164858dd47ad67bd1a49abf53a4914d0abfed70d3e524133b8df091",
+      "byte_length": 939,
+      "scenario_ids": [
+        "monthly-yearly",
+        "same-merchant-two-accounts"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/c-work-2026-invoice.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "eaa74e1d7902bc392dda930f568452db96d707fd017de7e270cd64bf576ebaab",
+      "byte_length": 968,
+      "scenario_ids": [
+        "monthly-yearly",
+        "same-merchant-two-accounts",
+        "amount-conflict"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/c-work-order-confirm.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "30c9d3213c76d7aaa2d1e744923eff5446c176a603e806b6adcb313e7b261cd3",
+      "byte_length": 967,
+      "scenario_ids": [
+        "unjudged-order-total",
+        "amount-conflict"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/canary/no-normalize.bin",
+      "format_role": "byte-canary",
+      "media_type": "application/octet-stream",
+      "sha256": "3043b30551ef9dc176906dea42f93dbefc7b887912868e1e6f11c8ef74348e41",
+      "byte_length": 44,
+      "scenario_ids": [
+        "human-edit-reimport"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/harbor-notes-2023-invoice.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "a5780bda79c746182b26e132e2e3bebee81d936eb65acc332e84191ff54f73db",
+      "byte_length": 950,
+      "scenario_ids": [
+        "period-ended-current-unknown"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/lumen-draft-onetime.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "500ee07af53732d72c5f82405d8048d1dcb1094bd5f13bf2d991e900b0e59992",
+      "byte_length": 1067,
+      "scenario_ids": [
+        "onetime-original-scope"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/renamed/NLV-september-statement-copy.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "c69d395d4e1abf23a82ef91c5b50220bdb821c4de53daf03a1f060d49acec8f3",
+      "byte_length": 941,
+      "scenario_ids": [
+        "human-edit-reimport"
+      ],
+      "byte_identical_to": "originals/v-2026-09-receipt.pdf",
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/store-export-work.csv",
+      "format_role": "utf-8-csv",
+      "media_type": "text/csv",
+      "sha256": "e4f81906cb1c30c984a47154a11f2093471f369f234e37f08125e0343f1be729",
+      "byte_length": 350,
+      "scenario_ids": [
+        "amount-conflict"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/v-2026-09-receipt.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "c69d395d4e1abf23a82ef91c5b50220bdb821c4de53daf03a1f060d49acec8f3",
+      "byte_length": 941,
+      "scenario_ids": [
+        "monthly-yearly",
+        "human-edit-reimport"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/v-2026-10-credit-note.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "2bb1e92147c559dde28e364bf8ee98fd5b2841be03aee5a37abc42cb2b96c978",
+      "byte_length": 966,
+      "scenario_ids": [
+        "total-refund"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    },
+    {
+      "path": "originals/v-2026-10-receipt.pdf",
+      "format_role": "text-pdf",
+      "media_type": "application/pdf",
+      "sha256": "6ef84e25e3aa831510870f6357ca64037fc06e2fd2c7f54a2ff71587613f92d0",
+      "byte_length": 941,
+      "scenario_ids": [
+        "monthly-yearly",
+        "total-refund"
+      ],
+      "byte_identical_to": null,
+      "normalization": "raw bytes; not a decoded or re-encoded document"
+    }
+  ]
+}

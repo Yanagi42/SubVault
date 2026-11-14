@@ -1,0 +1,2 @@
+# Corpus bytes are fixtures. Do not normalize newlines or encodings.
+synthetic/corpus/** -text linguist-generated=false
