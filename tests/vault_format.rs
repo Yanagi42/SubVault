@@ -813,7 +813,12 @@ fn old_program_returns_14_and_leaves_the_vault_unchanged() {
     let journals = tree(&copy.join("journal"));
     let (code, body) = run(&["open", "--vault", copy.to_str().unwrap()]);
     assert_eq!(code, 14, "{body}");
-    assert_eq!(body["reason"], "newer_schema");
+    assert_eq!(body["reason"], "vault_format_unverified");
+    assert_eq!(body["schema_version_found"], 3);
+    assert_eq!(
+        sql(&copy, "SELECT value FROM meta WHERE key='vault_format';"),
+        "2"
+    );
     assert_eq!(header_user_version(&copy.join("vault.db")), 3);
     assert_eq!(sql(&copy, "PRAGMA user_version;"), "3");
     assert_eq!(tree(&copy.join("journal")), journals);

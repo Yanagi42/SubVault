@@ -212,6 +212,7 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
                 flags.format = Some(match value.as_str() {
                     "1" => 1,
                     "2" => 2,
+                    "3" => 3,
                     _ => return Err(Fail::new(EXIT_USAGE, "Usage", "bad_format")),
                 });
             }

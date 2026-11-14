@@ -72,7 +72,7 @@ fn require_body_format(vault: &Path) -> Result<(), Fail> {
     super::guard_vault(vault)?;
     match super::accept_wal_format(&vault.join("vault.db"))? {
         1 => Err(needs_upgrade()),
-        2 => Ok(()),
+        2 | 3 => Ok(()),
         version => Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(version))

@@ -173,7 +173,7 @@ pub fn help_report() -> Report {
         json!([
             "help",
             "version",
-            "init --vault PATH [--format 1|2]",
+            "init --vault PATH [--format 1|2|3]",
             "open --vault PATH",
             "verify --vault PATH",
             "import --vault PATH --command-id ID --media-type TYPE --source PATH [--batch-id ID] [--display-name NAME]",
@@ -207,7 +207,7 @@ pub fn version_report() -> Report {
     let mut body = honesty("Version");
     body.insert("git_sha".into(), json!(env!("SUBVAULT_GIT_SHA")));
     body.insert("vault_format".into(), json!(1));
-    body.insert("supported_vault_formats".into(), json!([1, 2]));
+    body.insert("supported_vault_formats".into(), json!([1, 2, 3]));
     body.insert("capabilities".into(), capabilities());
     body.insert("platform_limits".into(), platform_limits(None));
     Report {
@@ -247,7 +247,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
                     .extra("created_new_vault", json!(false)),
             );
         }
-    } else if format == 2 {
+    } else if format == 2 || format == 3 {
         validate_hook_names(
             hooks.stop_at.as_deref(),
             hooks.inject_point.as_deref(),
@@ -283,20 +283,24 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             store::checkpoint(&conn).map_err(|err| db_fail(err, "init_checkpoint"))?;
             return Ok(vault_id);
         }
-        conn.execute_batch("PRAGMA user_version = 2;")
+        let format_text = format.to_string();
+        conn.execute_batch(&format!("PRAGMA user_version = {format};"))
             .map_err(|err| db_fail(err, "init_version"))?;
         conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('vault_format', '2')",
-            [],
+            "INSERT INTO meta(key, value) VALUES ('vault_format', ?1)",
+            [&format_text],
         )
         .map_err(|err| db_fail(err, "init_version"))?;
-        hooks.stop("version_set", init_point(false))?;
-        hooks.inject("version_checkpoint", init_point(false))?;
+        hooks.stop("version_set", init_point(false, format))?;
+        hooks.inject("version_checkpoint", init_point(false, format))?;
         publish_checkpoint(&conn)?;
         drop(conn);
-        hooks.stop("version_checkpoint", init_point(false))?;
+        hooks.stop("version_checkpoint", init_point(false, format))?;
         let (seen, companion, schema) = visible_main_format(&scratch.join("vault.db"))?;
-        if seen != 2 || companion.as_deref() != Some("2") || schema.as_deref() != Some("1") {
+        if seen != format as i64
+            || companion.as_deref() != Some(format_text.as_str())
+            || schema.as_deref() != Some("1")
+        {
             return Err(
                 Fail::new(EXIT_VERSION, "VersionUnsupported", "version_not_in_main_db")
                     .extra("schema_version_found", json!(seen))
@@ -305,8 +309,8 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
                     .extra("published", json!(false)),
             );
         }
-        hooks.inject("version_verify", init_point(false))?;
-        hooks.stop("before_publish", init_point(false))?;
+        hooks.inject("version_verify", init_point(false, format))?;
+        hooks.stop("before_publish", init_point(false, format))?;
         Ok(vault_id)
     })();
     let vault_id = match built {
@@ -321,7 +325,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
         return Err(io_fail(err, "init_rename").extra("created_new_vault", json!(false)));
     }
     let _ = fsutil::fsync_dir(parent);
-    hooks.stop("after_publish", init_point(true))?;
+    hooks.stop("after_publish", init_point(true, format))?;
     let mut body = honesty("Initialized");
     body.insert("vault_id".into(), json!(vault_id));
     body.insert("vault_format".into(), json!(format));
@@ -337,8 +341,11 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     })
 }
 
-fn init_point(published: bool) -> Map<String, Value> {
-    map_of(&[("published", json!(published)), ("vault_format", json!(2))])
+fn init_point(published: bool, format: u8) -> Map<String, Value> {
+    map_of(&[
+        ("published", json!(published)),
+        ("vault_format", json!(format)),
+    ])
 }
 
 fn publish_checkpoint(conn: &Connection) -> Result<(), Fail> {
@@ -1431,9 +1438,10 @@ fn vault_unreadable(err: &io::Error, reason: &'static str, during: &str) -> Fail
 
 fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
     let (version, format, schema) = visible_main_format(&path.join("vault.db"))?;
-    if version == 2 {
-        if format.as_deref() == Some("2") && schema.as_deref() == Some("1") {
-            return Ok(2);
+    if version == 2 || version == 3 {
+        let expected = if version == 2 { "2" } else { "3" };
+        if format.as_deref() == Some(expected) && schema.as_deref() == Some("1") {
+            return Ok(version);
         }
         return Err(Fail::new(
             EXIT_VERSION,
@@ -1443,7 +1451,7 @@ fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
         .extra("schema_version_found", json!(version))
         .extra("created_new_vault", json!(false)));
     }
-    if version > 2 {
+    if version > 3 {
         return Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(version))
@@ -1574,14 +1582,14 @@ fn judge_format(
     format: Option<&str>,
     schema: Option<&str>,
 ) -> Result<i64, Fail> {
-    if effective > 2 {
+    if effective > 3 {
         return Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(effective))
                 .extra("created_new_vault", json!(false)),
         );
     }
-    if effective != 1 && effective != 2 {
+    if effective != 1 && effective != 2 && effective != 3 {
         return Err(
             Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "unexpected_user_version")
                 .extra("schema_version_found", json!(effective))
@@ -1619,16 +1627,17 @@ fn judge_format(
         }
         return Ok(1);
     }
-    if format != Some("2") || schema != Some("1") {
+    let expected = if effective == 2 { "2" } else { "3" };
+    if format != Some(expected) || schema != Some("1") {
         return Err(Fail::new(
             EXIT_VERSION,
             "VersionUnsupported",
             "vault_format_unverified",
         )
-        .extra("schema_version_found", json!(2))
+        .extra("schema_version_found", json!(effective))
         .extra("created_new_vault", json!(false)));
     }
-    Ok(2)
+    Ok(effective)
 }
 
 /// Command lookup. mode=ro without immutable sees a committed row while the writer still holds the lock.
