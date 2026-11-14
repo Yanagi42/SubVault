@@ -58,6 +58,7 @@ const INIT_STOPS: &[&str] = &[
     "version_set",
     "version_checkpoint",
     "before_publish",
+    "before_dir_publish",
     "after_publish",
 ];
 const INIT_INJECTS: &[&str] = &["version_checkpoint", "version_verify", "publish_dir_fsync"];
@@ -92,19 +93,12 @@ impl HookRun {
         }
     }
 
-    fn stop(&mut self, point: &str, mut details: Map<String, Value>) -> Result<(), Fail> {
-        if self.hooks.stop_at.as_deref() != Some(point) {
-            return Ok(());
+    fn stop(&mut self, point: &str, details: Map<String, Value>) -> Result<(), Fail> {
+        let requested = self.hooks.stop_at.as_deref() == Some(point);
+        stop_checkpoint(&self.hooks, point, details)?;
+        if requested {
+            self.stop_reached = true;
         }
-        let path = self.hooks.checkpoint.clone().ok_or_else(|| {
-            Fail::new(EXIT_USAGE, "Usage", "checkpoint_required").extra("point", json!(point))
-        })?;
-        details.insert("point".into(), json!(point));
-        let bytes = serde_json::to_vec_pretty(&Value::Object(details))
-            .map_err(|_| Fail::new(EXIT_USAGE, "Usage", "checkpoint_encode"))?;
-        atomic_write(&path, &bytes).map_err(|err| io_fail(err, "checkpoint"))?;
-        self.stop_reached = true;
-        sigstop();
         Ok(())
     }
 
@@ -156,6 +150,25 @@ impl HookRun {
             )
             .extra("preservation", json!(NOT_PRESERVED)))
     }
+}
+
+pub(super) fn stop_checkpoint(
+    hooks: &Hooks,
+    point: &str,
+    mut details: Map<String, Value>,
+) -> Result<(), Fail> {
+    if hooks.stop_at.as_deref() != Some(point) {
+        return Ok(());
+    }
+    let path = hooks.checkpoint.clone().ok_or_else(|| {
+        Fail::new(EXIT_USAGE, "Usage", "checkpoint_required").extra("point", json!(point))
+    })?;
+    details.insert("point".into(), json!(point));
+    let bytes = serde_json::to_vec_pretty(&Value::Object(details))
+        .map_err(|_| Fail::new(EXIT_USAGE, "Usage", "checkpoint_encode"))?;
+    atomic_write(&path, &bytes).map_err(|err| io_fail(err, "checkpoint"))?;
+    sigstop();
+    Ok(())
 }
 
 fn action_name(action: InjectAction) -> &'static str {
@@ -268,8 +281,11 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
         return Err(unsupported_fs(magic));
     }
     if format == 1 {
+        let stop = hooks.stop_at.as_deref();
         let point = hooks.inject_point.as_deref();
-        if hooks.stop_at.is_some() || matches!(point, Some(name) if name != "publish_dir_fsync") {
+        let stop_ok = matches!(stop, None | Some("before_dir_publish"));
+        let inject_ok = matches!(point, None | Some("publish_dir_fsync"));
+        if !stop_ok || !inject_ok {
             return Err(
                 Fail::new(EXIT_USAGE, "Usage", "format_1_has_no_version_hook")
                     .extra("created_new_vault", json!(false)),
@@ -355,13 +371,39 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     let vault_id = match built {
         Ok(id) => id,
         Err(fail) => {
-            let _ = fs::remove_dir_all(&scratch);
-            return Err(fail.extra("created_new_vault", json!(false)));
+            return Err(finish_init_scratch(
+                &scratch,
+                fail.extra("created_new_vault", json!(false)),
+            ));
         }
     };
-    if let Err(err) = fs::rename(&scratch, path) {
-        let _ = fs::remove_dir_all(&scratch);
-        return Err(io_fail(err, "init_rename").extra("created_new_vault", json!(false)));
+    // The early check is only a friendly diagnosis. This second check reports
+    // a name that appeared while the private directory was being built. The
+    // stop is after it, so the atomic publish is what refuses a later name.
+    match fs::symlink_metadata(crate::platform::final_directory_entry(path)) {
+        Ok(_) => {
+            return Err(finish_init_scratch(
+                &scratch,
+                Fail::new(EXIT_REJECTED, "Rejected", "vault_path_exists")
+                    .extra("created_new_vault", json!(false)),
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(finish_init_scratch(
+                &scratch,
+                io_fail(err, "init_stat").extra("created_new_vault", json!(false)),
+            ));
+        }
+    }
+    if let Err(fail) = hooks.stop("before_dir_publish", init_point(false, format)) {
+        return Err(finish_init_scratch(
+            &scratch,
+            fail.extra("created_new_vault", json!(false)),
+        ));
+    }
+    if let Err(fail) = publish_init_dir(&scratch, path) {
+        return Err(finish_init_scratch(&scratch, fail));
     }
     let sync_error = fsutil::fsync_dir(parent).err().map(|err| err.to_string());
     let injected = match hooks.note_inject("publish_dir_fsync", init_point(true, format)) {
@@ -393,6 +435,92 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     }
     hooks.stop("after_publish", init_point(true, format))?;
     Ok(init_ready(&vault_id, format, magic))
+}
+
+fn publish_init_dir(scratch: &Path, path: &Path) -> Result<(), Fail> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_file = File::open(parent)
+        .map_err(|err| io_fail(err, "init_rename").extra("created_new_vault", json!(false)))?;
+    let from = scratch.file_name().ok_or_else(|| {
+        io_fail(
+            io::Error::new(io::ErrorKind::InvalidInput, "init staging has no file name"),
+            "init_rename",
+        )
+        .extra("created_new_vault", json!(false))
+    })?;
+    let destination = crate::platform::final_directory_entry(path);
+    let to = destination.file_name().ok_or_else(|| {
+        io_fail(
+            io::Error::new(io::ErrorKind::InvalidInput, "init target has no file name"),
+            "init_rename",
+        )
+        .extra("created_new_vault", json!(false))
+    })?;
+    crate::platform::rename_dir_noreplace(&parent_file, from, to).map_err(init_rename_failure)
+}
+
+fn init_rename_failure(err: io::Error) -> Fail {
+    match crate::platform::classify_rename_dir(&err) {
+        crate::platform::RenameDirClass::Exists => {
+            Fail::new(EXIT_REJECTED, "Rejected", "vault_path_exists")
+                .extra("created_new_vault", json!(false))
+                .extra("during", json!("init_rename"))
+                .extra("os_error", json!(err.to_string()))
+                .extra("injected", json!(false))
+        }
+        crate::platform::RenameDirClass::Unavailable => Fail::new(
+            EXIT_UNSUPPORTED_FS,
+            "Unsupported",
+            "rename_noreplace_unavailable",
+        )
+        .extra("created_new_vault", json!(false))
+        .extra("during", json!("init_rename"))
+        .extra("os_error", json!(err.to_string()))
+        .extra("injected", json!(false)),
+        crate::platform::RenameDirClass::NoSpace
+        | crate::platform::RenameDirClass::Permission
+        | crate::platform::RenameDirClass::Busy
+        | crate::platform::RenameDirClass::Invalid
+        | crate::platform::RenameDirClass::CrossDevice
+        | crate::platform::RenameDirClass::Other => {
+            io_fail(err, "init_rename").extra("created_new_vault", json!(false))
+        }
+    }
+}
+
+fn finish_init_scratch(scratch: &Path, mut fail: Fail) -> Fail {
+    if let Err(message) = discard_init_scratch(scratch) {
+        fail.extra.insert("staging_cleanup".into(), json!("failed"));
+        fail.extra.insert(
+            "staging_residue".into(),
+            json!(scratch.display().to_string()),
+        );
+        fail.extra
+            .insert("staging_cleanup_error".into(), json!(message));
+    }
+    fail
+}
+
+fn discard_init_scratch(scratch: &Path) -> Result<(), String> {
+    let name = scratch
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !name.starts_with(".subvault-init-") {
+        return Err(format!("refusing to remove {}", scratch.display()));
+    }
+    let meta = match fs::symlink_metadata(scratch) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.to_string()),
+    };
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err("refusing to remove a non-directory".into());
+    }
+    fs::remove_dir_all(scratch).map_err(|err| err.to_string())
 }
 
 fn init_ready(vault_id: &str, format: u8, magic: i64) -> Report {
@@ -2709,4 +2837,132 @@ fn unsupported_fs(magic: i64) -> Fail {
     )
     .extra("filesystem_magic", json!(format!("0x{magic:x}")))
     .extra("created_new_vault", json!(false))
+}
+
+#[cfg(test)]
+mod rename_receipts {
+    use super::*;
+
+    fn os(code: i32) -> io::Error {
+        io::Error::from_raw_os_error(code)
+    }
+
+    fn init_report(err: io::Error) -> Report {
+        note_uncommitted(init_rename_failure(err)).into_report()
+    }
+
+    #[test]
+    fn rename_errno_receipts_stay_in_their_existing_classes() {
+        let exists = init_report(os(libc::EEXIST));
+        assert_eq!(exists.code, EXIT_REJECTED);
+        let exists = exists.body;
+        assert_eq!(exists["outcome"], "Rejected");
+        assert_eq!(exists["reason"], "vault_path_exists");
+        assert_eq!(exists["created_new_vault"], false);
+        assert_eq!(exists["during"], "init_rename");
+        assert_eq!(exists["injected"], false);
+        assert!(exists.get("preservation").is_none(), "{exists}");
+
+        let unavailable = init_report(os(libc::ENOSYS));
+        assert_eq!(unavailable.code, EXIT_UNSUPPORTED_FS);
+        let unavailable = unavailable.body;
+        assert_eq!(unavailable["outcome"], "Unsupported");
+        assert_eq!(unavailable["reason"], "rename_noreplace_unavailable");
+        assert_ne!(unavailable["outcome"], "NotPreserved");
+        assert!(unavailable["os_error"]
+            .as_str()
+            .unwrap()
+            .contains("os error 38"));
+
+        let invalid = init_report(os(libc::EINVAL));
+        assert_eq!(invalid.code, EXIT_NOT_PRESERVED);
+        let invalid = invalid.body;
+        assert_eq!(invalid["outcome"], "NotPreserved");
+        assert_eq!(invalid["reason"], "io_error");
+        assert_eq!(invalid["preservation"], "not_preserved");
+        assert!(invalid["os_error"]
+            .as_str()
+            .unwrap()
+            .contains("os error 22"));
+        assert_ne!(invalid["reason"], "rename_noreplace_unavailable");
+
+        let cross = init_report(os(libc::EXDEV));
+        assert_eq!(cross.code, EXIT_NOT_PRESERVED);
+        let cross = cross.body;
+        assert_eq!(cross["outcome"], "NotPreserved");
+        assert_eq!(cross["reason"], "io_error");
+        assert!(cross["os_error"].as_str().unwrap().contains("os error 18"));
+        assert_ne!(cross["outcome"], "Unsupported");
+        assert_ne!(cross["reason"], "rename_noreplace_unavailable");
+
+        let access = init_report(os(libc::EACCES)).body;
+        let perm = init_report(os(libc::EPERM)).body;
+        let busy = init_report(os(libc::EBUSY)).body;
+        let full = init_report(os(libc::ENOSPC)).body;
+        assert_eq!(access["reason"], "io_error");
+        assert_eq!(perm["reason"], "io_error");
+        assert_eq!(busy["reason"], "io_error");
+        assert_eq!(full["reason"], "enospc");
+        assert_ne!(access["reason"], "writer_busy");
+        assert_ne!(busy["reason"], "writer_busy");
+        assert_ne!(full["reason"], "writer_busy");
+        assert!(access["os_error"].as_str().unwrap().contains("os error 13"));
+        assert!(perm["os_error"].as_str().unwrap().contains("os error 1"));
+        assert!(busy["os_error"].as_str().unwrap().contains("os error 16"));
+        assert!(full["os_error"].as_str().unwrap().contains("os error 28"));
+        assert_ne!(access["os_error"], busy["os_error"]);
+        assert_ne!(busy["os_error"], full["os_error"]);
+        assert_ne!(access["os_error"], perm["os_error"]);
+
+        let export_exists = export::export_publish_failure(os(libc::EEXIST)).into_report();
+        assert_eq!(export_exists.code, EXIT_REJECTED);
+        assert_eq!(export_exists.body["reason"], "output_exists");
+        assert_eq!(export_exists.body["output_written"], false);
+        assert_eq!(export_exists.body["during"], "export_publish");
+        assert_eq!(export_exists.body["injected"], false);
+
+        let export_unavailable = export::export_publish_failure(os(libc::ENOSYS)).into_report();
+        assert_eq!(export_unavailable.code, EXIT_UNSUPPORTED_FS);
+        assert_eq!(
+            export_unavailable.body["reason"],
+            "rename_noreplace_unavailable"
+        );
+        assert_eq!(export_unavailable.body["output_written"], false);
+
+        let export_invalid = export::export_publish_failure(os(libc::EINVAL)).into_report();
+        assert_eq!(export_invalid.code, EXIT_INTEGRITY);
+        assert_eq!(export_invalid.body["outcome"], "Incomplete");
+        assert_eq!(export_invalid.body["reason"], "io_error");
+        assert!(export_invalid.body["os_error"]
+            .as_str()
+            .unwrap()
+            .contains("os error 22"));
+        assert_ne!(export_invalid.body["outcome"], "Unsupported");
+
+        let export_cross = export::export_publish_failure(os(libc::EXDEV)).into_report();
+        assert_eq!(export_cross.code, EXIT_INTEGRITY);
+        assert_eq!(export_cross.body["reason"], "io_error");
+        assert!(export_cross.body["os_error"]
+            .as_str()
+            .unwrap()
+            .contains("os error 18"));
+        assert_ne!(export_cross.body["reason"], "rename_noreplace_unavailable");
+
+        let export_access = export::export_publish_failure(os(libc::EACCES)).into_report();
+        let export_busy = export::export_publish_failure(os(libc::EBUSY)).into_report();
+        let export_full = export::export_publish_failure(os(libc::ENOSPC)).into_report();
+        assert_eq!(export_access.code, EXIT_INTEGRITY);
+        assert_eq!(export_busy.code, EXIT_INTEGRITY);
+        assert_eq!(export_full.code, EXIT_INTEGRITY);
+        assert_eq!(export_access.body["reason"], "io_error");
+        assert_eq!(export_busy.body["reason"], "io_error");
+        assert_eq!(export_full.body["reason"], "enospc");
+        assert_ne!(export_access.body["reason"], "writer_busy");
+        assert_ne!(export_busy.body["reason"], "writer_busy");
+        assert_ne!(export_access.code, EXIT_LOCKED);
+        assert_ne!(export_busy.code, EXIT_LOCKED);
+        assert_ne!(export_full.code, EXIT_LOCKED);
+        assert_ne!(export_access.body["os_error"], export_busy.body["os_error"]);
+        assert_ne!(export_busy.body["os_error"], export_full.body["os_error"]);
+    }
 }

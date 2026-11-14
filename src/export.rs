@@ -3,12 +3,12 @@
 //! copy of the live vault directory, a backup, or a protection choice.
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::facts;
@@ -43,7 +43,7 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
     validate_hook_names(
         req.hooks.stop_at.as_deref(),
         req.hooks.inject_point.as_deref(),
-        &[],
+        &["before_dir_publish"],
         EXPORT_INJECTS,
         EXPORT_INJECTS,
     )?;
@@ -148,8 +148,12 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(scratch.fail(copy_fail(err, "export_publish"))),
     }
-    fs::rename(&scratch.temp, &req.out)
-        .map_err(|err| scratch.fail(copy_fail(err, "export_publish")))?;
+    let mut stop_details = Map::new();
+    stop_details.insert("published".into(), json!(false));
+    super::stop_checkpoint(&req.hooks, "before_dir_publish", stop_details)
+        .map_err(|fail| scratch.fail(fail))?;
+    publish_export_dir(&scratch.temp, &req.out)
+        .map_err(|err| scratch.fail(export_publish_failure(err)))?;
     // The published name is req.out. scratch still names the old temporary
     // path, so a later scratch.fail must not be used to represent this package.
     let sync_error = fsutil::fsync_dir(parent).err().map(|err| err.to_string());
@@ -1298,6 +1302,13 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn discard(path: &Path) -> Result<(), String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !name.starts_with(".export-") {
+        return Err(format!("refusing to remove {}", path.display()));
+    }
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1400,6 +1411,48 @@ fn rejected(reason: &'static str) -> Fail {
 
 fn chain_fail(fact_id: &str) -> Fail {
     recovery("decision_chain_inconsistent").extra("fact_id", json!(fact_id))
+}
+
+fn publish_export_dir(temp: &Path, out: &Path) -> io::Result<()> {
+    let parent = out
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_file = File::open(parent)?;
+    let from = temp.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export staging has no file name",
+        )
+    })?;
+    let to = out.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export target has no file name",
+        )
+    })?;
+    crate::platform::rename_dir_noreplace(&parent_file, from, to)
+}
+
+pub(super) fn export_publish_failure(err: io::Error) -> Fail {
+    match crate::platform::classify_rename_dir(&err) {
+        crate::platform::RenameDirClass::Exists => rejected("output_exists")
+            .extra("during", json!("export_publish"))
+            .extra("os_error", json!(err.to_string())),
+        crate::platform::RenameDirClass::Unavailable => unpublished(
+            crate::model::EXIT_UNSUPPORTED_FS,
+            "Unsupported",
+            "rename_noreplace_unavailable",
+        )
+        .extra("during", json!("export_publish"))
+        .extra("os_error", json!(err.to_string())),
+        crate::platform::RenameDirClass::NoSpace
+        | crate::platform::RenameDirClass::Permission
+        | crate::platform::RenameDirClass::Busy
+        | crate::platform::RenameDirClass::Invalid
+        | crate::platform::RenameDirClass::CrossDevice
+        | crate::platform::RenameDirClass::Other => copy_fail(err, "export_publish"),
+    }
 }
 
 fn copy_fail(err: io::Error, during: &str) -> Fail {
