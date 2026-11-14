@@ -39,6 +39,10 @@ fn baseline_bin() -> &'static Path {
                 "--target-dir",
                 "/tmp/subvault-42364745-target",
             ])
+            .env(
+                "SUBVAULT_GIT_SHA",
+                "42364745aa00910c3ec47ee4fd63c3dac831e11a",
+            )
             .status()
             .expect("baseline cargo");
         assert!(status.success(), "baseline 42364745 binary did not build");
@@ -1983,6 +1987,16 @@ fn cancel_and_marker_do_not_rewrite_a_decision_journal() {
 
 #[test]
 fn the_previous_binary_has_no_correct_command_and_does_not_write_a_format_3_vault() {
+    let (code, version) = run_at(baseline_bin(), &["version"]);
+    assert_eq!(code, 0, "{version}");
+    assert_eq!(
+        version["git_sha"],
+        "42364745aa00910c3ec47ee4fd63c3dac831e11a"
+    );
+    assert_eq!(
+        version["supported_vault_formats"],
+        serde_json::json!([1, 2])
+    );
     let tmp = Tmp::new("old-bin");
     let vault = init3(&tmp);
     let before = fs::read(vault.join("vault.db")).unwrap();
