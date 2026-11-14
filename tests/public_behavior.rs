@@ -2280,10 +2280,63 @@ fn committed_import_replays_without_the_external_file() {
             source.to_str().unwrap(),
         ],
     );
-    assert_eq!(other_type.code, Some(0), "{}", other_type.stdout);
-    assert_eq!(parse(&other_type)["outcome"], "AlreadyCommitted");
-    assert_eq!(parse(&other_type)["source_check"], "absent");
-    assert_eq!(parse(&other_type)["new_effect"], false);
+    assert_eq!(other_type.code, Some(16), "{}", other_type.stdout);
+    let other = parse(&other_type);
+    assert_eq!(other["outcome"], "Rejected");
+    assert_eq!(other["reason"], "payload_conflict");
+    assert_eq!(other["new_effect"], false);
+    assert_eq!(other["preservation"], "preserved");
+    assert_eq!(other["object_intact"], true);
+    assert_eq!(other["payload_matches"], false);
+    assert_eq!(other["source_check"], "absent");
+    assert_eq!(other["requested_media_type"], "text/plain");
+    assert_eq!(other["media_type"], "application/pdf");
+    assert_eq!(other["source_id"], first["source_id"]);
+    assert_eq!(other["content_sha256"], first["content_sha256"]);
+    let (after_absent_code, after_absent) = open_vault(&tmp);
+    assert_eq!(after_absent_code, 0, "{after_absent}");
+    assert_eq!(
+        after_absent["occurrences"].as_array().unwrap().len(),
+        occurrences
+    );
+    assert_eq!(after_absent["sources"][0]["media_type"], "application/pdf");
+    assert_eq!(after_absent["sources"][0]["preservation"], "preserved");
+    assert_eq!(after_absent["sources"][0]["object_intact"], true);
+    assert_eq!(
+        after_absent["occurrences"][0]["display_name"],
+        first["display_name"]
+    );
+    let renamed = run(
+        "replay-absent-other-name",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "pdf",
+            "--media-type",
+            "application/pdf",
+            "--display-name",
+            "renamed.pdf",
+            "--source",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(renamed.code, Some(0), "{}", renamed.stdout);
+    let renamed_body = parse(&renamed);
+    assert_eq!(renamed_body["outcome"], "AlreadyCommitted");
+    assert_eq!(renamed_body["new_effect"], false);
+    assert_eq!(renamed_body["preservation"], "preserved");
+    assert_eq!(renamed_body["source_check"], "absent");
+    assert_eq!(renamed_body["display_name"], first["display_name"]);
+    assert_ne!(renamed_body["display_name"], "renamed.pdf");
+    let (named_code, named) = open_vault(&tmp);
+    assert_eq!(named_code, 0, "{named}");
+    assert_eq!(named["occurrences"].as_array().unwrap().len(), occurrences);
+    assert_eq!(
+        named["occurrences"][0]["display_name"],
+        first["display_name"]
+    );
 
     fs::write(&source, b"different-but-present").unwrap();
     let conflict = run(

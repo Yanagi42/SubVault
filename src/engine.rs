@@ -1689,15 +1689,23 @@ fn replay_committed(
         })?;
     confirm_source_bytes(session, &source, &req.command_id)?;
     match classify_source(&req.source) {
-        // The external path is gone, so its bytes and media type cannot be checked again.
-        // The hosted object was checked above. This is a historical receipt, not a new import.
+        // The external file is gone, so its bytes are not read again. The hosted
+        // hash was checked above, and the requested media type is still part of
+        // the import fingerprint. Display name is not.
         SourceView::Absent => {
+            let fingerprint = fingerprint(&["import", &source.content_sha256, &req.media_type]);
+            if fingerprint != existing.payload_fingerprint {
+                return Err(checked_conflict(&req.command_id, &source)
+                    .extra("requested_media_type", json!(req.media_type))
+                    .extra("source_check", json!("absent")));
+            }
             if let Some(map) = receipt.as_object_mut() {
                 map.insert("source_check".into(), json!("absent"));
                 map.insert(
                     "replay".into(),
                     json!("historical_receipt_source_not_rechecked"),
                 );
+                map.insert("payload_matches".into(), json!(true));
             }
             Ok(receipt)
         }
