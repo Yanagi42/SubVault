@@ -1301,6 +1301,8 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Removes whatever directory is at this staging path. The name prefix is a
+/// shape check, not a record of ownership. The destination is a different path.
 fn discard(path: &Path) -> Result<(), String> {
     let name = path
         .file_name()

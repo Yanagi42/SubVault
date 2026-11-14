@@ -151,18 +151,19 @@ mod linux {
         }
     }
 
+    /// One directory entry on this Linux. `/` and NUL are not name bytes.
+    /// `.` and `..` are the dot entries. A backslash is an ordinary byte.
     fn single_entry(name: &OsStr) -> io::Result<CString> {
         let bytes = name.as_bytes();
         if bytes.is_empty()
             || bytes == b"."
             || bytes == b".."
             || bytes.contains(&b'/')
-            || bytes.contains(&b'\\')
             || bytes.contains(&0)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "directory entry must be a single non-dot name without a separator",
+                "directory entry must be a single name other than . or ..",
             ));
         }
         CString::new(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
@@ -207,6 +208,7 @@ mod linux {
         use super::*;
         use std::ffi::{CString, OsStr};
         use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::io::AsRawFd;
         use std::path::{Path, PathBuf};
@@ -330,13 +332,31 @@ mod linux {
             fs::create_dir(dir.join("staging")).expect("staging");
             fs::create_dir(dir.join("kept")).expect("kept");
             let kept = dev_ino(&dir.join("kept"));
-            for name in ["a/b", "a\\b", "", ".", ".."] {
+            for name in ["a/b", "", ".", ".."] {
                 let err = rename_dir_noreplace(&parent, OsStr::new("staging"), OsStr::new(name))
                     .expect_err(name);
                 assert_eq!(classify_rename_dir(&err), RenameDirClass::Invalid, "{name}");
                 assert!(err.raw_os_error().is_none(), "{name}: {err}");
             }
+            let nul = std::ffi::OsStr::from_bytes(b"a\0b");
+            let err = rename_dir_noreplace(&parent, OsStr::new("staging"), nul).expect_err("nul");
+            assert_eq!(classify_rename_dir(&err), RenameDirClass::Invalid);
+            assert!(err.raw_os_error().is_none(), "{err}");
+            assert!(!dir.join("a").exists());
             assert!(dir.join("staging").is_dir());
+            assert_eq!(dev_ino(&dir.join("kept")), kept);
+            let staged = dev_ino(&dir.join("staging"));
+            fs::write(dir.join("staging").join("SENTINEL"), b"slash-name\n").expect("sentinel");
+            rename_dir_noreplace(&parent, OsStr::new("staging"), OsStr::new("a\\b"))
+                .expect("backslash is one Linux name");
+            let published = dir.join("a\\b");
+            assert_eq!(dev_ino(&published), staged);
+            assert_eq!(
+                fs::read(published.join("SENTINEL")).unwrap(),
+                b"slash-name\n"
+            );
+            assert!(!dir.join("a").exists());
+            assert!(!dir.join("b").exists());
             assert_eq!(dev_ino(&dir.join("kept")), kept);
             let _ = fs::remove_dir_all(&dir);
         }

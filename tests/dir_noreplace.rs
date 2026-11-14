@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -694,4 +695,170 @@ fn injected_directory_fsync_keeps_the_published_directory() {
     assert!(out.join("records.json").is_file());
     let seen: Value = serde_json::from_str(&fs::read_to_string(&witness).unwrap()).unwrap();
     assert_eq!(seen["published"], true);
+}
+
+fn linux_backslash_name(parent: &Path, name: &str) -> PathBuf {
+    assert!(name.contains('\\'), "{name}");
+    assert!(!name.contains('/'), "{name}");
+    let path = parent.join(name);
+    assert_eq!(path.file_name(), Some(OsStr::new(name)));
+    path
+}
+
+#[test]
+fn a_backslash_is_one_linux_name_for_a_new_init_and_export() {
+    for format in ["1", "2", "3"] {
+        let tmp = Tmp::new(&format!("bs{format}"));
+        let vault = linux_backslash_name(tmp.path(), "a\\b");
+        let (code, body) = run(&[
+            "init",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--format",
+            format,
+        ]);
+        assert_eq!(code, 0, "{body}");
+        assert_eq!(body["outcome"], "Initialized");
+        assert_eq!(body["created_new_vault"], true);
+        assert_eq!(body["vault_format"], format.parse::<i64>().unwrap());
+        assert!(vault.join("vault.db").is_file(), "{body}");
+        assert!(vault.join("SYNTHETIC_ONLY").is_file());
+        assert!(!tmp.path().join("a").exists());
+        assert!(!tmp.path().join("b").exists());
+        let (opened, ready) = run(&["open", "--vault", vault.to_str().unwrap()]);
+        assert_eq!(opened, 0, "{ready}");
+        assert_eq!(ready["outcome"], "Ready");
+    }
+
+    let tmp = Tmp::new("bs-export");
+    let vault = tmp.path().join("vault");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "1"]);
+    assert_eq!(code, 0, "{body}");
+    let vault_db = fs::read(vault.join("vault.db")).unwrap();
+    let out = linux_backslash_name(tmp.path(), "p\\k");
+    let (code, body) = run(&[
+        "export",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{body}");
+    assert_eq!(body["outcome"], "Exported");
+    assert_eq!(body["output_written"], true);
+    assert!(out.join("manifest.json").is_file(), "{body}");
+    assert!(out.join("records.json").is_file());
+    assert!(!out.join("vault.db").exists());
+    assert!(!tmp.path().join("p").exists());
+    assert!(!tmp.path().join("k").exists());
+    assert_eq!(fs::read(vault.join("vault.db")).unwrap(), vault_db);
+}
+
+#[test]
+fn a_backslash_name_keeps_a_competitor_that_is_already_there_or_appears_after_the_check() {
+    let tmp = Tmp::new("bs-early");
+    let vault = linux_backslash_name(tmp.path(), "a\\b");
+    fs::create_dir(&vault).unwrap();
+    fs::write(vault.join("KEEP"), b"KEEP\n").unwrap();
+    let entry = dev_ino(&vault);
+    let keep = dev_ino(&vault.join("KEEP"));
+    let hash = sha256(&vault.join("KEEP"));
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "1"]);
+    assert_eq!(code, 16, "{body}");
+    assert_eq!(body["reason"], "vault_path_exists");
+    assert_eq!(body["created_new_vault"], false);
+    assert!(body.get("during").is_none(), "{body}");
+    assert!(body.get("preservation").is_none(), "{body}");
+    assert_eq!(dev_ino(&vault), entry);
+    assert_eq!(dev_ino(&vault.join("KEEP")), keep);
+    assert_eq!(sha256(&vault.join("KEEP")), hash);
+    assert_eq!(fs::read(vault.join("KEEP")).unwrap(), b"KEEP\n");
+    assert!(!vault.join("vault.db").exists());
+    assert!(names(tmp.path(), ".subvault-init-").is_empty());
+
+    for competitor in [
+        Competitor::Empty,
+        Competitor::NonEmpty,
+        Competitor::File,
+        Competitor::Symlink,
+    ] {
+        let tmp = Tmp::new("bs-race");
+        let vault = linux_backslash_name(tmp.path(), "a\\b");
+        let checkpoint = tmp.path().join("checkpoint.json");
+        let mut child = spawn(
+            &[
+                "init",
+                "--vault",
+                vault.to_str().unwrap(),
+                "--format",
+                "1",
+                "--stop-at",
+                "before_dir_publish",
+                "--checkpoint",
+                checkpoint.to_str().unwrap(),
+            ],
+            &checkpoint,
+        );
+        let seen: Value = serde_json::from_str(&fs::read_to_string(&checkpoint).unwrap()).unwrap();
+        assert_eq!(seen["point"], "before_dir_publish");
+        assert_eq!(seen["published"], false);
+        assert_eq!(seen["vault_format"], 1);
+        assert!(!vault.exists());
+        let mark = plant(&vault, competitor);
+        let (code, body) = child.resume();
+        assert_eq!(code, 16, "{}: {body}", mark.kind);
+        assert_eq!(body["reason"], "vault_path_exists");
+        assert_eq!(body["during"], "init_rename");
+        assert_eq!(body["created_new_vault"], false);
+        assert_eq!(body["injected"], false);
+        assert!(body.get("preservation").is_none(), "{body}");
+        assert_mark(&vault, &mark);
+        assert!(names(tmp.path(), ".subvault-init-").is_empty(), "{body}");
+        assert!(!tmp.path().join("a").join("vault.db").exists());
+    }
+
+    let tmp = Tmp::new("bs-export-race");
+    let vault = tmp.path().join("vault");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "1"]);
+    assert_eq!(code, 0, "{body}");
+    let vault_db = fs::read(vault.join("vault.db")).unwrap();
+    let out = linux_backslash_name(tmp.path(), "p\\k");
+    let checkpoint = tmp.path().join("checkpoint.json");
+    let mut child = spawn(
+        &[
+            "export",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--stop-at",
+            "before_dir_publish",
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ],
+        &checkpoint,
+    );
+    let seen: Value = serde_json::from_str(&fs::read_to_string(&checkpoint).unwrap()).unwrap();
+    assert_eq!(seen["point"], "before_dir_publish");
+    assert_eq!(seen["published"], false);
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("KEEP"), b"EXPORT-KEEP\n").unwrap();
+    let entry = dev_ino(&out);
+    let keep = dev_ino(&out.join("KEEP"));
+    let hash = sha256(&out.join("KEEP"));
+    let (code, body) = child.resume();
+    assert_eq!(code, 16, "{body}");
+    assert_eq!(body["reason"], "output_exists");
+    assert_eq!(body["during"], "export_publish");
+    assert_eq!(body["output_written"], false);
+    assert_eq!(body["output_cleanup"], "removed");
+    assert_eq!(body["injected"], false);
+    assert_eq!(dev_ino(&out), entry);
+    assert_eq!(dev_ino(&out.join("KEEP")), keep);
+    assert_eq!(sha256(&out.join("KEEP")), hash);
+    assert_eq!(fs::read(out.join("KEEP")).unwrap(), b"EXPORT-KEEP\n");
+    assert!(!out.join("manifest.json").exists());
+    assert!(names(tmp.path(), ".export-").is_empty(), "{body}");
+    assert_eq!(fs::read(vault.join("vault.db")).unwrap(), vault_db);
+    assert!(!tmp.path().join("p").exists());
 }

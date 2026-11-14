@@ -504,6 +504,8 @@ fn finish_init_scratch(scratch: &Path, mut fail: Fail) -> Fail {
     fail
 }
 
+/// Removes whatever directory is at this staging path. The name prefix is a
+/// shape check, not a record of ownership. The destination is a different path.
 fn discard_init_scratch(scratch: &Path) -> Result<(), String> {
     let name = scratch
         .file_name()
