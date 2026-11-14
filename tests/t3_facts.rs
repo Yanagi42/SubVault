@@ -366,8 +366,14 @@ fn format_3_publishes_only_after_the_main_header_matches() {
     assert_eq!(code, 15, "{body}");
     assert_eq!(body["injected"], true);
     assert_eq!(body["inject_point"], "version_checkpoint");
+    assert_eq!(body["reason"], "injected_enospc");
+    assert_eq!(body["outcome"], "NotPreserved");
     assert_eq!(body["created_new_vault"], false);
+    assert_eq!(body["staging_cleanup"], "not_attempted");
     assert!(!unpublished.exists());
+    let left = PathBuf::from(body["staging_path"].as_str().unwrap());
+    assert!(left.join("vault.db").is_file(), "{body}");
+    fs::remove_dir_all(&left).unwrap();
 
     let vault3 = tmp.path().join("vault3");
     let checkpoint = tmp.path().join("before.json");
@@ -442,7 +448,11 @@ fn format_3_publishes_only_after_the_main_header_matches() {
     assert_eq!(body["reason"], "version_not_in_main_db");
     assert_eq!(body["published"], false);
     assert_eq!(body["created_new_vault"], false);
+    assert_eq!(body["staging_cleanup"], "not_attempted");
     assert!(!vault3.exists());
+    let left = PathBuf::from(body["staging_path"].as_str().unwrap());
+    assert!(left.is_dir(), "{body}");
+    assert_eq!(left, scratch);
 
     let (code, body) = run(&["init", "--vault", vault3.to_str().unwrap(), "--format", "3"]);
     assert_eq!(code, 0, "{body}");

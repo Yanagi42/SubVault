@@ -274,26 +274,24 @@ fn note_export_dir(hooks: &Hooks) -> Result<bool, String> {
     Ok(true)
 }
 
+const STAGING_CLEANUP_REASON: &str = "automatic path deletion is disabled because a path is not ownership; this is the original staging path, and its current location and current owner are unknown";
+
 struct Scratch {
     temp: PathBuf,
 }
 
 impl Scratch {
-    fn fail(&self, mut fail: Fail) -> Fail {
-        match discard(&self.temp) {
-            Ok(()) => {
-                fail.extra.insert("output_cleanup".into(), json!("removed"));
-            }
-            Err(message) => {
-                fail.extra.insert("output_cleanup".into(), json!("failed"));
-                fail.extra
-                    .insert("output_cleanup_error".into(), json!(message));
-            }
-        }
-        fail.extra.insert("output_written".into(), json!(false));
-        fail.extra
-            .insert("completeness".into(), json!("incomplete"));
-        fail
+    /// The temporary directory exists. Failure does not delete that path.
+    /// `Drop` does not delete it either. A name is not ownership.
+    fn fail(&self, fail: Fail) -> Fail {
+        fail.extra("output_cleanup", json!("not_attempted"))
+            .extra("output_cleanup_reason", json!(STAGING_CLEANUP_REASON))
+            .extra(
+                "output_staging_path",
+                json!(self.temp.display().to_string()),
+            )
+            .extra("output_written", json!(false))
+            .extra("completeness", json!("incomplete"))
     }
 }
 
@@ -1299,27 +1297,6 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
-}
-
-/// Removes whatever directory is at this staging path. The name prefix is a
-/// shape check, not a record of ownership. The destination is a different path.
-fn discard(path: &Path) -> Result<(), String> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if !name.starts_with(".export-") {
-        return Err(format!("refusing to remove {}", path.display()));
-    }
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.to_string()),
-    };
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Err("refusing to remove a non-directory".into());
-    }
-    fs::remove_dir_all(path).map_err(|err| err.to_string())
 }
 
 fn reach_inject(hooks: &Hooks) -> Result<(), Fail> {

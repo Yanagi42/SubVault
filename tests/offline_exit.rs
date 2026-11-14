@@ -656,6 +656,8 @@ fn missing_or_mismatched_bytes_are_not_published_as_complete() {
     assert_eq!(body["completeness"], "incomplete");
     assert_eq!(body["output_written"], false);
     assert_eq!(body["output_cleanup"], "not_created");
+    assert!(body.get("output_staging_path").is_none(), "{body}");
+    assert!(body.get("output_cleanup_reason").is_none(), "{body}");
     assert!(!blocked.exists());
     assert!(body.get("preservation").is_none(), "{body}");
 
@@ -766,7 +768,15 @@ fn export_refuses_vault_interior_and_existing_names_before_creating_a_package() 
     ]);
     assert_eq!(code, 16, "{body}");
     assert_eq!(body["reason"], "output_exists");
+    assert_eq!(body["output_cleanup"], "not_created");
+    assert!(body.get("output_staging_path").is_none(), "{body}");
     assert_eq!(fs::read(existing.join("KEEP")).unwrap(), b"keep");
+    let early_stages: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".export-"))
+        .collect();
+    assert!(early_stages.is_empty(), "{early_stages:?}");
 
     let dangling = tmp.path().join("dangling");
     symlink("missing-target", &dangling).unwrap();
@@ -838,9 +848,19 @@ fn export_write_failure_leaves_no_package_and_does_not_change_objects() {
         assert_eq!(body["injected"], true);
         assert_eq!(body["completeness"], "incomplete");
         assert_eq!(body["output_written"], false);
-        assert_eq!(body["output_cleanup"], "removed");
+        assert_eq!(body["output_cleanup"], "not_attempted");
+        assert!(
+            body["output_cleanup_reason"]
+                .as_str()
+                .unwrap()
+                .contains("automatic path deletion is disabled"),
+            "{body}"
+        );
+        assert!(body.get("output_cleanup_error").is_none(), "{body}");
         assert!(body.get("preservation").is_none(), "{body}");
         assert!(!dest.exists());
+        let stage = PathBuf::from(body["output_staging_path"].as_str().unwrap());
+        assert!(stage.is_dir(), "{body}");
         let witness: Value = serde_json::from_slice(&fs::read(&witness).unwrap()).unwrap();
         assert_eq!(witness["reached"], true);
         assert_eq!(witness["point"], "export_write");
@@ -849,7 +869,15 @@ fn export_write_failure_leaves_no_package_and_does_not_change_objects() {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(".export-"))
             .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(
+            leftovers.iter().any(|name| stage.ends_with(name)),
+            "{leftovers:?} {stage:?}"
+        );
+        assert_eq!(
+            leftovers.len(),
+            if action == "io_error" { 1 } else { 2 },
+            "{leftovers:?}"
+        );
     }
     assert_eq!(object_hashes(&vault), hashes);
 }
@@ -923,6 +951,7 @@ fn parent_dir_fsync_after_publish_keeps_the_export_package() {
     assert_eq!(body["reason"], "directory_durability_unknown");
     assert_eq!(body["injected"], true);
     assert!(body.get("output_cleanup").is_none(), "{body}");
+    assert!(body.get("output_staging_path").is_none(), "{body}");
     let seen = serde_json::from_str::<Value>(&fs::read_to_string(&witness).unwrap()).unwrap();
     assert_eq!(seen["point"], "export_dir_fsync");
     assert_eq!(seen["published"], true);

@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -191,6 +191,7 @@ fn spawn(args: &[&str], checkpoint: &Path) -> Stopped {
     Stopped::wait(child, checkpoint)
 }
 
+#[derive(Clone, Copy)]
 enum Competitor {
     Empty,
     NonEmpty,
@@ -297,6 +298,67 @@ fn assert_mark(dir: &Path, mark: &Mark) {
     }
 }
 
+const PATH_CLEANUP_REASON: &str = "automatic path deletion is disabled because a path is not ownership; this is the original staging path, and its current location and current owner are unknown";
+
+fn assert_init_cleanup(body: &Value, stage: &Path) {
+    assert_eq!(body["staging_cleanup"], "not_attempted", "{body}");
+    assert_eq!(
+        body["staging_cleanup_reason"], PATH_CLEANUP_REASON,
+        "{body}"
+    );
+    assert_eq!(body["staging_path"], stage.display().to_string(), "{body}");
+    assert!(body.get("staging_residue").is_none(), "{body}");
+    assert!(body.get("staging_cleanup_error").is_none(), "{body}");
+}
+
+fn assert_export_cleanup(body: &Value, stage: &Path) {
+    assert_eq!(body["output_cleanup"], "not_attempted", "{body}");
+    assert_eq!(body["output_cleanup_reason"], PATH_CLEANUP_REASON, "{body}");
+    assert_eq!(
+        body["output_staging_path"],
+        stage.display().to_string(),
+        "{body}"
+    );
+    assert_eq!(body["output_written"], false, "{body}");
+    assert_eq!(body["completeness"], "incomplete", "{body}");
+    assert!(body.get("output_cleanup_error").is_none(), "{body}");
+}
+
+fn file_snapshot(root: &Path) -> Vec<(String, (u64, u64), &'static str, String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let mut entries: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let meta = fs::symlink_metadata(&path).unwrap();
+            assert!(
+                !meta.file_type().is_symlink(),
+                "unexpected symlink {}",
+                path.display()
+            );
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let ino = (meta.dev(), meta.ino());
+            if meta.is_dir() {
+                out.push((rel, ino, "dir", String::new(), Vec::new()));
+                dirs.push(path);
+                continue;
+            }
+            let bytes = fs::read(&path).unwrap();
+            out.push((rel, ino, "file", sha256(&path), bytes));
+        }
+    }
+    out.sort();
+    out
+}
+
 #[test]
 fn real_stop_keeps_a_competitor_created_after_the_check() {
     for format in ["1", "2", "3"] {
@@ -330,6 +392,11 @@ fn real_stop_keeps_a_competitor_created_after_the_check() {
             assert_eq!(seen["vault_format"], format.parse::<i64>().unwrap());
             assert!(!vault.exists());
             let staging = one_staging(tmp.path(), ".subvault-init-");
+            let staged = dev_ino(&staging);
+            let files = file_snapshot(&staging);
+            assert!(files
+                .iter()
+                .any(|(rel, _, kind, _, _)| rel == "SYNTHETIC_ONLY" && *kind == "file"));
             let mark = plant(&vault, competitor);
             let (code, body) = child.resume();
             assert_eq!(code, 16, "format {format} {:?}: {body}", mark.kind);
@@ -340,10 +407,11 @@ fn real_stop_keeps_a_competitor_created_after_the_check() {
             assert_eq!(body["injected"], false);
             assert!(body.get("preservation").is_none(), "{body}");
             assert_ne!(body["reason"], "writer_busy");
+            assert_init_cleanup(&body, &staging);
             assert_mark(&vault, &mark);
-            assert!(names(tmp.path(), ".subvault-init-").is_empty(), "{body}");
+            assert_eq!(dev_ino(&staging), staged);
+            assert_eq!(file_snapshot(&staging), files);
             assert!(!vault.join("SYNTHETIC_ONLY").exists());
-            let _ = staging;
         }
     }
 }
@@ -387,18 +455,23 @@ fn real_export_stop_keeps_the_competitor_and_the_source_vault() {
         assert_eq!(seen["point"], "before_dir_publish");
         assert_eq!(seen["published"], false);
         assert!(!out.exists());
-        let _staging = one_staging(tmp.path(), ".export-");
+        let staging = one_staging(tmp.path(), ".export-");
+        let staged = dev_ino(&staging);
+        let files = file_snapshot(&staging);
+        assert!(files
+            .iter()
+            .any(|(rel, _, kind, _, _)| rel == "manifest.json" && *kind == "file"));
         let mark = plant(&out, competitor);
         let (code, body) = child.resume();
         assert_eq!(code, 16, "{body}");
         assert_eq!(body["outcome"], "Rejected");
         assert_eq!(body["reason"], "output_exists");
-        assert_eq!(body["output_written"], false);
         assert_eq!(body["during"], "export_publish");
         assert_eq!(body["injected"], false);
-        assert_eq!(body["output_cleanup"], "removed");
+        assert_export_cleanup(&body, &staging);
         assert_mark(&out, &mark);
-        assert!(names(tmp.path(), ".export-").is_empty(), "{body}");
+        assert_eq!(dev_ino(&staging), staged);
+        assert_eq!(file_snapshot(&staging), files);
         assert_eq!(fs::read(vault.join("vault.db")).unwrap(), vault_db);
         assert_eq!(fs::read(vault.join("SYNTHETIC_ONLY")).unwrap(), banner);
         assert_eq!(dev_ino(&old), old_ino);
@@ -419,6 +492,8 @@ fn a_name_that_exists_before_init_stays_on_the_friendly_path() {
     assert_eq!(body["created_new_vault"], false);
     assert!(body.get("during").is_none(), "{body}");
     assert!(body.get("preservation").is_none(), "{body}");
+    assert!(body.get("staging_cleanup").is_none(), "{body}");
+    assert!(body.get("staging_path").is_none(), "{body}");
     assert_eq!(dev_ino(&vault), ino);
     assert!(names(tmp.path(), ".subvault-init-").is_empty());
 }
@@ -450,6 +525,9 @@ fn successful_publish_uses_the_staging_inode() {
         assert_eq!(body["outcome"], "Initialized");
         assert_eq!(body["created_new_vault"], true);
         assert_eq!(body["vault_format"], format.parse::<i64>().unwrap());
+        assert!(body.get("staging_cleanup").is_none(), "{body}");
+        assert!(body.get("staging_path").is_none(), "{body}");
+        assert!(body.get("staging_cleanup_reason").is_none(), "{body}");
         assert_eq!(dev_ino(&vault), staged);
         assert!(names(tmp.path(), ".subvault-init-").is_empty());
         assert!(vault.join("SYNTHETIC_ONLY").is_file());
@@ -486,6 +564,8 @@ fn successful_publish_uses_the_staging_inode() {
     assert_eq!(body["outcome"], "Exported");
     assert_eq!(body["output_written"], true);
     assert!(body.get("output_cleanup").is_none(), "{body}");
+    assert!(body.get("output_cleanup_reason").is_none(), "{body}");
+    assert!(body.get("output_staging_path").is_none(), "{body}");
     assert_eq!(dev_ino(&out), staged);
     assert!(names(tmp.path(), ".export-").is_empty());
     assert!(out.join("manifest.json").is_file());
@@ -494,97 +574,230 @@ fn successful_publish_uses_the_staging_inode() {
 }
 
 #[test]
-fn cleanup_failure_reports_the_private_directory_and_keeps_the_competitor() {
-    let tmp = Tmp::new("init-clean");
-    let vault = tmp.path().join("vault");
-    let checkpoint = tmp.path().join("checkpoint.json");
-    let mut child = spawn(
-        &[
+fn a_failed_build_keeps_the_stage_and_the_main_error() {
+    for (format, inject, reason, point) in [
+        (
+            "2",
+            "enospc:version_checkpoint",
+            "injected_enospc",
+            "version_checkpoint",
+        ),
+        (
+            "3",
+            "io_error:version_verify",
+            "injected_io_error",
+            "version_verify",
+        ),
+    ] {
+        let tmp = Tmp::new(&format!("build{format}"));
+        let vault = tmp.path().join("vault");
+        let witness = tmp.path().join("witness.json");
+        let (code, body) = run(&[
             "init",
             "--vault",
             vault.to_str().unwrap(),
             "--format",
-            "2",
-            "--stop-at",
-            "before_dir_publish",
-            "--checkpoint",
-            checkpoint.to_str().unwrap(),
-        ],
-        &checkpoint,
-    );
-    let staging = one_staging(tmp.path(), ".subvault-init-");
-    let mut perms = fs::metadata(&staging).unwrap().permissions();
-    perms.set_mode(0o555);
-    fs::set_permissions(&staging, perms).unwrap();
-    fs::create_dir(&vault).unwrap();
-    let ino = dev_ino(&vault);
-    let (code, body) = child.resume();
-    assert_eq!(code, 16, "{body}");
-    assert_eq!(body["reason"], "vault_path_exists");
-    assert_eq!(body["during"], "init_rename");
-    assert_eq!(body["staging_cleanup"], "failed");
-    assert_eq!(body["staging_residue"], staging.display().to_string());
-    assert!(
-        body["staging_cleanup_error"]
-            .as_str()
-            .unwrap()
-            .contains("os error 13"),
-        "{body}"
-    );
-    assert_eq!(dev_ino(&vault), ino);
-    assert!(staging.join("SYNTHETIC_ONLY").is_file());
-    let mut perms = fs::metadata(&staging).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&staging, perms).unwrap();
+            format,
+            "--inject",
+            inject,
+            "--witness",
+            witness.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 15, "{body}");
+        assert_eq!(body["outcome"], "NotPreserved");
+        assert_eq!(body["reason"], reason);
+        assert_eq!(body["injected"], true);
+        assert_eq!(body["inject_point"], point);
+        assert_eq!(body["preservation"], "not_preserved");
+        assert_eq!(body["created_new_vault"], false);
+        assert!(body.get("published").is_none(), "{body}");
+        assert!(!vault.exists());
+        let stage = PathBuf::from(body["staging_path"].as_str().unwrap());
+        assert_init_cleanup(&body, &stage);
+        assert!(stage.join("SYNTHETIC_ONLY").is_file());
+        assert!(stage.join("vault.db").is_file());
+        let seen: Value = serde_json::from_str(&fs::read_to_string(&witness).unwrap()).unwrap();
+        assert_eq!(seen["reached"], true);
+        assert_eq!(seen["point"], point);
+    }
 
-    let tmp = Tmp::new("export-clean");
+    let tmp = Tmp::new("export-build");
     let vault = tmp.path().join("vault");
-    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap()]);
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "1"]);
     assert_eq!(code, 0, "{body}");
     let vault_db = fs::read(vault.join("vault.db")).unwrap();
-    let out = tmp.path().join("pkg");
-    let checkpoint = tmp.path().join("checkpoint.json");
-    let mut child = spawn(
-        &[
+    let mut seen_stages = Vec::new();
+    for (action, reason) in [
+        ("io_error", "injected_io_error"),
+        ("enospc", "injected_enospc"),
+    ] {
+        let out = tmp.path().join(action);
+        let witness = tmp.path().join(format!("{action}.json"));
+        let (code, body) = run(&[
             "export",
             "--vault",
             vault.to_str().unwrap(),
             "--out",
             out.to_str().unwrap(),
-            "--stop-at",
-            "before_dir_publish",
-            "--checkpoint",
-            checkpoint.to_str().unwrap(),
-        ],
-        &checkpoint,
-    );
-    let staging = one_staging(tmp.path(), ".export-");
-    let mut perms = fs::metadata(&staging).unwrap().permissions();
-    perms.set_mode(0o555);
-    fs::set_permissions(&staging, perms).unwrap();
-    fs::create_dir(&out).unwrap();
-    fs::write(out.join("KEEP"), b"STILL-HERE\n").unwrap();
-    let ino = dev_ino(&out.join("KEEP"));
-    let hash = sha256(&out.join("KEEP"));
-    let (code, body) = child.resume();
-    assert_eq!(code, 16, "{body}");
-    assert_eq!(body["reason"], "output_exists");
-    assert_eq!(body["output_written"], false);
-    assert_eq!(body["output_cleanup"], "failed");
-    assert!(
-        body["output_cleanup_error"]
-            .as_str()
-            .unwrap()
-            .contains("os error 13"),
-        "{body}"
-    );
-    assert_eq!(dev_ino(&out.join("KEEP")), ino);
-    assert_eq!(sha256(&out.join("KEEP")), hash);
-    assert!(staging.join("manifest.json").is_file());
+            "--inject",
+            &format!("{action}:export_write"),
+            "--witness",
+            witness.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 3, "{body}");
+        assert_eq!(body["outcome"], "Incomplete");
+        assert_eq!(body["reason"], reason);
+        assert_eq!(body["during"], "export_write");
+        assert_eq!(body["injected"], true);
+        assert!(!out.exists());
+        let stage = PathBuf::from(body["output_staging_path"].as_str().unwrap());
+        assert_export_cleanup(&body, &stage);
+        assert!(stage.is_dir());
+        assert_eq!(fs::symlink_metadata(&stage).unwrap().is_dir(), true);
+        seen_stages.push(stage);
+        let seen: Value = serde_json::from_str(&fs::read_to_string(&witness).unwrap()).unwrap();
+        assert_eq!(seen["point"], "export_write");
+        assert_eq!(seen["action"], action);
+    }
+    assert_eq!(seen_stages.len(), 2);
+    assert_ne!(seen_stages[0], seen_stages[1]);
+    assert!(seen_stages.iter().all(|stage| stage.is_dir()));
     assert_eq!(fs::read(vault.join("vault.db")).unwrap(), vault_db);
-    let mut perms = fs::metadata(&staging).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&staging, perms).unwrap();
+}
+
+fn plant_replacement(stage: &Path) -> ((u64, u64), (u64, u64), String) {
+    fs::create_dir(stage).unwrap();
+    let mine = stage.join("ONLY-MINE");
+    fs::write(&mine, b"ONLY-MINE\n").unwrap();
+    (dev_ino(stage), dev_ino(&mine), sha256(&mine))
+}
+
+#[test]
+fn a_replaced_stage_name_stays_with_the_moved_stage_and_the_destination() {
+    for format in ["1", "2", "3"] {
+        for competitor in [
+            Competitor::Empty,
+            Competitor::NonEmpty,
+            Competitor::File,
+            Competitor::Symlink,
+        ] {
+            let tmp = Tmp::new(&format!("swap{format}"));
+            let vault = tmp.path().join("vault");
+            let checkpoint = tmp.path().join("checkpoint.json");
+            let mut child = spawn(
+                &[
+                    "init",
+                    "--vault",
+                    vault.to_str().unwrap(),
+                    "--format",
+                    format,
+                    "--stop-at",
+                    "before_dir_publish",
+                    "--checkpoint",
+                    checkpoint.to_str().unwrap(),
+                ],
+                &checkpoint,
+            );
+            let seen: Value =
+                serde_json::from_str(&fs::read_to_string(&checkpoint).unwrap()).unwrap();
+            assert_eq!(seen["point"], "before_dir_publish");
+            assert_eq!(seen["published"], false);
+            assert!(!vault.exists());
+            let staging = one_staging(tmp.path(), ".subvault-init-");
+            let staged = dev_ino(&staging);
+            let files = file_snapshot(&staging);
+            let moved = tmp.path().join(format!(
+                "moved-{}",
+                staging.file_name().unwrap().to_string_lossy()
+            ));
+            fs::rename(&staging, &moved).unwrap();
+            let (replacement, mine_ino, mine_sha) = plant_replacement(&staging);
+            let mark = plant(&vault, competitor);
+            let (code, body) = child.resume();
+            assert_eq!(code, 16, "format {format} {}: {body}", mark.kind);
+            assert_eq!(body["outcome"], "Rejected");
+            assert_eq!(body["reason"], "vault_path_exists");
+            assert_eq!(body["during"], "init_rename");
+            assert_eq!(body["created_new_vault"], false);
+            assert_eq!(body["injected"], false);
+            assert!(body.get("preservation").is_none(), "{body}");
+            assert_init_cleanup(&body, &staging);
+            assert_eq!(dev_ino(&moved), staged, "moved stage inode");
+            assert_eq!(file_snapshot(&moved), files, "moved stage bytes");
+            assert_eq!(dev_ino(&staging), replacement, "replacement inode");
+            assert_eq!(dev_ino(&staging.join("ONLY-MINE")), mine_ino);
+            assert_eq!(sha256(&staging.join("ONLY-MINE")), mine_sha);
+            assert_eq!(fs::read(staging.join("ONLY-MINE")).unwrap(), b"ONLY-MINE\n");
+            assert_mark(&vault, &mark);
+        }
+    }
+
+    for competitor in [
+        Competitor::Empty,
+        Competitor::NonEmpty,
+        Competitor::File,
+        Competitor::Symlink,
+    ] {
+        let tmp = Tmp::new(&format!("swap-export-{}", competitor_label(competitor)));
+        let vault = tmp.path().join("vault");
+        let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "1"]);
+        assert_eq!(code, 0, "{body}");
+        let vault_db = fs::read(vault.join("vault.db")).unwrap();
+        let out = tmp.path().join("pkg");
+        let checkpoint = tmp.path().join("checkpoint.json");
+        let mut child = spawn(
+            &[
+                "export",
+                "--vault",
+                vault.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--stop-at",
+                "before_dir_publish",
+                "--checkpoint",
+                checkpoint.to_str().unwrap(),
+            ],
+            &checkpoint,
+        );
+        let seen: Value = serde_json::from_str(&fs::read_to_string(&checkpoint).unwrap()).unwrap();
+        assert_eq!(seen["point"], "before_dir_publish");
+        assert_eq!(seen["published"], false);
+        assert!(!out.exists());
+        let staging = one_staging(tmp.path(), ".export-");
+        let staged = dev_ino(&staging);
+        let files = file_snapshot(&staging);
+        let moved = tmp.path().join(format!(
+            "moved-{}",
+            staging.file_name().unwrap().to_string_lossy()
+        ));
+        fs::rename(&staging, &moved).unwrap();
+        let (replacement, mine_ino, mine_sha) = plant_replacement(&staging);
+        let mark = plant(&out, competitor);
+        let (code, body) = child.resume();
+        assert_eq!(code, 16, "{}: {body}", mark.kind);
+        assert_eq!(body["outcome"], "Rejected");
+        assert_eq!(body["reason"], "output_exists");
+        assert_eq!(body["during"], "export_publish");
+        assert_eq!(body["injected"], false);
+        assert_export_cleanup(&body, &staging);
+        assert_eq!(dev_ino(&moved), staged, "moved export stage inode");
+        assert_eq!(file_snapshot(&moved), files, "moved export stage bytes");
+        assert_eq!(dev_ino(&staging), replacement, "replacement inode");
+        assert_eq!(dev_ino(&staging.join("ONLY-MINE")), mine_ino);
+        assert_eq!(sha256(&staging.join("ONLY-MINE")), mine_sha);
+        assert_eq!(fs::read(staging.join("ONLY-MINE")).unwrap(), b"ONLY-MINE\n");
+        assert_mark(&out, &mark);
+        assert_eq!(fs::read(vault.join("vault.db")).unwrap(), vault_db);
+    }
+}
+
+fn competitor_label(competitor: Competitor) -> &'static str {
+    match competitor {
+        Competitor::Empty => "empty",
+        Competitor::NonEmpty => "nonempty",
+        Competitor::File => "file",
+        Competitor::Symlink => "symlink",
+    }
 }
 
 #[test]
@@ -611,6 +824,8 @@ fn format_1_does_not_gain_the_other_version_hooks() {
         assert_eq!(code, 2, "{point}: {body}");
         assert_eq!(body["reason"], "format_1_has_no_version_hook");
         assert_eq!(body["created_new_vault"], false);
+        assert!(body.get("staging_cleanup").is_none(), "{body}");
+        assert!(body.get("staging_path").is_none(), "{body}");
         assert!(!vault.exists());
         assert!(names(tmp.path(), ".subvault-init-").is_empty());
     }
@@ -634,6 +849,8 @@ fn format_1_does_not_gain_the_other_version_hooks() {
     assert_eq!(code, 2, "{body}");
     assert_eq!(body["reason"], "unknown_stop_point");
     assert_eq!(body["point"], "export_before_rename");
+    assert!(body.get("output_cleanup").is_none(), "{body}");
+    assert!(body.get("output_staging_path").is_none(), "{body}");
     assert!(!out.exists());
     assert!(names(tmp.path(), ".export-").is_empty());
 }
@@ -661,6 +878,7 @@ fn injected_directory_fsync_keeps_the_published_directory() {
     assert_eq!(body["created_new_vault"], true);
     assert_eq!(body["injected"], true);
     assert!(body.get("staging_cleanup").is_none(), "{body}");
+    assert!(body.get("staging_path").is_none(), "{body}");
     assert!(body.get("preservation").is_none(), "{body}");
     assert!(names(tmp.path(), ".subvault-init-").is_empty());
     assert!(vault.join("vault.db").is_file());
@@ -691,6 +909,7 @@ fn injected_directory_fsync_keeps_the_published_directory() {
     assert_eq!(body["output_written"], true);
     assert_eq!(body["injected"], true);
     assert!(body.get("output_cleanup").is_none(), "{body}");
+    assert!(body.get("output_staging_path").is_none(), "{body}");
     assert!(names(tmp.path(), ".export-").is_empty());
     assert!(out.join("records.json").is_file());
     let seen: Value = serde_json::from_str(&fs::read_to_string(&witness).unwrap()).unwrap();
@@ -721,6 +940,8 @@ fn a_backslash_is_one_linux_name_for_a_new_init_and_export() {
         assert_eq!(body["outcome"], "Initialized");
         assert_eq!(body["created_new_vault"], true);
         assert_eq!(body["vault_format"], format.parse::<i64>().unwrap());
+        assert!(body.get("staging_cleanup").is_none(), "{body}");
+        assert!(body.get("staging_path").is_none(), "{body}");
         assert!(vault.join("vault.db").is_file(), "{body}");
         assert!(vault.join("SYNTHETIC_ONLY").is_file());
         assert!(!tmp.path().join("a").exists());
@@ -746,6 +967,8 @@ fn a_backslash_is_one_linux_name_for_a_new_init_and_export() {
     assert_eq!(code, 0, "{body}");
     assert_eq!(body["outcome"], "Exported");
     assert_eq!(body["output_written"], true);
+    assert!(body.get("output_cleanup").is_none(), "{body}");
+    assert!(body.get("output_staging_path").is_none(), "{body}");
     assert!(out.join("manifest.json").is_file(), "{body}");
     assert!(out.join("records.json").is_file());
     assert!(!out.join("vault.db").exists());
@@ -769,6 +992,8 @@ fn a_backslash_name_keeps_a_competitor_that_is_already_there_or_appears_after_th
     assert_eq!(body["created_new_vault"], false);
     assert!(body.get("during").is_none(), "{body}");
     assert!(body.get("preservation").is_none(), "{body}");
+    assert!(body.get("staging_cleanup").is_none(), "{body}");
+    assert!(body.get("staging_path").is_none(), "{body}");
     assert_eq!(dev_ino(&vault), entry);
     assert_eq!(dev_ino(&vault.join("KEEP")), keep);
     assert_eq!(sha256(&vault.join("KEEP")), hash);
@@ -804,6 +1029,9 @@ fn a_backslash_name_keeps_a_competitor_that_is_already_there_or_appears_after_th
         assert_eq!(seen["published"], false);
         assert_eq!(seen["vault_format"], 1);
         assert!(!vault.exists());
+        let staging = one_staging(tmp.path(), ".subvault-init-");
+        let staged = dev_ino(&staging);
+        let files = file_snapshot(&staging);
         let mark = plant(&vault, competitor);
         let (code, body) = child.resume();
         assert_eq!(code, 16, "{}: {body}", mark.kind);
@@ -812,9 +1040,12 @@ fn a_backslash_name_keeps_a_competitor_that_is_already_there_or_appears_after_th
         assert_eq!(body["created_new_vault"], false);
         assert_eq!(body["injected"], false);
         assert!(body.get("preservation").is_none(), "{body}");
+        assert_init_cleanup(&body, &staging);
         assert_mark(&vault, &mark);
-        assert!(names(tmp.path(), ".subvault-init-").is_empty(), "{body}");
-        assert!(!tmp.path().join("a").join("vault.db").exists());
+        assert_eq!(dev_ino(&staging), staged);
+        assert_eq!(file_snapshot(&staging), files);
+        assert!(!tmp.path().join("a").exists());
+        assert!(!tmp.path().join("b").exists());
     }
 
     let tmp = Tmp::new("bs-export-race");
@@ -841,6 +1072,9 @@ fn a_backslash_name_keeps_a_competitor_that_is_already_there_or_appears_after_th
     let seen: Value = serde_json::from_str(&fs::read_to_string(&checkpoint).unwrap()).unwrap();
     assert_eq!(seen["point"], "before_dir_publish");
     assert_eq!(seen["published"], false);
+    let staging = one_staging(tmp.path(), ".export-");
+    let staged = dev_ino(&staging);
+    let files = file_snapshot(&staging);
     fs::create_dir(&out).unwrap();
     fs::write(out.join("KEEP"), b"EXPORT-KEEP\n").unwrap();
     let entry = dev_ino(&out);
@@ -850,15 +1084,16 @@ fn a_backslash_name_keeps_a_competitor_that_is_already_there_or_appears_after_th
     assert_eq!(code, 16, "{body}");
     assert_eq!(body["reason"], "output_exists");
     assert_eq!(body["during"], "export_publish");
-    assert_eq!(body["output_written"], false);
-    assert_eq!(body["output_cleanup"], "removed");
     assert_eq!(body["injected"], false);
+    assert_export_cleanup(&body, &staging);
     assert_eq!(dev_ino(&out), entry);
     assert_eq!(dev_ino(&out.join("KEEP")), keep);
     assert_eq!(sha256(&out.join("KEEP")), hash);
     assert_eq!(fs::read(out.join("KEEP")).unwrap(), b"EXPORT-KEEP\n");
     assert!(!out.join("manifest.json").exists());
-    assert!(names(tmp.path(), ".export-").is_empty(), "{body}");
+    assert_eq!(dev_ino(&staging), staged);
+    assert_eq!(file_snapshot(&staging), files);
     assert_eq!(fs::read(vault.join("vault.db")).unwrap(), vault_db);
     assert!(!tmp.path().join("p").exists());
+    assert!(!tmp.path().join("k").exists());
 }

@@ -491,38 +491,17 @@ fn init_rename_failure(err: io::Error) -> Fail {
     }
 }
 
-fn finish_init_scratch(scratch: &Path, mut fail: Fail) -> Fail {
-    if let Err(message) = discard_init_scratch(scratch) {
-        fail.extra.insert("staging_cleanup".into(), json!("failed"));
-        fail.extra.insert(
-            "staging_residue".into(),
-            json!(scratch.display().to_string()),
-        );
-        fail.extra
-            .insert("staging_cleanup_error".into(), json!(message));
-    }
-    fail
-}
+const STAGING_CLEANUP_REASON: &str = "automatic path deletion is disabled because a path is not ownership; this is the original staging path, and its current location and current owner are unknown";
 
-/// Removes whatever directory is at this staging path. The name prefix is a
-/// shape check, not a record of ownership. The destination is a different path.
-fn discard_init_scratch(scratch: &Path) -> Result<(), String> {
-    let name = scratch
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if !name.starts_with(".subvault-init-") {
-        return Err(format!("refusing to remove {}", scratch.display()));
-    }
-    let meta = match fs::symlink_metadata(scratch) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.to_string()),
-    };
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Err("refusing to remove a non-directory".into());
-    }
-    fs::remove_dir_all(scratch).map_err(|err| err.to_string())
+/// The private directory exists. Failure does not delete that path: a name is
+/// not ownership, so a recursive delete could remove a replacement. The receipt
+/// says deletion was not attempted and repeats the original path. It does not
+/// say that a directory is still there, where it is, or who it belongs to.
+/// There is no `Drop` that deletes this directory.
+fn finish_init_scratch(scratch: &Path, fail: Fail) -> Fail {
+    fail.extra("staging_cleanup", json!("not_attempted"))
+        .extra("staging_cleanup_reason", json!(STAGING_CLEANUP_REASON))
+        .extra("staging_path", json!(scratch.display().to_string()))
 }
 
 fn init_ready(vault_id: &str, format: u8, magic: i64) -> Report {

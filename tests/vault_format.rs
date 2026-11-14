@@ -251,6 +251,23 @@ fn sql(vault: &Path, statement: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn unfinished_init(parent: &Path, body: &Value) -> PathBuf {
+    assert_eq!(body["staging_cleanup"], "not_attempted", "{body}");
+    assert!(
+        body["staging_cleanup_reason"]
+            .as_str()
+            .unwrap()
+            .contains("automatic path deletion is disabled"),
+        "{body}"
+    );
+    assert!(body.get("staging_residue").is_none(), "{body}");
+    assert!(body.get("staging_cleanup_error").is_none(), "{body}");
+    let path = PathBuf::from(body["staging_path"].as_str().unwrap());
+    assert!(path.starts_with(parent), "{}", path.display());
+    assert!(path.is_dir(), "{}", path.display());
+    path
+}
+
 fn scratch_dir(parent: &Path) -> PathBuf {
     let mut found = Vec::new();
     for entry in fs::read_dir(parent).unwrap() {
@@ -526,7 +543,12 @@ fn checkpoint_or_verify_failure_does_not_publish() {
     assert_eq!(body["injected"], true);
     assert_eq!(body["inject_point"], "version_checkpoint");
     assert_eq!(body["created_new_vault"], false);
+    assert_eq!(body["outcome"], "NotPreserved");
+    assert_eq!(body["reason"], "injected_enospc");
     assert!(!vault.exists());
+    let left = unfinished_init(tmp.path(), &body);
+    assert!(left.join("vault.db").is_file());
+    fs::remove_dir_all(&left).unwrap();
     assert!(witness.is_file());
 
     let witness = tmp.path().join("verify.json");
@@ -543,8 +565,13 @@ fn checkpoint_or_verify_failure_does_not_publish() {
     ]);
     assert_eq!(code, 15, "{body}");
     assert_eq!(body["inject_point"], "version_verify");
+    assert_eq!(body["outcome"], "NotPreserved");
+    assert_eq!(body["reason"], "injected_io_error");
     assert_eq!(body["created_new_vault"], false);
     assert!(!vault.exists());
+    let left = unfinished_init(tmp.path(), &body);
+    assert!(left.join("vault.db").is_file());
+    fs::remove_dir_all(&left).unwrap();
 
     let checkpoint = tmp.path().join("checked.json");
     let mut child = Stopped::spawn(&[
@@ -576,7 +603,10 @@ fn checkpoint_or_verify_failure_does_not_publish() {
     assert_eq!(body["published"], false);
     assert_eq!(body["created_new_vault"], false);
     assert!(!vault.exists());
-    assert!(!scratch.exists());
+    assert!(scratch.is_dir());
+    assert_eq!(body["staging_path"], scratch.display().to_string());
+    assert_eq!(unfinished_init(tmp.path(), &body), scratch);
+    fs::remove_dir_all(&scratch).unwrap();
 
     let checkpoint = tmp.path().join("busy.json");
     let mut child = Stopped::spawn(&[
