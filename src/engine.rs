@@ -36,10 +36,13 @@ mod decide;
 mod export;
 #[path = "fragment.rs"]
 mod fragment;
+#[path = "html.rs"]
+mod html;
 
 pub use decide::{correct_fact, query_facts, undo_decision, CorrectRequest, UndoRequest};
 pub use export::{export_copy, ExportRequest};
 pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
+pub use html::{submit_html, HtmlRequest};
 
 const IMPORT_STOPS: &[&str] = &[
     "before_copy",
@@ -219,7 +222,7 @@ pub fn help_report() -> Report {
     let mut body = honesty("Help");
     body.insert(
         "note".into(),
-        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. On a new format 3 vault, that same publish also records a stated paid amount and a stated service period as facts. Those facts are source statements, not verified payments, purchases, or account links. correct can replace the stated USD amount text, and undo appends a compensating decision. export writes one offline package outside the vault: originals, candidates, current facts, and the decision chain. It does not choose a protection mode. PDF extraction is not available. Security is not complete. This is not a user-ready product."),
+        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. On a new format 3 vault, that same publish also records a stated paid amount and a stated service period as facts. Those facts are source statements, not verified payments, purchases, or account links. correct can replace the stated USD amount text, and undo appends a compensating decision. export writes one offline package outside the vault: originals, candidates, current facts, and the decision chain. It does not choose a protection mode. PDF extraction is not available. Security is not complete. This is not a user-ready product. format 4 takes one local UTF-8 HTML file and keeps those bytes. Its extraction is a limited static-text pass, not browser visibility, and it does not migrate an older vault."),
     );
     body.insert(
         "commands".into(),
@@ -233,6 +236,7 @@ pub fn help_report() -> Report {
             "read --vault PATH --source-id ID --out PATH",
             "marker --vault PATH --command-id ID --source-id ID --value TEXT",
             "fragment --vault PATH --command-id ID --fragment PATH [--batch-id ID]",
+            "html --vault PATH --command-id ID --source PATH [--batch-id ID]",
             "candidates --vault PATH [--source-id ID]",
             "facts --vault PATH [--source-id ID] [--fact-id ID]",
             "export --vault PATH --out PATH [--allow-partial yes]",
@@ -2034,7 +2038,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
-    if journal.kind == "fragment" || journal.kind == "decision" {
+    if journal.kind == "fragment" || journal.kind == "decision" || journal.kind == "html" {
         return Err(fragment_journal_conflict());
     }
     if journal.generation != req.generation {
@@ -2847,7 +2851,7 @@ fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
-    if journal.kind == "fragment" || journal.kind == "decision" {
+    if journal.kind == "fragment" || journal.kind == "decision" || journal.kind == "html" {
         return Err(fragment_journal_conflict());
     }
     if journal.generation != req.generation {

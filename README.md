@@ -133,12 +133,26 @@ scripts/run-t1-evidence.sh
 
 `export --vault PATH --out PATH` 在现有写锁下，用只读连接读一份快照，再把包写到库外。`--out` 的落点规则和 `read --out` 相同：库内、解析不了、父目录不存在、或最后一级已经存在，都拒绝，并且不创建包。包不是活动库目录的副本，里面没有 `vault.db`。
 
-`records.json` 有来源、出现、原件身份、来源版本、候选和定位、当前事实，以及全部决定。格式 3 另有 `facts.csv`，只放当前值；空的金额留空，不写成 0。`manifest.json` 记录每个文件的 SHA-256 和长度。`snapshot_id` 是 `records.json` 字节的 SHA-256，不是 SQLite 的历史版本号。原件在 `originals/<object_id>`。保护方式仍是 `undecided`：这是合成库的明文副本，不是获准的真实资料出口。
+`records.json` 有来源、出现、原件身份、来源版本、候选和定位、当前事实，以及全部决定。格式 3 和格式 4 另有 `facts.csv`，只放当前值；空的金额留空，不写成 0。`manifest.json` 记录每个文件的 SHA-256 和长度。`snapshot_id` 是 `records.json` 字节的 SHA-256，不是 SQLite 的历史版本号。原件在 `originals/<object_id>`。格式 4 的 HTML 原件只作为文本放进包里，不执行，也不自动加载其中的外部引用。保护方式仍是 `undecided`：这是合成库的明文副本，不是获准的真实资料出口。
 
 最后一次目录项核对通过之后，才用同一父目录上的 `renameat2(RENAME_NOREPLACE)` 把临时目录发布成 `--out`。核对之后才出现的名字不会被换掉；那种失败是退出码 16 的 `output_exists`。已经建出临时目录之后的失败不再按那条路径递归删除。`output_cleanup` 是 `not_attempted`，并带 `output_cleanup_reason` 和当初的 `output_staging_path`。这只说明这次没有尝试按路径删除，不说明该路径上现在有没有目录、位置或归属，也不指示按路径删除。`output_written` 仍是 false，`completeness` 仍是 `incomplete`。目的竞争者、被挪走的原临时目录、以及放回原名的替代目录都留下来。还没建临时目录的早拒不改成 `not_attempted`，也不附一条临时路径；原来就是 `output_cleanup=not_created` 的保持这个值。正常成功不带 `output_cleanup`。发布成功后保留同一把父目录句柄，显式 `sync_all` 之后才释放，不按路径重新打开，也不在 `Drop` 里同步。内核没有这个调用，或这次调用返回跨设备错误时，不改用普通 `rename` 或复制。核对通过并且发布成功时，`completeness` 是 `complete`，退出码 0。确认缺件或哈希不符时，不带 `--allow-partial yes` 就不发布，退出码 12，`completeness` 是 `incomplete`。带了这个参数才发布 `partial`，缺件留在 `missing`，不把缺的字节补成完整。对象这次读不出来不是缺件，即使带了参数也不发布。决定链对不上、引用断了，同样不发布。写失败或 `--inject io_error:export_write` / `enospc:export_write` 仍是退出码 3，`output_written` 为 false，临时目录留在原路径，`output_cleanup` 为 `not_attempted`。已有的成功包不会被这次失败覆盖。改名成功之后，同一把句柄上的 `sync_all` 返回错误是退出码 3，`published` 为 true，`parent_fsync_returned_ok` 为 false，reason 是 `io_error` 或 `enospc`，`during` 是 `export_dir_fsync`。包留在已经改好的名字上，`output_written` 仍是 true，`completeness` 保持核对结果，不回到失败收尾，也不带 `output_cleanup`。`output` 仍是请求的 `--out`。sync 已经返回成功之后的 `--inject io_error:export_dir_fsync` / `enospc:export_dir_fsync`，或那次见证写入失败，也是退出码 3，但 `parent_fsync_returned_ok` 为 true，reason 是注入的 `injected_io_error` / `injected_enospc` 或写入的 `io_error` / `enospc`。`directory_durable=false` 是最终耐久未确认，不能倒推那次 sync 失败。不把这次写成未发布，也不删掉已经改好名的包。真实的 `sync_all` 返回错误没有做出来；错误分类是静态的。这不是完整的安全清理。SIGKILL 没有回执。
 
 这里没有主体、购买、备份、对象租约、导出取消代次，也不选择加密。复制活动库目录仍然不算完整出口。只在这台 Linux 上核对过路径。
 
+## 格式 4 的有限 HTML
+
+`html --vault PATH --command-id ID --source PATH` 只接受格式 4。格式 1、2、3 在打开写会话之前拒绝，已有库不会被迁移或改写。调用者不能另给媒体类型。程序不读标准输入、邮箱或剪贴板，也不取远程资源。
+
+接受的文件必须是非空 UTF-8，并且不超过 65536 字节。编码不猜测。拒绝发生在保全之前，原件不入库。接受之后，原始字节原样放进 `objects/`。之后的解析或提取失败仍报告 `preservation=preserved`，不把已经托管的原件说成没保住。同一 CommandId 再执行时先核对托管字节：外部文件还能读且哈希不同是 `payload_conflict`，对象不改；外部文件读不到时不把已提交对象改成 `not_preserved`。另一个 CommandId 提交同一份哈希返回 `AlreadyPreserved`，不再提取一次。一个格式 4 库只收一份 HTML。
+
+媒体类型固定为 `text/html;charset=utf-8`，`role` 是 `user_provided_html`。这不是 `text/plain`，也不是 `user_provided_fragment`。提取器是 `subvault-html` 1，规范化 `html-static-text-1`，拼接 `html-block-1`，规则 `stated-html-blocks-1`，空白 `html-collapse-1`。偏移单位是原始 UTF-8 文件上的 Unicode 标量，不是版本化纯文本。解析用锁定的 `tl` 0.7.8 取元素和原始字节边界，实体解码用锁定的 `html-escape` 0.2.13，只解码解析器已经分开的文本节点。这两项是实现记录，不进入 logical key。
+
+支持的块是 `p`、`div`、`li`、`h1` 到 `h6`、`blockquote`。行内容纳 `b`、`strong`、`i`、`em`、`span` 和 `br`。`html`、`body`、`ul`、`ol` 只作容器。`head`、`script`、注释，以及带 `hidden` 属性的祖先不进入文本。`br` 变成换行。ASCII 空格、制表符、CR 和换页折叠成一个空格，然后去掉两端空白；不折叠不换行空格。普通 HTML 并不都在这个范围里。块外的正文、看不见的标签（例如 `table`、`a`、`img`、`pre`）是 `out_of_scope`，不发布部分事实。任何 `style` 属性、`style` 元素，或 `rel` 含 stylesheet 的 `link`，整篇提取都是 `unsupported`：字节仍保住，程序不解释 CSS。没有对上的已付金额或服务期是 `no_match`。同一类出现不同的值是 `conflict`，冲突的那类不自动采用；另一类没有冲突时仍可单独采用。相同的重复句子采用第一条，其余标 `duplicate_statement`。
+
+金额和服务期仍用正文里的写法：`Amount paid USD ` 加整数和两位小数，`Service period: ` 加 `YYYY-MM-DD through YYYY-MM-DD`。匹配发生在折叠后的显示行上，不按原始 HTML 的整行扫描。每条事实用包含这段行内内容的最小支持元素的一段连续原始字节。`excerpt` 是那段原始 HTML，`display_excerpt` 是解码并折叠后的文本，两者分开。字节偏移、标量偏移、来源版本和哈希都能回到原件。不另造派生对象，也不做多段双定位。来源只当文本展示：不执行，不联网，不自动浏览。
+
+`facts` 在格式 4 上的 `slice` 是 `T4-html`。事实值仍是来源声明：`payment_verified` 为 false，`observed_at` 为 null，`current_status` 和 `time_status` 为 unknown。`correct` 和 `undo` 沿用 `t3-payload-1`，只改写明的 USD 金额文本。导出包里的 HTML 原件可能含有外部引用；`field_notes.html_original` 写明这些引用不会被自动加载。格式 1、2、3 的导出注释不增加这一条。
+
 ## 这轮没有做
 
-整理、全文搜索、订阅规则、购买、权益、PDF 提取、OCR、加密、真实数据导入、桌面壳和遥测都没有实现。离线退出包不是备份，也不是保护方案。正文候选本身不是事实。格式 3 另有事实表，只承接写明的已付金额和服务期。T0/T1 通过不等于产品完成。Linux 上的结果不代表 Windows。
+整理、全文搜索、订阅规则、购买、权益、PDF 提取、OCR、加密、真实数据导入、桌面壳和遥测都没有实现。离线退出包不是备份，也不是保护方案。正文候选本身不是事实。格式 3 另有事实表，只承接写明的已付金额和服务期。格式 4 的 HTML 只做上面列出的静态文本，不是浏览器，也不表示普通 HTML 都能提取。T0/T1 通过不等于产品完成。Linux 上的结果不代表 Windows。

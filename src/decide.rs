@@ -55,6 +55,7 @@ pub(super) fn adopt_statements(
     source_id: &str,
     source_version_id: &str,
     run_id: &str,
+    rule_version: &str,
     drafts: &[StatedDraft<'_>],
 ) -> Result<Vec<Adopted>, Fail> {
     let recorded_at = super::now_ms();
@@ -89,7 +90,7 @@ pub(super) fn adopt_statements(
                 draft.kind,
                 RULE_ACTOR_ID,
                 recorded_at,
-                body::RULES_VERSION,
+                rule_version,
                 value_json
             ],
         )
@@ -211,7 +212,9 @@ pub fn query_facts(vault: &Path, source_id: Option<String>, fact_id: Option<Stri
 
 fn tag(mut report: Report) -> Report {
     if let Some(map) = report.body.as_object_mut() {
-        map.insert("slice".into(), json!("T3-facts"));
+        if map.get("slice").and_then(|value| value.as_str()) == Some("T1") {
+            map.insert("slice".into(), json!("T3-facts"));
+        }
     }
     report
 }
@@ -298,7 +301,10 @@ fn query_inner(
         }));
     }
     let mut body = honesty("Facts");
-    body.insert("slice".into(), json!("T3-facts"));
+    body.insert(
+        "slice".into(),
+        json!(if version == 4 { "T4-html" } else { "T3-facts" }),
+    );
     body.insert("new_effect".into(), json!(false));
     body.insert("read_only".into(), json!(true));
     body.insert("facts".into(), Value::Array(facts));
@@ -340,12 +346,22 @@ fn candidate_anchor(conn: &Connection, candidate_id: &str, source_id: &str) -> R
             .extra("candidate_id", json!(candidate_id))
             .extra("new_effect", json!(false))
     })?;
-    Ok(json!({
+    let mut anchor = json!({
         "candidate_id": candidate_id,
         "kind": kind,
         "excerpt": excerpt,
         "locator": locator
-    }))
+    });
+    if let Some(display) = anchor
+        .get("locator")
+        .and_then(|item| item.get("display_excerpt"))
+        .cloned()
+    {
+        if let Some(map) = anchor.as_object_mut() {
+            map.insert("display_excerpt".into(), display);
+        }
+    }
+    Ok(anchor)
 }
 
 fn decision_history(conn: &Connection, fact_id: &str) -> Result<Vec<Value>, Fail> {

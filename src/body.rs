@@ -405,6 +405,28 @@ fn period_draft(line: &Line, start: &str, end: &str) -> Draft {
     draft
 }
 
+pub(crate) enum StatedLine {
+    Amount(String),
+    Period(String, String),
+    Other,
+}
+
+/// The paid and period prefixes used by a plain fragment. HTML extraction
+/// calls this after it has already produced a folded display line.
+pub(crate) fn stated_line(line: &str) -> StatedLine {
+    if let Some(rest) = line.strip_prefix("Amount paid USD ") {
+        if let Some(amount) = money(rest) {
+            return StatedLine::Amount(amount);
+        }
+    }
+    if let Some(rest) = line.strip_prefix("Service period: ") {
+        if let Some((start, end)) = period(rest) {
+            return StatedLine::Period(start, end);
+        }
+    }
+    StatedLine::Other
+}
+
 fn status_draft(line: &Line, date: &str) -> Draft {
     let mut draft = located(
         line,

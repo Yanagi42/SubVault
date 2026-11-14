@@ -99,7 +99,8 @@ fn needs_upgrade() -> Fail {
 
 fn as_body_slice(mut report: Report) -> Report {
     if let Some(map) = report.body.as_object_mut() {
-        if map.get("slice").and_then(|value| value.as_str()) != Some("T3-facts") {
+        let slice = map.get("slice").and_then(|value| value.as_str());
+        if slice != Some("T3-facts") && slice != Some("T4-html") {
             map.insert("slice".into(), json!("T2a-body"));
         }
     }
@@ -711,6 +712,7 @@ fn publish(
             &opened.source_id,
             &opened.source_version_id,
             &opened.run_id,
+            body::RULES_VERSION,
             &stated,
         )?
     } else {
@@ -1289,7 +1291,10 @@ fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fa
     .map_err(|err| unseen_db(err, "candidates_open"))?;
     super::accept_connection_format(&vault.join("vault.db"), &conn)?;
     let schema = store::meta(&conn, "body_schema").map_err(|err| unseen_db(err, "body_schema"))?;
-    if schema.is_none() {
+    let html_schema =
+        store::meta(&conn, "html_body_schema").map_err(|err| unseen_db(err, "html_body_schema"))?;
+    let html = schema.is_none() && html_schema.as_deref() == Some(store::HTML_BODY_SCHEMA);
+    if schema.is_none() && !html {
         let mut body = body_outcome("Candidates");
         body.insert("new_effect".into(), json!(false));
         body.insert("body_schema".into(), Value::Null);
@@ -1298,7 +1303,7 @@ fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fa
         body.insert("read_only".into(), json!(true));
         return Ok((EXIT_OK, Value::Object(body)));
     }
-    if schema.as_deref() != Some(store::BODY_SCHEMA) {
+    if !html && schema.as_deref() != Some(store::BODY_SCHEMA) {
         return Err(refused("body_schema_unsupported").extra("new_effect", json!(false)));
     }
     for name in store::BODY_TABLES {
@@ -1399,7 +1404,7 @@ fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fa
         let (Some(value), Some(locator)) = (value, locator) else {
             continue;
         };
-        candidates.push(json!({
+        let mut item = json!({
             "candidate_id": row.0,
             "run_id": row.1,
             "attempt_id": row.2,
@@ -1420,14 +1425,30 @@ fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fa
             "purchase_id": null,
             "account_id": null,
             "relationship": null
-        }));
+        });
+        if let Some(display) = item
+            .get("locator")
+            .and_then(|locator| locator.get("display_excerpt"))
+            .cloned()
+        {
+            if let Some(map) = item.as_object_mut() {
+                map.insert("display_excerpt".into(), display);
+            }
+        }
+        candidates.push(item);
     }
     drop(stmt);
     let runs = list_runs(&conn, source_id, &mut alerts, &mut damaged)?;
     let mut body = body_outcome("Candidates");
     body.insert("new_effect".into(), json!(false));
     body.insert("read_only".into(), json!(true));
-    body.insert("body_schema".into(), json!(store::BODY_SCHEMA));
+    if html {
+        body.insert("slice".into(), json!("T4-html"));
+        body.insert("body_schema".into(), Value::Null);
+        body.insert("html_body_schema".into(), json!(store::HTML_BODY_SCHEMA));
+    } else {
+        body.insert("body_schema".into(), json!(store::BODY_SCHEMA));
+    }
     body.insert("candidates".into(), Value::Array(candidates));
     body.insert("runs".into(), runs);
     body.insert("alerts".into(), Value::Array(alerts.clone()));

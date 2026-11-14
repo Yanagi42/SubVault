@@ -738,7 +738,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
         "security_complete": false,
         "synthetic_only": true,
         "live_directory_copy": false,
-        "field_notes": field_notes(),
+        "field_notes": field_notes(vault_format),
         "sources": source_json(&sources),
         "occurrences": occurrence_json(&occurrences),
         "objects": object_json,
@@ -1260,14 +1260,20 @@ fn occurrence_json(rows: &[OccurrenceRow]) -> Vec<Value> {
         .collect()
 }
 
-fn field_notes() -> Value {
-    json!({
+fn field_notes(vault_format: i64) -> Value {
+    let mut notes = json!({
         "stated_amount_paid": "来源载明的已付金额，不是已核到账。",
         "stated_service_period": "来源载明的服务期。没有观察日，当前状态保持未知。",
         "candidate": "候选不是事实。没有被事实引用的候选仍留在包内。",
         "protection": "保护方式未定。这是合成库的明文副本，不是获准的真实资料出口。",
         "paths": "包内原件只用 originals/ 下的相对路径。出现记录里的外部路径只是当时的取得记录。"
-    })
+    });
+    if vault_format == 4 {
+        notes["html_original"] = json!(
+            "包内 HTML 只作为文本保存和展示。程序不执行它，不连接网络，也不自动加载其中的外部引用。"
+        );
+    }
+    notes
 }
 
 fn manifest_value(

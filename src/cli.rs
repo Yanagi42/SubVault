@@ -154,6 +154,23 @@ pub fn execute(args: Vec<String>) -> Report {
                 hooks,
             })
         }
+        "html" => {
+            let (Some(vault), Some(command_id), Some(source)) =
+                (flags.vault, flags.command_id, flags.source)
+            else {
+                return usage("html_required_flags");
+            };
+            if flags.media_type.is_some() {
+                return usage("html_media_type_fixed");
+            }
+            engine::submit_html(engine::HtmlRequest {
+                vault,
+                command_id,
+                source,
+                batch_id: flags.batch_id,
+                hooks,
+            })
+        }
         "fragment" => {
             let (Some(vault), Some(command_id), Some(fragment)) =
                 (flags.vault, flags.command_id, flags.fragment)

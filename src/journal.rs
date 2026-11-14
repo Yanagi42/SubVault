@@ -13,7 +13,7 @@ use crate::store;
 // A missing optional key and JSON null are both absent.
 // payload_fingerprint stays optional: an in-progress journal can be
 // written before the bytes are hashed, and a missing fingerprint is not
-// damage. kind is import, marker, fragment, or decision. state is started, copying,
+// damage. kind is import, marker, fragment, decision, or html. state is started, copying,
 // object_ready, aborted, or committed. There is no second journal version.
 macro_rules! journal_ty {
     (req_str) => { String };
@@ -137,6 +137,7 @@ fn accept(journal: &Journal) -> Result<(), ()> {
         && journal.kind != "marker"
         && journal.kind != "fragment"
         && journal.kind != "decision"
+        && journal.kind != "html"
     {
         return Err(());
     }
