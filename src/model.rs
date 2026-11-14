@@ -14,6 +14,12 @@ pub const EXIT_FAULT_MISSED: i32 = 17;
 pub const EXIT_UNSUPPORTED_FS: i32 = 18;
 pub const EXIT_NOT_SYNTHETIC: i32 = 19;
 pub const EXIT_STOP_MISSED: i32 = 20;
+pub const EXIT_UNCERTAIN: i32 = 21;
+
+pub const PRESERVED: &str = "preserved";
+pub const NOT_PRESERVED: &str = "not_preserved";
+pub const NOT_ARRANGED: &str = "not_arranged";
+pub const NOT_SEARCHABLE: &str = "not_searchable";
 
 pub const VAULT_BANNER: &str = "\
 SYNTHETIC-ONLY DISPOSABLE VAULT
@@ -35,6 +41,9 @@ pub struct Fail {
     pub outcome: &'static str,
     pub reason: String,
     pub extra: Map<String, Value>,
+    /// When set, unwind leaves the staging file for a later open to remove.
+    /// Real I/O errors leave this false. Injected probes set it explicitly.
+    pub keep_staging: bool,
 }
 
 impl Fail {
@@ -44,7 +53,13 @@ impl Fail {
             outcome,
             reason: reason.into(),
             extra: Map::new(),
+            keep_staging: false,
         }
+    }
+
+    pub fn keep_staging(mut self) -> Self {
+        self.keep_staging = true;
+        self
     }
 
     pub fn extra(mut self, key: &str, value: Value) -> Self {
@@ -89,6 +104,37 @@ pub fn capabilities() -> Value {
         "entitlements": "not_available",
         "real_data_import": "not_available"
     })
+}
+
+pub(crate) fn io_fail(err: std::io::Error, during: &str) -> Fail {
+    let enospc = err.raw_os_error() == Some(libc::ENOSPC);
+    Fail::new(
+        EXIT_NOT_PRESERVED,
+        "NotPreserved",
+        if enospc { "enospc" } else { "io_error" },
+    )
+    .extra("injected", Value::Bool(false))
+    .extra("during", Value::String(during.into()))
+    .extra("os_error", Value::String(err.to_string()))
+    .extra("preservation", Value::String(NOT_PRESERVED.into()))
+    .extra("new_effect", Value::Bool(false))
+}
+
+pub(crate) fn db_fail(err: rusqlite::Error, during: &str) -> Fail {
+    let full = matches!(
+        &err,
+        rusqlite::Error::SqliteFailure(ffi, _) if ffi.code == rusqlite::ErrorCode::DiskFull
+    );
+    Fail::new(
+        EXIT_NOT_PRESERVED,
+        "NotPreserved",
+        if full { "enospc" } else { "db_error" },
+    )
+    .extra("injected", Value::Bool(false))
+    .extra("during", Value::String(during.into()))
+    .extra("os_error", Value::String(err.to_string()))
+    .extra("preservation", Value::String(NOT_PRESERVED.into()))
+    .extra("new_effect", Value::Bool(false))
 }
 
 pub fn platform_limits(magic: Option<i64>) -> Value {

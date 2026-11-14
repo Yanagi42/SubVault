@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
@@ -934,7 +934,14 @@ fn kill_points_keep_old_bytes_and_do_not_report_success() {
         assert_eq!(read.code, Some(0), "{}", read.stdout);
         assert_eq!(fs::read(&out_path).unwrap(), old_bytes);
 
-        if matches!(point, "before_copy" | "object_ready" | "before_db_commit") {
+        if matches!(
+            point,
+            "before_copy"
+                | "during_copy"
+                | "after_copy_before_publish"
+                | "object_ready"
+                | "before_db_commit"
+        ) {
             let resumed = import(&tmp, "new", "text/csv", &new_path);
             assert_eq!(resumed["outcome"], "Committed");
             assert_eq!(files_with_bytes(&vault(&tmp), &new_bytes).len(), 1);
@@ -1214,7 +1221,9 @@ fn injected_faults_reach_and_do_not_preserve() {
     assert_eq!(wit["content_sha256"], source_hash);
     assert_eq!(wit["db_committed"], false);
     assert_eq!(wit["published"], false);
-    assert_eq!(files_with_bytes(&vault(&tmp), &source_bytes).len(), 1);
+    assert!(files_with_bytes(&vault(&tmp), &source_bytes)
+        .iter()
+        .all(|path| path.starts_with(vault(&tmp).join("staging"))));
     let (_, status) = open_vault(&tmp);
     assert!(status["sources"]
         .as_array()
@@ -1264,6 +1273,7 @@ fn injected_faults_reach_and_do_not_preserve() {
     );
     assert_eq!(db_fail.code, Some(15), "{}", db_fail.stdout);
     assert_eq!(parse(&db_fail)["injected"], true);
+    assert_eq!(parse(&db_fail)["reason"], "injected_io_error");
     assert_eq!(parse(&db_fail)["inject_point"], "db_commit");
     let db_wit: Value = serde_json::from_slice(&fs::read(&witness_db).unwrap()).unwrap();
     assert_eq!(db_wit["point"], "db_commit");
@@ -1843,4 +1853,868 @@ fn payload_conflict_and_marker_retry_do_not_double_apply() {
         &["verify", "--vault", vault(&tmp).to_str().unwrap()],
     );
     assert_eq!(parse(&verify), status);
+}
+
+fn object_names(root: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(root.join("objects"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn spawn_env(args: &[&str], env: &[(&str, &str)]) -> std::process::Child {
+    let mut cmd = Command::new(bin());
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.spawn().unwrap()
+}
+
+fn continue_child(child: std::process::Child, scenario: &str) -> Out {
+    assert!(Command::new("kill")
+        .args(["-CONT", &child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let out = from_output(child.wait_with_output().unwrap(), Duration::ZERO);
+    record(scenario, &[], &out);
+    out
+}
+
+fn mark_old(tmp: &Tmp, source_id: &str) {
+    let marked = run(
+        "marker",
+        &[
+            "marker",
+            "--vault",
+            vault(tmp).to_str().unwrap(),
+            "--command-id",
+            "mark",
+            "--source-id",
+            source_id,
+            "--value",
+            "human-edit-v1",
+        ],
+    );
+    assert_eq!(marked.code, Some(0), "{}", marked.stdout);
+}
+
+fn short_read_library(dir: &Path) -> PathBuf {
+    let source = dir.join("shortread.c");
+    fs::write(
+        &source,
+        r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static ssize_t (*real_read)(int, void *, size_t);
+ssize_t read(int fd, void *buf, size_t count) {
+    if (!real_read) real_read = (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, "read");
+    char link[64], dest[PATH_MAX];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, dest, sizeof dest - 1);
+    if (n > 0) {
+        dest[n] = 0;
+        if (strstr(dest, "SHORTREAD-") && count > 1) count = 1;
+    }
+    return real_read(fd, buf, count);
+}
+"#,
+    )
+    .unwrap();
+    let library = dir.join("libshortread.so");
+    let built = Command::new("gcc")
+        .args(["-shared", "-fPIC", "-O2", "-o"])
+        .arg(&library)
+        .arg(&source)
+        .arg("-ldl")
+        .status()
+        .unwrap();
+    assert!(built.success(), "gcc did not build the short-read probe");
+    library
+}
+
+struct RestoreMode {
+    path: PathBuf,
+    mode: u32,
+}
+
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+    }
+}
+
+#[test]
+fn cancel_sees_wal_commit_then_kill() {
+    for point in ["after_db_commit", "before_receipt"] {
+        let tmp = Tmp::new(point);
+        vault_init(&tmp);
+        let old = import(
+            &tmp,
+            "old",
+            "application/pdf",
+            &corpus().join("originals/v-2026-09-receipt.pdf"),
+        );
+        let source_id = old["source_id"].as_str().unwrap().to_string();
+        mark_old(&tmp, &source_id);
+        let source = corpus().join("originals/store-export-work.csv");
+        let checkpoint = tmp.path().join("cp.json");
+        let mut child = spawn(&[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "new",
+            "--media-type",
+            "text/csv",
+            "--source",
+            source.to_str().unwrap(),
+            "--stop-at",
+            point,
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ]);
+        let reached = wait_checkpoint(&mut child, &checkpoint);
+        assert_eq!(reached["db_committed"], true);
+        let cancel = run(
+            "cancel-wal",
+            &[
+                "cancel",
+                "--vault",
+                vault(&tmp).to_str().unwrap(),
+                "--command-id",
+                "new",
+                "--generation",
+                "1",
+            ],
+        );
+        assert_eq!(cancel.code, Some(0), "{}", cancel.stdout);
+        let body = parse(&cancel);
+        assert_eq!(body["outcome"], "AlreadyCommitted");
+        assert_eq!(body["cancel_applied"], false);
+        assert_eq!(body["preservation"], "preserved");
+        assert!(!vault(&tmp).join("control").join("new").exists());
+        kill_child(child, "kill-after-cancel");
+        let (code, status) = open_vault(&tmp);
+        assert_eq!(code, 0, "{status}");
+        assert!(status["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["command_id"] == "new"));
+        assert_eq!(
+            status["occurrences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["command_id"] == "new")
+                .count(),
+            1
+        );
+        let kept = status["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["source_id"] == source_id)
+            .unwrap();
+        assert_eq!(kept["user_marker"], "human-edit-v1");
+        assert_eq!(kept["object_intact"], true);
+        assert!(status["dangling_references"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn during_copy_stops_before_publish_for_short_inputs() {
+    let tmp = Tmp::new("short-copy");
+    vault_init(&tmp);
+    let old = import(
+        &tmp,
+        "old",
+        "application/pdf",
+        &corpus().join("originals/v-2026-09-receipt.pdf"),
+    );
+    mark_old(&tmp, old["source_id"].as_str().unwrap());
+    let before = object_names(&vault(&tmp));
+
+    for (name, bytes, written) in [
+        ("empty", &b""[..], 0),
+        ("one", &b"Q"[..], 0),
+        ("two", &b"AB"[..], 1),
+    ] {
+        let source = tmp.path().join(name);
+        fs::write(&source, bytes).unwrap();
+        let checkpoint = tmp.path().join(format!("{name}.json"));
+        let _ = fs::remove_file(&checkpoint);
+        let mut child = spawn(&[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            name,
+            "--media-type",
+            "application/octet-stream",
+            "--source",
+            source.to_str().unwrap(),
+            "--stop-at",
+            "during_copy",
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ]);
+        let reached = wait_checkpoint(&mut child, &checkpoint);
+        assert_eq!(reached["point"], "during_copy", "{name}");
+        assert_eq!(reached["published"], false, "{name}");
+        assert_eq!(reached["bytes_written"], written, "{name}");
+        assert_eq!(reached["db_committed"], false, "{name}");
+        assert_eq!(object_names(&vault(&tmp)), before, "{name}");
+        if name == "two" {
+            let partial = fs::read(vault(&tmp).join("staging").join("two.partial")).unwrap();
+            assert_eq!(partial, b"A");
+        }
+        kill_child(child, name);
+    }
+
+    let one = tmp.path().join("one-finish");
+    fs::write(&one, b"Q").unwrap();
+    let checkpoint = tmp.path().join("finish.json");
+    let mut child = spawn(&[
+        "import",
+        "--vault",
+        vault(&tmp).to_str().unwrap(),
+        "--command-id",
+        "finish-one",
+        "--media-type",
+        "application/octet-stream",
+        "--source",
+        one.to_str().unwrap(),
+        "--stop-at",
+        "during_copy",
+        "--checkpoint",
+        checkpoint.to_str().unwrap(),
+    ]);
+    let reached = wait_checkpoint(&mut child, &checkpoint);
+    assert_eq!(reached["bytes_written"], 0);
+    assert_eq!(object_names(&vault(&tmp)), before);
+    let finished = continue_child(child, "finish-one");
+    assert_eq!(finished.code, Some(0), "{}", finished.stdout);
+    let body = parse(&finished);
+    assert_eq!(body["outcome"], "Committed");
+    let out = tmp.path().join("q.out");
+    let read = run(
+        "read-one",
+        &[
+            "read",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--source-id",
+            body["source_id"].as_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(read.code, Some(0), "{}", read.stdout);
+    assert_eq!(fs::read(&out).unwrap(), b"Q");
+    let before = object_names(&vault(&tmp));
+
+    let library = short_read_library(tmp.path());
+    let source = tmp.path().join("SHORTREAD-body.bin");
+    let payload = b"abcdefghijklmnopqrstuvwxyz";
+    fs::write(&source, payload).unwrap();
+    let checkpoint = tmp.path().join("short.json");
+    let mut child = spawn_env(
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "short",
+            "--media-type",
+            "application/octet-stream",
+            "--source",
+            source.to_str().unwrap(),
+            "--stop-at",
+            "during_copy",
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ],
+        &[("LD_PRELOAD", library.to_str().unwrap())],
+    );
+    let reached = wait_checkpoint(&mut child, &checkpoint);
+    assert_eq!(reached["published"], false);
+    assert_eq!(reached["bytes_written"], 0);
+    assert_eq!(object_names(&vault(&tmp)), before);
+    assert_eq!(fs::read(&source).unwrap(), payload);
+    let finished = continue_child(child, "short-finish");
+    assert_eq!(finished.code, Some(0), "{}", finished.stdout);
+    let body = parse(&finished);
+    assert_eq!(body["outcome"], "Committed");
+    assert_eq!(body["byte_length"], payload.len());
+    let out = tmp.path().join("short.out");
+    let read = run(
+        "read-short",
+        &[
+            "read",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--source-id",
+            body["source_id"].as_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(read.code, Some(0), "{}", read.stdout);
+    assert_eq!(fs::read(&out).unwrap(), payload);
+    let (_, status) = open_vault(&tmp);
+    assert_eq!(
+        status["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["source_id"] == old["source_id"])
+            .unwrap()["user_marker"],
+        "human-edit-v1"
+    );
+}
+
+#[test]
+fn committed_import_replays_without_the_external_file() {
+    let tmp = Tmp::new("replay");
+    vault_init(&tmp);
+    let source = tmp.path().join("copy.pdf");
+    fs::copy(corpus().join("originals/v-2026-10-receipt.pdf"), &source).unwrap();
+    let first = import(&tmp, "pdf", "application/pdf", &source);
+    let occurrences = open_vault(&tmp).1["occurrences"].as_array().unwrap().len();
+    fs::remove_file(&source).unwrap();
+    let again = run(
+        "replay-absent",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "pdf",
+            "--media-type",
+            "application/pdf",
+            "--source",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(again.code, Some(0), "{}", again.stdout);
+    let body = parse(&again);
+    assert_eq!(body["outcome"], "AlreadyCommitted");
+    assert_eq!(body["new_effect"], false);
+    assert_eq!(body["source_check"], "absent");
+    assert_eq!(body["source_id"], first["source_id"]);
+    assert_eq!(
+        open_vault(&tmp).1["occurrences"].as_array().unwrap().len(),
+        occurrences
+    );
+    let out = tmp.path().join("hosted.pdf");
+    let read = run(
+        "read-replay",
+        &[
+            "read",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--source-id",
+            first["source_id"].as_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(read.code, Some(0), "{}", read.stdout);
+    assert_eq!(
+        fs::read(&out).unwrap(),
+        fs::read(corpus().join("originals/v-2026-10-receipt.pdf")).unwrap()
+    );
+    let other_type = run(
+        "replay-absent-other-type",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "pdf",
+            "--media-type",
+            "text/plain",
+            "--source",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(other_type.code, Some(0), "{}", other_type.stdout);
+    assert_eq!(parse(&other_type)["outcome"], "AlreadyCommitted");
+    assert_eq!(parse(&other_type)["source_check"], "absent");
+    assert_eq!(parse(&other_type)["new_effect"], false);
+
+    fs::write(&source, b"different-but-present").unwrap();
+    let conflict = run(
+        "replay-conflict",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "pdf",
+            "--media-type",
+            "application/pdf",
+            "--source",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(conflict.code, Some(16), "{}", conflict.stdout);
+    assert_eq!(parse(&conflict)["reason"], "payload_conflict");
+    assert_eq!(parse(&conflict)["new_effect"], false);
+
+    fs::write(
+        &source,
+        fs::read(corpus().join("originals/v-2026-10-receipt.pdf")).unwrap(),
+    )
+    .unwrap();
+    let mode = fs::metadata(&source).unwrap().mode();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o0)).unwrap();
+    let _restore = RestoreMode {
+        path: source.clone(),
+        mode,
+    };
+    let blocked = run(
+        "replay-unreadable",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "pdf",
+            "--media-type",
+            "application/pdf",
+            "--source",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(blocked.code, Some(0), "{}", blocked.stdout);
+    assert_eq!(parse(&blocked)["reason"], "source_unreadable");
+    assert_eq!(parse(&blocked)["new_effect"], false);
+    assert_eq!(parse(&blocked)["injected"], false);
+    assert_eq!(open_vault(&tmp).1["sources"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn retry_does_not_repair_a_damaged_hosted_object() {
+    let tmp = Tmp::new("hosted");
+    vault_init(&tmp);
+    let source = corpus().join("originals/v-2026-10-receipt.pdf");
+    let first = import(&tmp, "pdf", "application/pdf", &source);
+    let object = vault(&tmp)
+        .join("objects")
+        .join(first["object_id"].as_str().unwrap());
+    let original = fs::read(&object).unwrap();
+    let mut damaged = original.clone();
+    damaged[20] ^= 0xff;
+    fs::write(&object, &damaged).unwrap();
+    let names = object_names(&vault(&tmp));
+    let again = run(
+        "retry-tampered",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "pdf",
+            "--media-type",
+            "application/pdf",
+            "--source",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(again.code, Some(12), "{}", again.stdout);
+    let body = parse(&again);
+    assert_eq!(body["outcome"], "RecoveryRequired");
+    assert_eq!(body["new_effect"], false);
+    assert_eq!(body["reason"], "hash_mismatch");
+    assert_eq!(fs::read(&object).unwrap(), damaged);
+    assert_eq!(object_names(&vault(&tmp)), names);
+
+    fs::write(&object, &original).unwrap();
+    fs::remove_file(&object).unwrap();
+    let missing = run(
+        "retry-missing",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "pdf",
+            "--media-type",
+            "application/pdf",
+            "--source",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(missing.code, Some(12), "{}", missing.stdout);
+    assert_eq!(parse(&missing)["reason"], "object_missing");
+    assert_eq!(parse(&missing)["new_effect"], false);
+    assert!(!object.exists());
+    assert!(files_with_bytes(&vault(&tmp), &original).is_empty());
+}
+
+#[test]
+fn post_commit_journal_permission_is_not_not_preserved() {
+    let tmp = Tmp::new("journal-mode");
+    vault_init(&tmp);
+    import(
+        &tmp,
+        "old",
+        "application/pdf",
+        &corpus().join("originals/v-2026-09-receipt.pdf"),
+    );
+    let source = corpus().join("originals/store-export-work.csv");
+    let checkpoint = tmp.path().join("cp.json");
+    let mut child = spawn(&[
+        "import",
+        "--vault",
+        vault(&tmp).to_str().unwrap(),
+        "--command-id",
+        "new",
+        "--media-type",
+        "text/csv",
+        "--source",
+        source.to_str().unwrap(),
+        "--stop-at",
+        "after_db_commit",
+        "--checkpoint",
+        checkpoint.to_str().unwrap(),
+    ]);
+    let reached = wait_checkpoint(&mut child, &checkpoint);
+    assert_eq!(reached["db_committed"], true);
+    let journal = vault(&tmp).join("journal");
+    let mode = fs::metadata(&journal).unwrap().mode();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore = RestoreMode {
+        path: journal,
+        mode,
+    };
+    let writer = continue_child(child, "journal-eacces");
+    assert_eq!(writer.code, Some(0), "{}", writer.stdout);
+    let body = parse(&writer);
+    assert_eq!(body["outcome"], "Committed");
+    assert_eq!(body["preservation"], "preserved");
+    assert_eq!(body["post_commit_io"], true);
+    assert_eq!(body["during"], "journal_write");
+    assert_eq!(body["injected"], false);
+    let os_error = body["os_error"].as_str().unwrap();
+    assert!(
+        os_error.contains("Permission denied") || os_error.contains("os error 13"),
+        "{os_error}"
+    );
+    drop(_restore);
+    let (code, status) = open_vault(&tmp);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(
+        status["occurrences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["command_id"] == "new")
+            .count(),
+        1
+    );
+    let retry = run(
+        "retry-after-eacces",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "new",
+            "--media-type",
+            "text/csv",
+            "--source",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(retry.code, Some(0), "{}", retry.stdout);
+    assert_eq!(parse(&retry)["outcome"], "AlreadyCommitted");
+    assert_eq!(parse(&retry)["new_effect"], false);
+}
+
+#[test]
+fn cancel_does_not_initialize_a_damaged_database() {
+    let tmp = Tmp::new("cancel-damage");
+    vault_init(&tmp);
+    let imported = import(
+        &tmp,
+        "old",
+        "application/pdf",
+        &corpus().join("originals/harbor-notes-2023-invoice.pdf"),
+    );
+    let object = vault(&tmp)
+        .join("objects")
+        .join(imported["object_id"].as_str().unwrap());
+    let object_bytes = fs::read(&object).unwrap();
+
+    let zero = tmp.path().join("zero");
+    assert!(Command::new("cp")
+        .args(["-a", vault(&tmp).to_str().unwrap(), zero.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let zero_db = zero.join("vault.db");
+    fs::write(&zero_db, b"").unwrap();
+    let zero_object = zero
+        .join("objects")
+        .join(imported["object_id"].as_str().unwrap());
+    let before_object = fs::read(&zero_object).unwrap();
+    let cancel = run(
+        "cancel-zero",
+        &[
+            "cancel",
+            "--vault",
+            zero.to_str().unwrap(),
+            "--command-id",
+            "old",
+            "--generation",
+            "1",
+        ],
+    );
+    assert_eq!(cancel.code, Some(13), "{}", cancel.stdout);
+    assert_eq!(parse(&cancel)["outcome"], "ReadOnlyDamaged");
+    assert_eq!(fs::read(&zero_db).unwrap(), b"");
+    assert_eq!(fs::metadata(&zero_db).unwrap().len(), 0);
+    assert_eq!(fs::read(&zero_object).unwrap(), before_object);
+
+    let bad = tmp.path().join("bad");
+    assert!(Command::new("cp")
+        .args(["-a", vault(&tmp).to_str().unwrap(), bad.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let bad_db = bad.join("vault.db");
+    let mut bytes = fs::read(&bad_db).unwrap();
+    bytes[..16].copy_from_slice(b"not a database!\0");
+    fs::write(&bad_db, &bytes).unwrap();
+    let before = fs::read(&bad_db).unwrap();
+    let cancel = run(
+        "cancel-bad-header",
+        &[
+            "cancel",
+            "--vault",
+            bad.to_str().unwrap(),
+            "--command-id",
+            "old",
+            "--generation",
+            "1",
+        ],
+    );
+    assert_eq!(cancel.code, Some(13), "{}", cancel.stdout);
+    assert_eq!(fs::read(&bad_db).unwrap(), before);
+
+    let newer = tmp.path().join("newer");
+    assert!(Command::new("cp")
+        .args(["-a", vault(&tmp).to_str().unwrap(), newer.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let newer_db = newer.join("vault.db");
+    assert!(Command::new("sqlite3")
+        .arg(&newer_db)
+        .arg("PRAGMA user_version=2;")
+        .status()
+        .unwrap()
+        .success());
+    let before = fs::read(&newer_db).unwrap();
+    let cancel = run(
+        "cancel-version",
+        &[
+            "cancel",
+            "--vault",
+            newer.to_str().unwrap(),
+            "--command-id",
+            "old",
+            "--generation",
+            "1",
+        ],
+    );
+    assert_eq!(cancel.code, Some(14), "{}", cancel.stdout);
+    assert_eq!(parse(&cancel)["outcome"], "VersionUnsupported");
+    assert_eq!(fs::read(&newer_db).unwrap(), before);
+    assert_eq!(fs::read(&object).unwrap(), object_bytes);
+}
+
+#[test]
+fn non_object_receipt_is_not_a_successful_replay() {
+    let tmp = Tmp::new("receipt");
+    vault_init(&tmp);
+    import(
+        &tmp,
+        "pdf",
+        "application/pdf",
+        &corpus().join("originals/v-2026-09-receipt.pdf"),
+    );
+    let db = vault(&tmp).join("vault.db");
+    let sources_before = open_vault(&tmp).1["sources"].clone();
+    for raw in ["null", "[]", "7", "\"ok\""] {
+        assert!(Command::new("sqlite3")
+            .arg(&db)
+            .arg(format!(
+                "UPDATE commands SET result_json = '{raw}' WHERE command_id = 'pdf';"
+            ))
+            .status()
+            .unwrap()
+            .success());
+        let again = run(
+            "non-object",
+            &[
+                "import",
+                "--vault",
+                vault(&tmp).to_str().unwrap(),
+                "--command-id",
+                "pdf",
+                "--media-type",
+                "application/pdf",
+                "--source",
+                corpus()
+                    .join("originals/v-2026-09-receipt.pdf")
+                    .to_str()
+                    .unwrap(),
+            ],
+        );
+        assert_eq!(again.code, Some(12), "{raw} {}", again.stdout);
+        assert_eq!(parse(&again)["reason"], "command_result_not_object");
+        assert_eq!(parse(&again)["new_effect"], false);
+    }
+    assert!(Command::new("sqlite3")
+        .arg(&db)
+        .arg("UPDATE commands SET result_json = '{' WHERE command_id = 'pdf';")
+        .status()
+        .unwrap()
+        .success());
+    let broken = run(
+        "broken-receipt",
+        &[
+            "import",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--command-id",
+            "pdf",
+            "--media-type",
+            "application/pdf",
+            "--source",
+            corpus()
+                .join("originals/v-2026-09-receipt.pdf")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    assert_eq!(broken.code, Some(12), "{}", broken.stdout);
+    assert_eq!(parse(&broken)["reason"], "command_result_unreadable");
+    let (_, status) = open_vault(&tmp);
+    assert_eq!(status["sources"], sources_before);
+}
+
+#[test]
+fn killed_imports_resume_once_across_recover() {
+    for point in ["during_copy", "after_copy_before_publish"] {
+        let tmp = Tmp::new(point);
+        vault_init(&tmp);
+        let old = import(
+            &tmp,
+            "old",
+            "application/pdf",
+            &corpus().join("originals/v-2026-09-receipt.pdf"),
+        );
+        let source_id = old["source_id"].as_str().unwrap().to_string();
+        mark_old(&tmp, &source_id);
+        let source = corpus().join("originals/store-export-work.csv");
+        let source_bytes = fs::read(&source).unwrap();
+        for round in 0..2 {
+            let checkpoint = tmp.path().join(format!("cp-{round}.json"));
+            let mut child = spawn(&[
+                "import",
+                "--vault",
+                vault(&tmp).to_str().unwrap(),
+                "--command-id",
+                "new",
+                "--media-type",
+                "text/csv",
+                "--source",
+                source.to_str().unwrap(),
+                "--stop-at",
+                point,
+                "--checkpoint",
+                checkpoint.to_str().unwrap(),
+            ]);
+            let reached = wait_checkpoint(&mut child, &checkpoint);
+            assert_eq!(reached["db_committed"], false);
+            assert_eq!(reached["published"], false);
+            kill_child(child, point);
+            let recovered = run(
+                "recover-between",
+                &["recover", "--vault", vault(&tmp).to_str().unwrap()],
+            );
+            assert_eq!(recovered.code, Some(0), "{}", recovered.stdout);
+            let status = parse(&recovered);
+            assert!(status["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|command| command["command_id"] != "new"));
+            assert!(status["dangling_references"].as_array().unwrap().is_empty());
+            let kept = status["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["source_id"] == source_id)
+                .unwrap();
+            assert_eq!(kept["user_marker"], "human-edit-v1");
+            assert_eq!(kept["object_intact"], true);
+        }
+        let done = import(&tmp, "new", "text/csv", &source);
+        assert_eq!(done["outcome"], "Committed");
+        assert_eq!(files_with_bytes(&vault(&tmp), &source_bytes).len(), 1);
+        let retry = run(
+            "retry-matrix",
+            &[
+                "import",
+                "--vault",
+                vault(&tmp).to_str().unwrap(),
+                "--command-id",
+                "new",
+                "--media-type",
+                "text/csv",
+                "--source",
+                source.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(retry.code, Some(0), "{}", retry.stdout);
+        assert_eq!(parse(&retry)["outcome"], "AlreadyCommitted");
+        assert_eq!(parse(&retry)["new_effect"], false);
+        let (_, status) = open_vault(&tmp);
+        assert_eq!(
+            status["occurrences"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["command_id"] == "new")
+                .count(),
+            1
+        );
+        assert_eq!(
+            status["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["source_id"] == source_id)
+                .unwrap()["user_marker"],
+            "human-edit-v1"
+        );
+        assert!(status["dangling_references"].as_array().unwrap().is_empty());
+    }
 }

@@ -139,6 +139,15 @@ pub fn command(conn: &Connection, id: &str) -> rusqlite::Result<Option<CommandRo
     .optional()
 }
 
+pub fn object_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<ObjectRow>> {
+    conn.query_row(
+        "SELECT object_id, content_sha256, byte_length, relpath FROM objects WHERE object_id = ?1",
+        [id],
+        map_object,
+    )
+    .optional()
+}
+
 pub fn object_by_hash(conn: &Connection, hash: &str) -> rusqlite::Result<Option<ObjectRow>> {
     conn.query_row(
         "SELECT object_id, content_sha256, byte_length, relpath FROM objects WHERE content_sha256 = ?1",

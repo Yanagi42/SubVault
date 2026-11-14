@@ -1,7 +1,10 @@
 mod cli;
 mod engine;
+mod facts;
 mod fsutil;
 mod ids;
+mod inspect;
+mod journal;
 mod lockfile;
 mod model;
 mod store;

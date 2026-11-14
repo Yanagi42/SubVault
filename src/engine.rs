@@ -7,19 +7,24 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::facts::{self, ObjectFacts};
 use crate::fsutil::{
     self, atomic_write, filesystem_magic, network_filesystem, sha256_file, MAX_OBJECT_BYTES,
 };
 use crate::ids::{
-    self, canonical_object_relpath, hex_encode, is_command_id, is_display_name, is_lower_hex,
-    is_media_type, is_prefixed_id,
+    self, canonical_object_relpath, hex_encode, is_command_id, is_display_name, is_media_type,
+    is_prefixed_id,
+};
+use crate::journal::{
+    self, path as journal_path, read_file as read_journal_file, staging_path,
+    write as write_journal, Journal,
 };
 use crate::lockfile::{self, sigstop, VaultLock, LOCK_TEXT};
 use crate::model::{
-    capabilities, honesty, platform_limits, Fail, Report, EXIT_DAMAGED, EXIT_FAULT_MISSED,
-    EXIT_INTEGRITY, EXIT_LOCKED, EXIT_NOT_PRESERVED, EXIT_NOT_SYNTHETIC, EXIT_NOT_VAULT, EXIT_OK,
-    EXIT_RECOVERY, EXIT_REJECTED, EXIT_STOP_MISSED, EXIT_UNSUPPORTED_FS, EXIT_USAGE, EXIT_VERSION,
-    VAULT_BANNER,
+    capabilities, db_fail, honesty, io_fail, platform_limits, Fail, Report, EXIT_DAMAGED,
+    EXIT_FAULT_MISSED, EXIT_LOCKED, EXIT_NOT_PRESERVED, EXIT_NOT_SYNTHETIC, EXIT_NOT_VAULT,
+    EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_STOP_MISSED, EXIT_UNCERTAIN, EXIT_UNSUPPORTED_FS,
+    EXIT_USAGE, EXIT_VERSION, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE, PRESERVED, VAULT_BANNER,
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
@@ -35,6 +40,7 @@ const IMPORT_STOPS: &[&str] = &[
 const IMPORT_INJECTS: &[&str] = &["after_staging_fsync", "object_fsync", "db_commit"];
 const MARKER_STOPS: &[&str] = &["before_db_commit", "after_db_commit", "before_receipt"];
 const MARKER_INJECTS: &[&str] = &["db_commit"];
+const RECOGNIZED_INJECTS: &[&str] = &["after_staging_fsync", "object_fsync", "db_commit"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InjectAction {
@@ -112,6 +118,7 @@ impl HookRun {
             InjectAction::IoError => "injected_io_error",
         };
         Err(Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", reason)
+            .keep_staging()
             .extra("injected", Value::Bool(true))
             .extra("inject_point", json!(point))
             .extra(
@@ -125,7 +132,7 @@ impl HookRun {
                 "note",
                 json!("injected fault, not a full device and not a failed disk"),
             )
-            .extra("preservation", json!("not_preserved")))
+            .extra("preservation", json!(NOT_PRESERVED)))
     }
 }
 
@@ -134,27 +141,6 @@ struct Session {
     _lock: VaultLock,
     conn: Connection,
     magic: i64,
-}
-
-#[derive(Clone)]
-struct Journal {
-    command_id: String,
-    kind: String,
-    generation: i64,
-    state: String,
-    batch_id: Option<String>,
-    display_name: Option<String>,
-    external_path: Option<String>,
-    media_type: Option<String>,
-    occurrence_id: Option<String>,
-    object_id: Option<String>,
-    content_sha256: Option<String>,
-    byte_length: Option<i64>,
-    payload_fingerprint: Option<String>,
-    storage_reused: Option<bool>,
-    reason: Option<String>,
-    marker_value: Option<String>,
-    source_id: Option<String>,
 }
 
 struct Phase {
@@ -186,6 +172,13 @@ pub fn help_report() -> Report {
     body.insert(
         "test_hooks".into(),
         json!("--stop-at and --inject are explicit test hooks. A missed hook does not report success. --inject never means the disk or device really failed."),
+    );
+    body.insert(
+        "exit_codes".into(),
+        json!({
+            "20": EXIT_STOP_MISSED,
+            "21": EXIT_UNCERTAIN
+        }),
     );
     Report {
         code: EXIT_OK,
@@ -277,31 +270,29 @@ fn init_inner(path: &Path) -> Result<Report, Fail> {
 }
 
 pub fn open_vault(path: &Path) -> Report {
-    reopen(path, true)
+    reopen(path)
 }
 
 pub fn verify_vault(path: &Path) -> Report {
-    reopen(path, true)
+    reopen(path)
 }
 
 pub fn recover_vault(path: &Path) -> Report {
-    reopen(path, true)
+    reopen(path)
 }
 
-fn reopen(path: &Path, clean: bool) -> Report {
-    match reopen_inner(path, clean) {
+fn reopen(path: &Path) -> Report {
+    match reopen_inner(path) {
         Ok(report) => report,
         Err(fail) => fail.into_report(),
     }
 }
 
-fn reopen_inner(path: &Path, clean: bool) -> Result<Report, Fail> {
+fn reopen_inner(path: &Path) -> Result<Report, Fail> {
     let session = open_session(path)?;
-    if clean {
-        clean_temps(&session.root)?;
-    }
-    reconcile(&session)?;
-    let inspection = inspect(&session)?;
+    journal::clean_temps(&session.root)?;
+    journal::reconcile(&session.root, &session.conn)?;
+    let inspection = crate::inspect::report(&session.root, &session.conn, session.magic)?;
     store::checkpoint(&session.conn).map_err(|err| db_fail(err, "checkpoint"))?;
     Ok(inspection)
 }
@@ -361,6 +352,7 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
         req.hooks.stop_at.as_deref(),
         req.hooks.inject_point.as_deref(),
         IMPORT_STOPS,
+        RECOGNIZED_INJECTS,
         IMPORT_INJECTS,
     )?;
     if !is_command_id(&req.command_id) {
@@ -375,32 +367,13 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
         }
     }
     let session = open_session(&req.vault)?;
-    reconcile(&session)?;
-    let meta = fs::symlink_metadata(&req.source).map_err(|err| {
-        if err.kind() == io::ErrorKind::NotFound {
-            Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "source_missing")
-                .extra("preservation", json!("not_preserved"))
-                .extra("injected", json!(false))
-        } else {
-            io_fail(err, "source_metadata")
-        }
-    })?;
-    if !meta.file_type().is_file() {
-        return Err(
-            Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "source_not_a_file")
-                .extra("preservation", json!("not_preserved"))
-                .extra("injected", json!(false)),
-        );
+    journal::reconcile(&session.root, &session.conn)?;
+    if let Some(existing) = store::command(&session.conn, &req.command_id)
+        .map_err(|err| db_fail(err, "command_lookup"))?
+    {
+        return replay_committed(&session, &req, &existing);
     }
-    if meta.len() > MAX_OBJECT_BYTES {
-        return Err(
-            Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "object_too_large")
-                .extra("preservation", json!("not_preserved"))
-                .extra("byte_length", json!(meta.len()))
-                .extra("limit", json!(MAX_OBJECT_BYTES))
-                .extra("injected", json!(false)),
-        );
-    }
+    let meta = require_new_source(&req.source)?;
     let display_default = req
         .source
         .file_name()
@@ -410,29 +383,6 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
     let display_name = req.display_name.clone().unwrap_or(display_default);
     if !is_display_name(&display_name) {
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_display_name"));
-    }
-
-    if let Some(existing) = store::command(&session.conn, &req.command_id)
-        .map_err(|err| db_fail(err, "command_lookup"))?
-    {
-        if req.hooks.inject_point.is_some() || req.hooks.stop_at.is_some() {
-            return Err(Fail::new(
-                EXIT_FAULT_MISSED,
-                "FaultNotReached",
-                "command_already_committed",
-            )
-            .extra("injected", json!(req.hooks.inject_point.is_some()))
-            .extra("preservation", json!("not_preserved")));
-        }
-        let (hash, _len) = sha256_file(&req.source).map_err(|err| io_fail(err, "hash_source"))?;
-        let fingerprint = fingerprint(&["import", &hash, &req.media_type]);
-        if fingerprint != existing.payload_fingerprint {
-            return Err(Fail::new(EXIT_REJECTED, "Rejected", "payload_conflict")
-                .extra("command_id", json!(req.command_id))
-                .extra("preservation", json!("not_preserved"))
-                .extra("new_effect", json!(false)));
-        }
-        return already_committed(&existing);
     }
 
     let mut hooks = HookRun::new(req.hooks.clone());
@@ -544,14 +494,11 @@ fn import_attempt(
     let existing =
         store::object_by_hash(&session.conn, &hash).map_err(|err| db_fail(err, "object_lookup"))?;
     let (object_id, storage_reused) = if let Some(object) = existing {
-        verify_referenced_file(&session.root, &object).map_err(|alert| {
-            Fail::new(EXIT_RECOVERY, "RecoveryRequired", alert)
-                .extra("preservation", json!("not_preserved"))
-                .extra("content_sha256", json!(hash))
-                .extra("injected", json!(false))
-        })?;
+        refuse_unreached_object_fsync(hooks)?;
+        require_hosted_object(&session.root, &object, &hash, object.byte_length)?;
         (object.object_id, true)
     } else if let Some(orphan) = find_orphan_with_hash(&session.root, &session.conn, &hash)? {
+        refuse_unreached_object_fsync(hooks)?;
         (orphan, true)
     } else {
         let mut object_id = journal
@@ -591,12 +538,11 @@ fn import_attempt(
         "before_db_commit",
         checkpoint_map(&command_id, len, Some(len), Some(&hash), true, false),
     )?;
-    ensure_precommit(hooks)?;
     if take_cancel(&session.root, &command_id, journal.generation)? {
         return Err(cancelled());
     }
 
-    let result = {
+    let committed = {
         let tx = session
             .conn
             .unchecked_transaction()
@@ -687,29 +633,25 @@ fn import_attempt(
             "db_commit",
             checkpoint_map(&command_id, len, Some(len), Some(&hash), true, false),
         )?;
-        tx.commit().map_err(|err| db_fail(err, "db_commit"))?;
-        result
+        match tx.commit() {
+            Ok(()) => result,
+            Err(err) => return settle_commit(&session.root, &command_id, err),
+        }
     };
-
-    hooks.stop(
-        "after_db_commit",
-        checkpoint_map(&command_id, len, Some(len), Some(&hash), true, true),
-    )?;
-    journal.state = "committed".into();
-    journal.reason = None;
-    write_journal(&session.root, journal)?;
-    hooks.stop(
-        "before_receipt",
-        checkpoint_map(&command_id, len, Some(len), Some(&hash), true, true),
-    )?;
-    if hooks.hooks.inject_point.is_some() && !hooks.inject_reached {
-        return Err(
-            Fail::new(EXIT_FAULT_MISSED, "FaultNotReached", "inject_after_commit")
-                .extra("injected", json!(true))
-                .extra("preservation", json!("preserved")),
-        );
-    }
-    Ok(result)
+    finish_after_commit(committed, || {
+        hooks.stop(
+            "after_db_commit",
+            checkpoint_map(&command_id, len, Some(len), Some(&hash), true, true),
+        )?;
+        journal.state = "committed".into();
+        journal.reason = None;
+        write_journal(&session.root, journal)?;
+        hooks.stop(
+            "before_receipt",
+            checkpoint_map(&command_id, len, Some(len), Some(&hash), true, true),
+        )?;
+        Ok(())
+    })
 }
 
 pub struct MarkerRequest {
@@ -735,6 +677,7 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
         req.hooks.stop_at.as_deref(),
         req.hooks.inject_point.as_deref(),
         MARKER_STOPS,
+        RECOGNIZED_INJECTS,
         MARKER_INJECTS,
     )?;
     if !is_command_id(&req.command_id) || !is_prefixed_id(&req.source_id, "src_") {
@@ -757,11 +700,17 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
             .extra("injected", json!(req.hooks.inject_point.is_some())));
         }
         if existing.payload_fingerprint != fingerprint {
-            return Err(Fail::new(EXIT_REJECTED, "Rejected", "payload_conflict")
-                .extra("command_id", json!(req.command_id))
-                .extra("new_effect", json!(false)));
+            return Err(payload_conflict(&req.command_id));
         }
-        return already_committed(&existing);
+        let receipt = already_committed(&existing)?;
+        let source = store::source_by_id(&session.conn, &req.source_id)
+            .map_err(|err| db_fail(err, "source_lookup"))?
+            .ok_or_else(|| {
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_row_missing")
+                    .extra("new_effect", json!(false))
+            })?;
+        confirm_source_bytes(&session, &source, &req.command_id)?;
+        return Ok(receipt);
     }
     let source = store::source_by_id(&session.conn, &req.source_id)
         .map_err(|err| db_fail(err, "source_lookup"))?
@@ -794,9 +743,8 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
         "before_db_commit",
         checkpoint_map(&req.command_id, 0, None, None, false, false),
     )?;
-    ensure_precommit(&hooks)?;
     let recorded_at = now_ms();
-    let result = {
+    let committed = {
         let tx = session
             .conn
             .unchecked_transaction()
@@ -824,20 +772,24 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
             "db_commit",
             checkpoint_map(&req.command_id, 0, None, None, false, false),
         )?;
-        tx.commit().map_err(|err| db_fail(err, "db_commit"))?;
-        result
+        match tx.commit() {
+            Ok(()) => result,
+            Err(err) => return settle_commit(&session.root, &req.command_id, err),
+        }
     };
-    hooks.stop(
-        "after_db_commit",
-        checkpoint_map(&req.command_id, 0, None, None, false, true),
-    )?;
-    journal.state = "committed".into();
-    write_journal(&session.root, &journal)?;
-    hooks.stop(
-        "before_receipt",
-        checkpoint_map(&req.command_id, 0, None, None, false, true),
-    )?;
-    Ok(result)
+    finish_after_commit(committed, || {
+        hooks.stop(
+            "after_db_commit",
+            checkpoint_map(&req.command_id, 0, None, None, false, true),
+        )?;
+        journal.state = "committed".into();
+        write_journal(&session.root, &journal)?;
+        hooks.stop(
+            "before_receipt",
+            checkpoint_map(&req.command_id, 0, None, None, false, true),
+        )?;
+        Ok(())
+    })
 }
 
 pub struct ReadRequest {
@@ -865,29 +817,48 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
         .map_err(|err| db_fail(err, "source_lookup"))?
         .ok_or_else(|| Fail::new(EXIT_REJECTED, "Rejected", "unknown_source"))?;
     let object = lookup_object(&session, &source.object_id)?;
-    let relpath = canonical_object_relpath(&source.object_id).ok_or_else(|| {
-        Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_id_rejected")
-            .extra("source_id", json!(source.source_id))
-    })?;
-    let path_rejected = object.relpath != relpath;
-    let file_path = session.root.join(&relpath);
-    if !file_path.is_file() {
+    let facts = facts::object_facts(
+        &session.root,
+        &source.object_id,
+        Some(&object.relpath),
+        &source.content_sha256,
+        source.byte_length,
+    );
+    if facts.id_rejected {
+        return Err(
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_id_rejected")
+                .extra("source_id", json!(source.source_id)),
+        );
+    }
+    if let Some(message) = &facts.io_error {
+        return Err(
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_unreadable")
+                .extra("source_id", json!(source.source_id))
+                .extra("os_error", json!(message))
+                .extra("new_effect", json!(false)),
+        );
+    }
+    if facts.missing {
         return Err(
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_missing")
                 .extra("source_id", json!(source.source_id))
                 .extra("object_id", json!(source.object_id)),
         );
     }
-    let (hash, len) = sha256_file(&file_path).map_err(|err| io_fail(err, "hash_object"))?;
-    if hash != source.content_sha256 || len as i64 != source.byte_length {
+    if !facts.hash_matches || !facts.length_matches {
         return Err(
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "hash_mismatch")
                 .extra("source_id", json!(source.source_id))
                 .extra("object_id", json!(source.object_id))
                 .extra("expected_sha256", json!(source.content_sha256))
-                .extra("actual_sha256", json!(hash)),
+                .extra("actual_sha256", json!(facts.actual_hash)),
         );
     }
+    let relpath = facts.canonical_relpath.clone().unwrap_or_default();
+    let path_rejected = facts.relpath_differs;
+    let file_path = session.root.join(&relpath);
+    let hash = facts.actual_hash.clone().unwrap_or_default();
+    let len = facts.actual_len.unwrap_or(0);
     if req.out.exists() {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_exists"));
     }
@@ -907,9 +878,9 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
     body.insert("content_sha256".into(), json!(hash));
     body.insert("hash_alg".into(), json!("sha256"));
     body.insert("byte_length".into(), json!(len));
-    body.insert("preservation".into(), json!("preserved"));
-    body.insert("arrangement".into(), json!("not_arranged"));
-    body.insert("searchability".into(), json!("not_searchable"));
+    body.insert("preservation".into(), json!(PRESERVED));
+    body.insert("arrangement".into(), json!(NOT_ARRANGED));
+    body.insert("searchability".into(), json!(NOT_SEARCHABLE));
     body.insert("object_path_rejected".into(), json!(path_rejected));
     body.insert("new_effect".into(), json!(false));
     Ok(Value::Object(body))
@@ -946,7 +917,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
     if req.kind != "preservation" {
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_cancel_kind"));
     }
-    require_vault_shape(&req.vault)?;
+    guard_vault(&req.vault)?;
     let lock = match lockfile::VaultLock::try_acquire(&req.vault.join("writer.lock"))
         .map_err(|err| io_fail(err, "lock"))?
     {
@@ -954,18 +925,11 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
         None => return cancel_without_lock(&req),
     };
     let _lock = lock;
-    if !banner_exact(&req.vault)? {
-        return Err(Fail::new(
-            EXIT_NOT_SYNTHETIC,
-            "NotSynthetic",
-            "banner_mismatch",
-        ));
-    }
     let conn = open_writer(&req.vault)?;
     if let Some(existing) =
         store::command(&conn, &req.command_id).map_err(|err| db_fail(err, "command_lookup"))?
     {
-        let generation = result_generation(&existing.result_json);
+        let generation = result_generation(&existing.result_json)?;
         if generation != req.generation {
             return Err(Fail::new(EXIT_REJECTED, "Rejected", "generation_mismatch")
                 .extra("cancel_applied", json!(false)));
@@ -1013,7 +977,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
     })
 }
 
-fn open_session(path: &Path) -> Result<Session, Fail> {
+fn guard_vault(path: &Path) -> Result<i64, Fail> {
     require_vault_shape(path)?;
     if !banner_exact(path)? {
         return Err(
@@ -1030,6 +994,11 @@ fn open_session(path: &Path) -> Result<Session, Fail> {
         return Err(unsupported_fs(magic));
     }
     inspect_version_readonly(path)?;
+    Ok(magic)
+}
+
+fn open_session(path: &Path) -> Result<Session, Fail> {
+    let magic = guard_vault(path)?;
     let lock = lockfile::VaultLock::try_acquire(&path.join("writer.lock"))
         .map_err(|err| io_fail(err, "lock"))?
         .ok_or_else(|| {
@@ -1117,7 +1086,7 @@ fn inspect_version_readonly(path: &Path) -> Result<(), Fail> {
     Ok(())
 }
 
-fn readonly_uri(path: &Path) -> Result<String, Fail> {
+fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
     let abs = path
         .canonicalize()
         .map_err(|err| io_fail(err, "canonicalize"))?;
@@ -1129,296 +1098,23 @@ fn readonly_uri(path: &Path) -> Result<String, Fail> {
             "vault_path_unsupported",
         ));
     }
-    Ok(format!("file:{text}?mode=ro&immutable=1"))
+    Ok(format!("file:{text}?{query}"))
+}
+
+/// Version inspection only. immutable=1 does not see a commit that is still in the WAL.
+fn readonly_uri(path: &Path) -> Result<String, Fail> {
+    file_uri(path, "mode=ro&immutable=1")
+}
+
+/// Command lookup. mode=ro without immutable sees a committed row while the writer still holds the lock.
+fn wal_visible_uri(path: &Path) -> Result<String, Fail> {
+    file_uri(path, "mode=ro")
 }
 
 fn open_writer(path: &Path) -> Result<Connection, Fail> {
     let conn = Connection::open(path.join("vault.db")).map_err(|err| db_fail(err, "open"))?;
     store::configure(&conn).map_err(|err| db_fail(err, "pragma"))?;
     Ok(conn)
-}
-
-fn inspect(session: &Session) -> Result<Report, Fail> {
-    let sources = store::list_sources(&session.conn).map_err(|err| db_fail(err, "list_sources"))?;
-    let objects = store::list_objects(&session.conn).map_err(|err| db_fail(err, "list_objects"))?;
-    let occurrences =
-        store::list_occurrences(&session.conn).map_err(|err| db_fail(err, "list_occurrences"))?;
-    let commands =
-        store::list_commands(&session.conn).map_err(|err| db_fail(err, "list_commands"))?;
-    let journals = scan_journals(&session.root)?;
-    let mut alerts = Vec::new();
-    let mut dangling = Vec::new();
-    for name in &journals.unexpected {
-        alerts.push(json!({"code": "unexpected_journal_name", "name": name}));
-    }
-    for name in &journals.invalid {
-        alerts.push(json!({"code": "journal_invalid", "name": name}));
-    }
-    let db_object_ids: std::collections::BTreeSet<&str> =
-        objects.iter().map(|o| o.object_id.as_str()).collect();
-    let mut unreferenced = Vec::new();
-    let object_dir = session.root.join("objects");
-    if object_dir.is_dir() {
-        let mut names = Vec::new();
-        for entry in fs::read_dir(&object_dir).map_err(|err| io_fail(err, "read_objects"))? {
-            let entry = entry.map_err(|err| io_fail(err, "read_objects"))?;
-            names.push(entry.file_name().to_string_lossy().to_string());
-        }
-        names.sort();
-        for name in names {
-            if !is_prefixed_id(&name, "obj_") {
-                alerts.push(json!({"code": "unexpected_object_name", "name": name}));
-                continue;
-            }
-            if !db_object_ids.contains(name.as_str()) {
-                let path = object_dir.join(&name);
-                let (hash, len) = sha256_file(&path).map_err(|err| io_fail(err, "hash_orphan"))?;
-                unreferenced.push(json!({
-                    "object_id": name,
-                    "content_sha256": hash,
-                    "hash_alg": "sha256",
-                    "byte_length": len,
-                    "object_relpath": format!("objects/{name}")
-                }));
-            }
-        }
-    }
-    let mut source_json = Vec::new();
-    for source in &sources {
-        let mut intact = false;
-        let mut relpath = String::new();
-        if !is_prefixed_id(&source.object_id, "obj_") {
-            alerts.push(json!({"code": "object_id_rejected", "source_id": source.source_id, "object_id": source.object_id}));
-            dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "object_id_rejected"}));
-        } else {
-            relpath = format!("objects/{}", source.object_id);
-            if let Some(object) = objects.iter().find(|o| o.object_id == source.object_id) {
-                if object.relpath != relpath {
-                    alerts.push(json!({"code": "object_path_rejected", "source_id": source.source_id, "object_id": source.object_id}));
-                }
-            }
-            let path = session.root.join(&relpath);
-            if !path.is_file() {
-                alerts.push(json!({"code": "object_missing", "source_id": source.source_id, "object_id": source.object_id}));
-                dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "object_missing"}));
-            } else {
-                let (hash, len) = sha256_file(&path).map_err(|err| io_fail(err, "hash_object"))?;
-                if hash != source.content_sha256 || len as i64 != source.byte_length {
-                    alerts.push(json!({
-                        "code": "hash_mismatch",
-                        "source_id": source.source_id,
-                        "object_id": source.object_id,
-                        "expected_sha256": source.content_sha256,
-                        "actual_sha256": hash
-                    }));
-                    dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "hash_mismatch"}));
-                } else {
-                    intact = true;
-                }
-            }
-        }
-        source_json.push(json!({
-            "source_id": source.source_id,
-            "object_id": source.object_id,
-            "content_sha256": source.content_sha256,
-            "hash_alg": "sha256",
-            "byte_length": source.byte_length,
-            "media_type": source.media_type,
-            "user_marker": source.user_marker,
-            "preservation": "preserved",
-            "arrangement": "not_arranged",
-            "searchability": "not_searchable",
-            "purchase_id": null,
-            "entitlement_id": null,
-            "object_relpath": relpath,
-            "object_intact": intact
-        }));
-    }
-    let command_ids: std::collections::BTreeSet<&str> =
-        commands.iter().map(|c| c.command_id.as_str()).collect();
-    let mut incomplete = Vec::new();
-    for journal in &journals.valid {
-        if command_ids.contains(journal.command_id.as_str()) {
-            continue;
-        }
-        incomplete.push(json!({
-            "command_id": journal.command_id,
-            "kind": journal.kind,
-            "state": journal.state,
-            "reason": journal.reason,
-            "content_sha256": journal.content_sha256,
-            "byte_length": journal.byte_length,
-            "preservation": "not_preserved",
-            "source_id": null,
-            "purchase_id": null
-        }));
-    }
-    let invalid_journal = !journals.invalid.is_empty() || !journals.unexpected.is_empty();
-    let (code, outcome) = if !dangling.is_empty() || invalid_journal {
-        (EXIT_RECOVERY, "RecoveryRequired")
-    } else if !alerts.is_empty() {
-        (EXIT_INTEGRITY, "IntegrityAlert")
-    } else {
-        (EXIT_OK, "Ready")
-    };
-    let vault_id = store::meta(&session.conn, "vault_id")
-        .map_err(|err| db_fail(err, "meta"))?
-        .unwrap_or_default();
-    let mut body = honesty(outcome);
-    body.insert("vault_id".into(), json!(vault_id));
-    body.insert("disposable".into(), json!(true));
-    body.insert("protection".into(), json!("unanswered_synthetic_plaintext"));
-    body.insert("primary_input".into(), json!("unanswered"));
-    body.insert("schema_version".into(), json!(1));
-    body.insert("capabilities".into(), capabilities());
-    body.insert(
-        "platform_limits".into(),
-        platform_limits(Some(session.magic)),
-    );
-    body.insert("has_incomplete".into(), json!(!incomplete.is_empty()));
-    body.insert("sources".into(), Value::Array(source_json));
-    body.insert(
-        "occurrences".into(),
-        Value::Array(
-            occurrences
-                .iter()
-                .map(|row| {
-                    json!({
-                        "occurrence_id": row.occurrence_id,
-                        "source_id": row.source_id,
-                        "command_id": row.command_id,
-                        "batch_id": row.batch_id,
-                        "display_name": row.display_name,
-                        "external_path": row.external_path,
-                        "storage_reused": row.storage_reused,
-                        "recorded_at": row.recorded_at
-                    })
-                })
-                .collect(),
-        ),
-    );
-    body.insert(
-        "commands".into(),
-        Value::Array(
-            commands
-                .iter()
-                .map(|row| json!({"command_id": row.command_id, "kind": row.kind, "outcome": row.outcome}))
-                .collect(),
-        ),
-    );
-    body.insert("incomplete_commands".into(), Value::Array(incomplete));
-    body.insert("unreferenced_objects".into(), Value::Array(unreferenced));
-    body.insert("dangling_references".into(), Value::Array(dangling));
-    body.insert("alerts".into(), Value::Array(alerts));
-    body.insert(
-        "temporary_file_count".into(),
-        json!(count_staging(&session.root)),
-    );
-    body.insert("created_new_vault".into(), json!(false));
-    Ok(Report {
-        code,
-        body: Value::Object(body),
-    })
-}
-
-struct JournalScan {
-    valid: Vec<Journal>,
-    invalid: Vec<String>,
-    unexpected: Vec<String>,
-}
-
-fn scan_journals(root: &Path) -> Result<JournalScan, Fail> {
-    let mut scan = JournalScan {
-        valid: Vec::new(),
-        invalid: Vec::new(),
-        unexpected: Vec::new(),
-    };
-    let dir = root.join("journal");
-    if !dir.exists() {
-        return Ok(scan);
-    }
-    let mut names = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|err| io_fail(err, "read_journal"))? {
-        let entry = entry.map_err(|err| io_fail(err, "read_journal"))?;
-        names.push(entry.file_name().to_string_lossy().to_string());
-    }
-    names.sort();
-    for name in names {
-        if name.ends_with(".json.tmp") || name.starts_with('.') {
-            continue;
-        }
-        if !name.ends_with(".json") {
-            scan.unexpected.push(name);
-            continue;
-        }
-        let command_id = &name[..name.len() - 5];
-        if !is_command_id(command_id) {
-            scan.unexpected.push(name);
-            continue;
-        }
-        let path = dir.join(&name);
-        match read_journal_file(&path) {
-            Ok(journal) if journal.command_id == command_id => scan.valid.push(journal),
-            _ => scan.invalid.push(name),
-        }
-    }
-    Ok(scan)
-}
-
-fn reconcile(session: &Session) -> Result<(), Fail> {
-    let scan = scan_journals(&session.root)?;
-    for journal in scan.valid {
-        if journal.state == "committed" {
-            continue;
-        }
-        if store::command(&session.conn, &journal.command_id)
-            .map_err(|err| db_fail(err, "reconcile"))?
-            .is_some()
-        {
-            let mut journal = journal;
-            journal.state = "committed".into();
-            journal.reason = None;
-            write_journal(&session.root, &journal)?;
-        }
-    }
-    Ok(())
-}
-
-fn clean_temps(root: &Path) -> Result<(), Fail> {
-    let staging = root.join("staging");
-    if staging.is_dir() {
-        for entry in fs::read_dir(&staging).map_err(|err| io_fail(err, "read_staging"))? {
-            let entry = entry.map_err(|err| io_fail(err, "read_staging"))?;
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path).map_err(|err| io_fail(err, "staging_meta"))?;
-            if meta.is_file() || meta.file_type().is_symlink() {
-                fs::remove_file(&path).map_err(|err| io_fail(err, "remove_staging"))?;
-            }
-        }
-    }
-    let journal = root.join("journal");
-    if journal.is_dir() {
-        for entry in fs::read_dir(&journal).map_err(|err| io_fail(err, "read_journal"))? {
-            let entry = entry.map_err(|err| io_fail(err, "read_journal"))?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".json.tmp") || (name.starts_with('.') && name.ends_with(".tmp")) {
-                let meta =
-                    fs::symlink_metadata(entry.path()).map_err(|err| io_fail(err, "tmp_meta"))?;
-                if meta.is_file() || meta.file_type().is_symlink() {
-                    fs::remove_file(entry.path()).map_err(|err| io_fail(err, "remove_tmp"))?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn count_staging(root: &Path) -> i64 {
-    let staging = root.join("staging");
-    let Ok(rd) = fs::read_dir(staging) else {
-        return 0;
-    };
-    rd.filter_map(|e| e.ok()).count() as i64
 }
 
 fn load_or_new_journal(
@@ -1462,127 +1158,6 @@ fn load_or_new_journal(
     })
 }
 
-fn write_journal(root: &Path, journal: &Journal) -> Result<(), Fail> {
-    let path = journal_path(root, &journal.command_id);
-    let value = json!({
-        "command_id": journal.command_id,
-        "kind": journal.kind,
-        "generation": journal.generation,
-        "state": journal.state,
-        "batch_id": journal.batch_id,
-        "display_name": journal.display_name,
-        "external_path": journal.external_path,
-        "media_type": journal.media_type,
-        "occurrence_id": journal.occurrence_id,
-        "object_id": journal.object_id,
-        "content_sha256": journal.content_sha256,
-        "byte_length": journal.byte_length,
-        "payload_fingerprint": journal.payload_fingerprint,
-        "storage_reused": journal.storage_reused,
-        "reason": journal.reason,
-        "marker_value": journal.marker_value,
-        "source_id": journal.source_id
-    });
-    let bytes = serde_json::to_vec_pretty(&value)
-        .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "journal_encode"))?;
-    atomic_write(&path, &bytes).map_err(|err| io_fail(err, "journal_write"))
-}
-
-fn read_journal_file(path: &Path) -> Result<Journal, ()> {
-    let bytes = fs::read(path).map_err(|_| ())?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
-    let command_id = value
-        .get("command_id")
-        .and_then(|v| v.as_str())
-        .ok_or(())?
-        .to_string();
-    if !is_command_id(&command_id) {
-        return Err(());
-    }
-    let kind = value
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .ok_or(())?
-        .to_string();
-    if kind != "import" && kind != "marker" {
-        return Err(());
-    }
-    let generation = value.get("generation").and_then(|v| v.as_i64()).ok_or(())?;
-    if generation < 1 {
-        return Err(());
-    }
-    let state = value
-        .get("state")
-        .and_then(|v| v.as_str())
-        .ok_or(())?
-        .to_string();
-    if !matches!(
-        state.as_str(),
-        "started" | "copying" | "object_ready" | "aborted" | "committed"
-    ) {
-        return Err(());
-    }
-    let object_id = optional_string(&value, "object_id")?;
-    if let Some(id) = &object_id {
-        if !is_prefixed_id(id, "obj_") {
-            return Err(());
-        }
-    }
-    let occurrence_id = optional_string(&value, "occurrence_id")?;
-    if let Some(id) = &occurrence_id {
-        if !is_prefixed_id(id, "occ_") {
-            return Err(());
-        }
-    }
-    let source_id = optional_string(&value, "source_id")?;
-    if let Some(id) = &source_id {
-        if !is_prefixed_id(id, "src_") {
-            return Err(());
-        }
-    }
-    let content_sha256 = optional_string(&value, "content_sha256")?;
-    if let Some(hash) = &content_sha256 {
-        if !is_lower_hex(hash, 64) {
-            return Err(());
-        }
-    }
-    Ok(Journal {
-        command_id,
-        kind,
-        generation,
-        state,
-        batch_id: optional_string(&value, "batch_id")?,
-        display_name: optional_string(&value, "display_name")?,
-        external_path: optional_string(&value, "external_path")?,
-        media_type: optional_string(&value, "media_type")?,
-        occurrence_id,
-        object_id,
-        content_sha256,
-        byte_length: match value.get("byte_length") {
-            None | Some(Value::Null) => None,
-            Some(Value::Number(n)) => Some(n.as_i64().ok_or(())?),
-            _ => return Err(()),
-        },
-        payload_fingerprint: optional_string(&value, "payload_fingerprint")?,
-        storage_reused: match value.get("storage_reused") {
-            None | Some(Value::Null) => None,
-            Some(Value::Bool(v)) => Some(*v),
-            _ => return Err(()),
-        },
-        reason: optional_string(&value, "reason")?,
-        marker_value: optional_string(&value, "marker_value")?,
-        source_id,
-    })
-}
-
-fn optional_string(value: &Value, key: &str) -> Result<Option<String>, ()> {
-    match value.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => Ok(Some(s.clone())),
-        _ => Err(()),
-    }
-}
-
 fn copy_source(
     src: &Path,
     dest: &Path,
@@ -1611,32 +1186,36 @@ fn copy_source(
         if n == 0 {
             break;
         }
-        if !paused && n > 1 {
+        if paused {
             output
-                .write_all(&buf[..n - 1])
+                .write_all(&buf[..n])
+                .map_err(|err| io_fail(err, "write_staging"))?;
+            written += n as u64;
+            continue;
+        }
+        // One pause, before this read is fully in the staging file and before publish.
+        // A one-byte read stops with nothing of that byte written yet.
+        let hold = if n == 1 { 0 } else { n - 1 };
+        if hold > 0 {
+            output
+                .write_all(&buf[..hold])
                 .map_err(|err| io_fail(err, "write_staging"))?;
             output
                 .flush()
                 .map_err(|err| io_fail(err, "flush_staging"))?;
-            written += (n as u64) - 1;
-            hooks.stop(
-                "during_copy",
-                checkpoint_map(command_id, written, Some(expected_len), None, false, false),
-            )?;
-            if take_cancel(root, command_id, generation)? {
-                return Err(cancelled());
-            }
-            output
-                .write_all(&buf[n - 1..n])
-                .map_err(|err| io_fail(err, "write_staging"))?;
-            written += 1;
-            paused = true;
-            continue;
+            written += hold as u64;
+        }
+        hooks.stop(
+            "during_copy",
+            checkpoint_map(command_id, written, Some(expected_len), None, false, false),
+        )?;
+        if take_cancel(root, command_id, generation)? {
+            return Err(cancelled());
         }
         output
-            .write_all(&buf[..n])
+            .write_all(&buf[hold..n])
             .map_err(|err| io_fail(err, "write_staging"))?;
-        written += n as u64;
+        written += (n - hold) as u64;
         paused = true;
     }
     if !paused {
@@ -1644,6 +1223,9 @@ fn copy_source(
             "during_copy",
             checkpoint_map(command_id, written, Some(expected_len), None, false, false),
         )?;
+        if take_cancel(root, command_id, generation)? {
+            return Err(cancelled());
+        }
     }
     output
         .sync_all()
@@ -1685,33 +1267,14 @@ fn find_orphan_with_hash(
     Ok(None)
 }
 
-fn verify_referenced_file(root: &Path, object: &ObjectRow) -> Result<(), &'static str> {
-    let Some(relpath) = canonical_object_relpath(&object.object_id) else {
-        return Err("object_id_rejected");
-    };
-    let path = root.join(relpath);
-    if !path.is_file() {
-        return Err("object_missing");
-    }
-    let (hash, len) = sha256_file(&path).map_err(|_| "hash_mismatch")?;
-    if hash != object.content_sha256 || len as i64 != object.byte_length {
-        return Err("hash_mismatch");
-    }
-    Ok(())
-}
-
 fn lookup_object(session: &Session, object_id: &str) -> Result<ObjectRow, Fail> {
-    let objects = store::list_objects(&session.conn).map_err(|err| db_fail(err, "list_objects"))?;
-    objects
-        .into_iter()
-        .find(|o| o.object_id == object_id)
+    store::object_by_id(&session.conn, object_id)
+        .map_err(|err| db_fail(err, "object_lookup"))?
         .ok_or_else(|| Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_row_missing"))
 }
 
 fn unwind(root: &Path, journal: &mut Journal, phase: &Phase, fail: Fail) -> Result<Fail, Fail> {
-    // Injected failures leave the copied temp so a test can see the bytes that were
-    // written before the fault. open/recover removes staging. Cancel still removes it.
-    if !fail.reason.starts_with("injected_") {
+    if !fail.keep_staging {
         let _ = fs::remove_file(staging_path(root, &journal.command_id));
     }
     if journal.state != "committed" {
@@ -1762,11 +1325,27 @@ fn write_control(root: &Path, command_id: &str, generation: i64) -> Result<(), F
         .map_err(|err| io_fail(err, "control_write"))
 }
 
-fn result_generation(json_text: &str) -> i64 {
-    serde_json::from_str::<Value>(json_text)
-        .ok()
-        .and_then(|v| v.get("generation").and_then(|g| g.as_i64()))
-        .unwrap_or(1)
+fn result_generation(json_text: &str) -> Result<i64, Fail> {
+    let value: Value = serde_json::from_str(json_text).map_err(|_| {
+        Fail::new(
+            EXIT_RECOVERY,
+            "RecoveryRequired",
+            "command_result_unreadable",
+        )
+        .extra("new_effect", json!(false))
+    })?;
+    let Some(map) = value.as_object() else {
+        return Err(Fail::new(
+            EXIT_RECOVERY,
+            "RecoveryRequired",
+            "command_result_not_object",
+        )
+        .extra("new_effect", json!(false)));
+    };
+    Ok(map
+        .get("generation")
+        .and_then(|generation| generation.as_i64())
+        .unwrap_or(1))
 }
 
 fn already_committed(row: &CommandRow) -> Result<Value, Fail> {
@@ -1776,15 +1355,22 @@ fn already_committed(row: &CommandRow) -> Result<Value, Fail> {
             "RecoveryRequired",
             "command_result_unreadable",
         )
+        .extra("new_effect", json!(false))
     })?;
-    if let Some(map) = value.as_object_mut() {
-        map.insert("outcome".into(), json!("AlreadyCommitted"));
-        map.insert("new_effect".into(), json!(false));
-        map.insert("user_ready".into(), json!(false));
-        map.insert("security_complete".into(), json!(false));
-        map.insert("purchase_id".into(), Value::Null);
-        map.insert("entitlement_id".into(), Value::Null);
-    }
+    let Some(map) = value.as_object_mut() else {
+        return Err(Fail::new(
+            EXIT_RECOVERY,
+            "RecoveryRequired",
+            "command_result_not_object",
+        )
+        .extra("new_effect", json!(false)));
+    };
+    map.insert("outcome".into(), json!("AlreadyCommitted"));
+    map.insert("new_effect".into(), json!(false));
+    map.insert("user_ready".into(), json!(false));
+    map.insert("security_complete".into(), json!(false));
+    map.insert("purchase_id".into(), Value::Null);
+    map.insert("entitlement_id".into(), Value::Null);
     Ok(value)
 }
 
@@ -1849,59 +1435,30 @@ fn cancelled() -> Fail {
         .extra("purchase_id", Value::Null)
 }
 
-fn ensure_precommit(hooks: &HookRun) -> Result<(), Fail> {
-    if let Some(point) = &hooks.hooks.stop_at {
-        if IMPORT_STOPS.contains(&point.as_str())
-            && point != "after_db_commit"
-            && point != "before_receipt"
-            && !hooks.stop_reached
-        {
-            return Err(
-                Fail::new(EXIT_STOP_MISSED, "StopPointNotReached", point.clone())
-                    .extra("preservation", json!("not_preserved"))
-                    .extra("new_effect", json!(false)),
-            );
-        }
-    }
-    if let Some(point) = &hooks.hooks.inject_point {
-        if (point == "after_staging_fsync" || point == "object_fsync") && !hooks.inject_reached {
-            return Err(
-                Fail::new(EXIT_FAULT_MISSED, "FaultNotReached", point.clone())
-                    .extra("injected", json!(true))
-                    .extra("preservation", json!("not_preserved"))
-                    .extra("new_effect", json!(false)),
-            );
-        }
-    }
-    Ok(())
-}
-
 fn validate_hook_names(
     stop: Option<&str>,
     inject: Option<&str>,
-    stops: &[&str],
-    injects: &[&str],
+    reachable_stops: &[&str],
+    recognized_injects: &[&str],
+    reachable_injects: &[&str],
 ) -> Result<(), Fail> {
     if let Some(point) = stop {
-        if !stops.contains(&point) {
+        if !reachable_stops.contains(&point) {
             return Err(
                 Fail::new(EXIT_USAGE, "Usage", "unknown_stop_point").extra("point", json!(point))
             );
         }
     }
     if let Some(point) = inject {
-        if !injects.contains(&point)
-            && !IMPORT_INJECTS.contains(&point)
-            && !MARKER_INJECTS.contains(&point)
-        {
+        if !recognized_injects.contains(&point) {
             return Err(
                 Fail::new(EXIT_USAGE, "Usage", "unknown_inject_point").extra("point", json!(point))
             );
         }
-        if !injects.contains(&point) {
+        if !reachable_injects.contains(&point) {
             return Err(Fail::new(EXIT_FAULT_MISSED, "FaultNotReached", point)
                 .extra("injected", json!(true))
-                .extra("preservation", json!("not_preserved"))
+                .extra("preservation", json!(NOT_PRESERVED))
                 .extra("new_effect", json!(false)));
         }
     }
@@ -1944,14 +1501,6 @@ fn fingerprint(parts: &[&str]) -> String {
     hex_encode(&hasher.finalize())
 }
 
-fn journal_path(root: &Path, command_id: &str) -> PathBuf {
-    root.join("journal").join(format!("{command_id}.json"))
-}
-
-fn staging_path(root: &Path, command_id: &str) -> PathBuf {
-    root.join("staging").join(format!("{command_id}.partial"))
-}
-
 fn display_name_fallback() -> String {
     "source".into()
 }
@@ -1963,40 +1512,9 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn io_fail(err: io::Error, during: &str) -> Fail {
-    let enospc = err.raw_os_error() == Some(libc::ENOSPC);
-    Fail::new(
-        EXIT_NOT_PRESERVED,
-        "NotPreserved",
-        if enospc { "enospc" } else { "io_error" },
-    )
-    .extra("injected", json!(false))
-    .extra("during", json!(during))
-    .extra("os_error", json!(err.to_string()))
-    .extra("preservation", json!("not_preserved"))
-    .extra("new_effect", json!(false))
-}
-
-fn db_fail(err: rusqlite::Error, during: &str) -> Fail {
-    let full = matches!(
-        &err,
-        rusqlite::Error::SqliteFailure(ffi, _) if ffi.code == rusqlite::ErrorCode::DiskFull
-    );
-    Fail::new(
-        EXIT_NOT_PRESERVED,
-        "NotPreserved",
-        if full { "enospc" } else { "db_error" },
-    )
-    .extra("injected", json!(false))
-    .extra("during", json!(during))
-    .extra("os_error", json!(err.to_string()))
-    .extra("preservation", json!("not_preserved"))
-    .extra("new_effect", json!(false))
-}
-
 fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
     if let Some(row) = read_committed(&req.vault, &req.command_id)? {
-        let generation = result_generation(&row.result_json);
+        let generation = result_generation(&row.result_json)?;
         if generation != req.generation {
             return Err(Fail::new(EXIT_REJECTED, "Rejected", "generation_mismatch")
                 .extra("cancel_applied", json!(false)));
@@ -2038,16 +1556,293 @@ fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
 }
 
 fn read_committed(root: &Path, command_id: &str) -> Result<Option<CommandRow>, Fail> {
-    if !root.join("vault.db").is_file() || !sqlite_header_ok(&root.join("vault.db"))? {
-        return Ok(None);
+    let db = root.join("vault.db");
+    if !sqlite_header_ok(&db)? {
+        return Err(Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_header")
+            .extra("created_new_vault", json!(false)));
     }
-    let uri = readonly_uri(&root.join("vault.db"))?;
+    let uri = wal_visible_uri(&db)?;
     let conn = Connection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
-    .map_err(|_| Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_unreadable"))?;
-    store::command(&conn, command_id).map_err(|err| db_fail(err, "command_lookup"))
+    .map_err(|err| uncertain(command_id, "wal_open", &err.to_string()))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
+    store::command(&conn, command_id)
+        .map_err(|err| uncertain(command_id, "wal_query", &err.to_string()))
+}
+
+enum SourceView {
+    Absent,
+    Unreadable(String),
+    NotFile,
+    TooLarge(u64),
+    Ready { hash: String, len: u64 },
+}
+
+fn classify_source(path: &Path) -> SourceView {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return SourceView::Absent,
+        Err(err) => return SourceView::Unreadable(err.to_string()),
+    };
+    if !meta.file_type().is_file() {
+        return SourceView::NotFile;
+    }
+    if meta.len() > MAX_OBJECT_BYTES {
+        return SourceView::TooLarge(meta.len());
+    }
+    match sha256_file(path) {
+        Ok((hash, len)) => SourceView::Ready { hash, len },
+        Err(err) => SourceView::Unreadable(err.to_string()),
+    }
+}
+
+fn require_new_source(path: &Path) -> Result<fs::Metadata, Fail> {
+    let meta = fs::symlink_metadata(path).map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "source_missing")
+                .extra("preservation", json!(NOT_PRESERVED))
+                .extra("injected", json!(false))
+        } else {
+            io_fail(err, "source_metadata")
+        }
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(
+            Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "source_not_a_file")
+                .extra("preservation", json!(NOT_PRESERVED))
+                .extra("injected", json!(false)),
+        );
+    }
+    if meta.len() > MAX_OBJECT_BYTES {
+        return Err(
+            Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "object_too_large")
+                .extra("preservation", json!(NOT_PRESERVED))
+                .extra("byte_length", json!(meta.len()))
+                .extra("limit", json!(MAX_OBJECT_BYTES))
+                .extra("injected", json!(false)),
+        );
+    }
+    Ok(meta)
+}
+
+fn replay_committed(
+    session: &Session,
+    req: &ImportRequest,
+    existing: &CommandRow,
+) -> Result<Value, Fail> {
+    if req.hooks.inject_point.is_some() || req.hooks.stop_at.is_some() {
+        return Err(Fail::new(
+            EXIT_FAULT_MISSED,
+            "FaultNotReached",
+            "command_already_committed",
+        )
+        .extra("injected", json!(req.hooks.inject_point.is_some()))
+        .extra("preservation", json!(NOT_PRESERVED)));
+    }
+    let mut receipt = already_committed(existing)?;
+    let source_id = receipt
+        .get("source_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            Fail::new(
+                EXIT_RECOVERY,
+                "RecoveryRequired",
+                "command_result_incomplete",
+            )
+            .extra("new_effect", json!(false))
+        })?;
+    let source = store::source_by_id(&session.conn, source_id)
+        .map_err(|err| db_fail(err, "source_lookup"))?
+        .ok_or_else(|| {
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_row_missing")
+                .extra("new_effect", json!(false))
+                .extra("command_id", json!(req.command_id))
+        })?;
+    confirm_source_bytes(session, &source, &req.command_id)?;
+    match classify_source(&req.source) {
+        // The external path is gone, so its bytes and media type cannot be checked again.
+        // The hosted object was checked above. This is a historical receipt, not a new import.
+        SourceView::Absent => {
+            if let Some(map) = receipt.as_object_mut() {
+                map.insert("source_check".into(), json!("absent"));
+                map.insert(
+                    "replay".into(),
+                    json!("historical_receipt_source_not_rechecked"),
+                );
+            }
+            Ok(receipt)
+        }
+        SourceView::Unreadable(message) => {
+            Err(
+                Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "source_unreadable")
+                    .extra("os_error", json!(message))
+                    .extra("new_effect", json!(false))
+                    .extra("injected", json!(false))
+                    .extra("preservation", json!(NOT_PRESERVED))
+                    .extra("command_id", json!(req.command_id)),
+            )
+        }
+        SourceView::NotFile => {
+            Err(
+                Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "source_not_a_file")
+                    .extra("new_effect", json!(false))
+                    .extra("injected", json!(false))
+                    .extra("preservation", json!(NOT_PRESERVED))
+                    .extra("command_id", json!(req.command_id)),
+            )
+        }
+        SourceView::TooLarge(len) => {
+            Err(payload_conflict(&req.command_id).extra("byte_length", json!(len)))
+        }
+        SourceView::Ready { hash, len } => {
+            let fingerprint = fingerprint(&["import", &hash, &req.media_type]);
+            if fingerprint != existing.payload_fingerprint || len as i64 != source.byte_length {
+                return Err(payload_conflict(&req.command_id));
+            }
+            if let Some(map) = receipt.as_object_mut() {
+                map.insert("source_check".into(), json!("matched"));
+            }
+            Ok(receipt)
+        }
+    }
+}
+
+fn confirm_source_bytes(
+    session: &Session,
+    source: &SourceRow,
+    command_id: &str,
+) -> Result<(), Fail> {
+    let object = store::object_by_id(&session.conn, &source.object_id)
+        .map_err(|err| db_fail(err, "object_lookup"))?
+        .ok_or_else(|| {
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_row_missing")
+                .extra("new_effect", json!(false))
+                .extra("command_id", json!(command_id))
+        })?;
+    let facts = facts::object_facts(
+        &session.root,
+        &object.object_id,
+        Some(&object.relpath),
+        &source.content_sha256,
+        source.byte_length,
+    );
+    hosted_facts_ok(&facts).map_err(|fail| fail.extra("command_id", json!(command_id)))
+}
+
+fn require_hosted_object(
+    root: &Path,
+    object: &ObjectRow,
+    expected_hash: &str,
+    expected_len: i64,
+) -> Result<(), Fail> {
+    let facts = facts::object_facts(
+        root,
+        &object.object_id,
+        Some(&object.relpath),
+        expected_hash,
+        expected_len,
+    );
+    hosted_facts_ok(&facts)
+}
+
+fn hosted_facts_ok(facts: &ObjectFacts) -> Result<(), Fail> {
+    if facts.id_rejected {
+        return Err(bad_object("object_id_rejected"));
+    }
+    if let Some(message) = &facts.io_error {
+        return Err(bad_object("object_unreadable").extra("os_error", json!(message)));
+    }
+    if facts.missing {
+        return Err(bad_object("object_missing"));
+    }
+    if !facts.hash_matches || !facts.length_matches {
+        return Err(bad_object("hash_mismatch")
+            .extra("actual_sha256", json!(facts.actual_hash))
+            .extra("byte_length", json!(facts.actual_len)));
+    }
+    Ok(())
+}
+
+fn bad_object(reason: &str) -> Fail {
+    Fail::new(EXIT_RECOVERY, "RecoveryRequired", reason)
+        .extra("new_effect", json!(false))
+        .extra("injected", json!(false))
+}
+
+fn payload_conflict(command_id: &str) -> Fail {
+    Fail::new(EXIT_REJECTED, "Rejected", "payload_conflict")
+        .extra("command_id", json!(command_id))
+        .extra("preservation", json!(NOT_PRESERVED))
+        .extra("new_effect", json!(false))
+}
+
+fn refuse_unreached_object_fsync(hooks: &HookRun) -> Result<(), Fail> {
+    if hooks.hooks.inject_point.as_deref() == Some("object_fsync") {
+        return Err(
+            Fail::new(EXIT_FAULT_MISSED, "FaultNotReached", "object_fsync")
+                .extra("injected", json!(true))
+                .extra("preservation", json!(NOT_PRESERVED))
+                .extra("new_effect", json!(false))
+                .extra("published", json!(false)),
+        );
+    }
+    Ok(())
+}
+
+fn finish_after_commit(
+    result: Value,
+    after: impl FnOnce() -> Result<(), Fail>,
+) -> Result<Value, Fail> {
+    match after() {
+        Ok(()) => Ok(result),
+        Err(fail) => Ok(note_post_commit(result, &fail)),
+    }
+}
+
+fn note_post_commit(mut result: Value, fail: &Fail) -> Value {
+    if let Some(map) = result.as_object_mut() {
+        map.insert("post_commit_io".into(), json!(true));
+        map.insert("outcome".into(), json!("Committed"));
+        map.insert("preservation".into(), json!(PRESERVED));
+        map.insert("new_effect".into(), json!(true));
+        map.insert("injected".into(), json!(false));
+        if let Some(during) = fail.extra.get("during") {
+            map.insert("during".into(), during.clone());
+        }
+        if let Some(os_error) = fail.extra.get("os_error") {
+            map.insert("os_error".into(), os_error.clone());
+        }
+    }
+    result
+}
+
+fn settle_commit(root: &Path, command_id: &str, err: rusqlite::Error) -> Result<Value, Fail> {
+    match read_committed(root, command_id) {
+        Ok(Some(row)) => {
+            let mut body = already_committed(&row)?;
+            if let Some(map) = body.as_object_mut() {
+                map.insert("commit_error".into(), json!(err.to_string()));
+                map.insert("visible_despite_commit_error".into(), json!(true));
+            }
+            Ok(body)
+        }
+        Ok(None) => Err(db_fail(err, "db_commit")),
+        Err(_) => Err(uncertain(
+            command_id,
+            "after_commit_error",
+            &err.to_string(),
+        )),
+    }
+}
+
+fn uncertain(command_id: &str, during: &str, detail: &str) -> Fail {
+    Fail::new(EXIT_UNCERTAIN, "Uncertain", "commit_visibility_unknown")
+        .extra("command_id", json!(command_id))
+        .extra("during", json!(during))
+        .extra("detail", json!(detail))
+        .extra("new_effect", Value::Null)
 }
 
 fn unsupported_fs(magic: i64) -> Fail {
