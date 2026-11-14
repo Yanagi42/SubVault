@@ -19,7 +19,8 @@ pub const EXTRACTOR: &str = "subvault-html";
 pub const EXTRACTOR_VERSION: &str = "1";
 pub const NORMALIZATION: &str = "html-static-text-1";
 pub const JOIN: &str = "html-block-1";
-pub const RULES_VERSION: &str = "stated-html-blocks-2";
+pub const RULES_VERSION: &str = "stated-html-blocks-3";
+const ROW_DISPLAY: &str = "html-row-stated-1";
 const BLOCKS: &str = "p,div,li,h1,h2,h3,h4,h5,h6,blockquote,td,th";
 const CONTAINERS: &str = "html,body,ul,ol,table,thead,tbody,tfoot,tr";
 const INLINES: &str = "b,strong,i,em,span,br";
@@ -640,6 +641,7 @@ fn hit_value(hit: &Hit) -> Map<String, Value> {
     let mut value = Map::new();
     value.insert("kind".into(), json!(hit.kind));
     value.insert("display_excerpt".into(), json!(hit.display));
+    value.insert("display_version".into(), json!(hit.display_version));
     value.insert("usable".into(), json!(hit.usable));
     value.insert(
         "reason".into(),
@@ -676,6 +678,7 @@ fn hit_locator(version_id: &str, hash: &str, hit: &Hit) -> Value {
         "byte_end": hit.byte_end,
         "excerpt": hit.excerpt,
         "display_excerpt": hit.display,
+        "display_version": hit.display_version,
         "eml": null,
         "pdf_page": null,
         "coordinates": null
@@ -705,6 +708,8 @@ fn config_json() -> Value {
         "inlines": INLINES,
         "containers": CONTAINERS,
         "excluded": "head,script,comment,hidden",
+        "row_association": "same-tr-explicit-1",
+        "display_versions": "html-collapse-1,html-row-stated-1",
         "parser": PARSER,
         "parser_version": PARSER_VERSION,
         "entity_decoder": ENTITY_DECODER,
@@ -750,6 +755,7 @@ struct Hit {
     scalar_end: usize,
     excerpt: String,
     element: String,
+    display_version: Option<&'static str>,
 }
 
 struct Prepared {
@@ -871,9 +877,10 @@ fn walk_tag(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Sca
         return;
     }
     match name.as_str() {
-        "html" | "body" | "ul" | "ol" | "table" | "thead" | "tbody" | "tfoot" | "tr" => {
+        "html" | "body" | "ul" | "ol" | "table" | "thead" | "tbody" | "tfoot" => {
             walk(&children, parser, source, scan)
         }
+        "tr" => record_row(tag, parser, source, scan),
         "p" | "div" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" | "td"
         | "th" => {
             match element_span(tag, parser, source) {
@@ -970,6 +977,7 @@ fn record_block(
             scalar_end: span.scalar_end,
             excerpt: span.excerpt.clone(),
             element: name.to_string(),
+            display_version: Some(WHITESPACE),
         });
     }
 }
@@ -1024,15 +1032,24 @@ fn settle(mut hits: Vec<Hit>) -> Prepared {
             Some("conflicting_amounts" | "conflicting_periods")
         )
     });
-    if conflict {
+    let ambiguous = hits
+        .iter()
+        .any(|hit| hit.reason == Some("ambiguous_association"));
+    if conflict || ambiguous {
         for hit in &mut hits {
-            if hit.reason == Some("conflicting_amounts")
-                || hit.reason == Some("conflicting_periods")
-            {
+            if matches!(
+                hit.reason,
+                Some("conflicting_amounts" | "conflicting_periods" | "ambiguous_association")
+            ) {
                 hit.usable = false;
             }
         }
-        prepared("conflict", Some("conflicting_statements".into()), hits)
+        let reason = if conflict {
+            "conflicting_statements"
+        } else {
+            "ambiguous_association"
+        };
+        prepared("conflict", Some(reason.into()), hits)
     } else {
         prepared("matched", None, hits)
     }
@@ -1040,7 +1057,7 @@ fn settle(mut hits: Vec<Hit>) -> Prepared {
 
 fn mark(hits: &mut [Hit], kind: &str, value: impl Fn(&Hit) -> Option<String>) {
     let mut distinct = Vec::new();
-    for hit in hits.iter().filter(|hit| hit.kind == kind) {
+    for hit in hits.iter().filter(|hit| stated_hit(hit, kind)) {
         if let Some(text) = value(hit) {
             if !distinct.contains(&text) {
                 distinct.push(text);
@@ -1053,14 +1070,14 @@ fn mark(hits: &mut [Hit], kind: &str, value: impl Fn(&Hit) -> Option<String>) {
         } else {
             "conflicting_periods"
         };
-        for hit in hits.iter_mut().filter(|hit| hit.kind == kind) {
+        for hit in hits.iter_mut().filter(|hit| stated_hit(hit, kind)) {
             hit.usable = false;
             hit.reason = Some(reason);
         }
         return;
     }
     let mut kept = false;
-    for hit in hits.iter_mut().filter(|hit| hit.kind == kind) {
+    for hit in hits.iter_mut().filter(|hit| stated_hit(hit, kind)) {
         if !kept {
             kept = true;
             continue;
@@ -1068,6 +1085,10 @@ fn mark(hits: &mut [Hit], kind: &str, value: impl Fn(&Hit) -> Option<String>) {
         hit.usable = false;
         hit.reason = Some("duplicate_statement");
     }
+}
+
+fn stated_hit(hit: &Hit, kind: &str) -> bool {
+    hit.kind == kind && hit.reason != Some("ambiguous_association")
 }
 
 fn fold(text: &str) -> Vec<String> {
@@ -1095,6 +1116,325 @@ fn fold(text: &str) -> Vec<String> {
 
 fn decode_text(raw: &tl::Bytes) -> String {
     html_escape::decode_html_entities(&raw.as_utf8_str()).into_owned()
+}
+
+struct RowCell {
+    lines: Vec<String>,
+    span: OwnedSpan,
+}
+
+fn record_row(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Scan) {
+    let mut cells = Vec::new();
+    for handle in tag.children().top().iter().copied() {
+        let Some(node) = handle.get(parser) else {
+            scan.span_broken = true;
+            continue;
+        };
+        match node {
+            tl::Node::Comment(_) => {}
+            tl::Node::Raw(raw) => {
+                if !fold(&decode_text(raw)).is_empty() {
+                    scan.outside = true;
+                }
+            }
+            tl::Node::Tag(child) => note_row_child(child, parser, source, scan, &mut cells),
+        }
+    }
+    pair_amount(&cells, source, scan);
+    pair_period(&cells, source, scan);
+}
+
+fn note_row_child(
+    child: &tl::HTMLTag,
+    parser: &tl::Parser,
+    source: &str,
+    scan: &mut Scan,
+    cells: &mut Vec<RowCell>,
+) {
+    let name = tag_name(child);
+    if matches!(name.as_str(), "head" | "script") || has_attr(child, "hidden") {
+        return;
+    }
+    if name == "td" || name == "th" {
+        match element_span(child, parser, source) {
+            Some(span) => {
+                let lines = fold(&collect_inline(child, parser, scan));
+                record_stated_lines(&name, &span, &lines, scan);
+                cells.push(RowCell { lines, span });
+            }
+            None => scan.span_broken = true,
+        }
+        walk_nested(child, parser, source, scan);
+        return;
+    }
+    if is_block(&name) || is_container(&name) {
+        walk_tag(child, parser, source, scan);
+        return;
+    }
+    if matches!(name.as_str(), "b" | "strong" | "i" | "em" | "span" | "br") {
+        if !fold(&collect_inline(child, parser, scan)).is_empty() {
+            scan.outside = true;
+        }
+        return;
+    }
+    if scan.unknown.is_none() {
+        scan.unknown = Some(name);
+    }
+}
+
+fn walk_nested(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Scan) {
+    for handle in tag.children().top().iter().copied() {
+        let Some(tl::Node::Tag(child)) = handle.get(parser) else {
+            continue;
+        };
+        let name = tag_name(child);
+        if is_block(&name) || is_container(&name) || name == "head" || name == "script" {
+            walk_tag(child, parser, source, scan);
+        }
+    }
+}
+
+fn record_stated_lines(name: &str, span: &OwnedSpan, lines: &[String], scan: &mut Scan) {
+    for line in lines {
+        let (kind, amount, start, end) = match body::stated_line(line) {
+            StatedLine::Amount(amount) => ("stated_amount_paid", Some(amount), None, None),
+            StatedLine::Period(start, end) => {
+                ("stated_service_period", None, Some(start), Some(end))
+            }
+            StatedLine::Other => continue,
+        };
+        scan.hits.push(Hit {
+            kind,
+            display: line.clone(),
+            usable: true,
+            reason: None,
+            amount_text: amount,
+            period_start: start,
+            period_end: end,
+            byte_start: span.byte_start,
+            byte_end: span.byte_end,
+            scalar_start: span.scalar_start,
+            scalar_end: span.scalar_end,
+            excerpt: span.excerpt.clone(),
+            element: name.to_string(),
+            display_version: Some(WHITESPACE),
+        });
+    }
+}
+
+fn pair_amount(cells: &[RowCell], source: &str, scan: &mut Scan) {
+    let mut labels = Vec::new();
+    let mut values = Vec::new();
+    for (index, cell) in cells.iter().enumerate() {
+        let Some(line) = single_line(&cell.lines) else {
+            continue;
+        };
+        if line == "Amount paid" {
+            labels.push(index);
+        } else if let Some(amount) = amount_cell(line) {
+            values.push((index, amount, line.to_string()));
+        }
+    }
+    if labels.len() == 1 && values.len() == 1 {
+        let (_, amount, value_line) = &values[0];
+        let display = format!("Amount paid {value_line}");
+        if !matches!(body::stated_line(&display), StatedLine::Amount(ref parsed) if parsed == amount)
+        {
+            return;
+        }
+        push_row(
+            source,
+            &cells[labels[0]],
+            &cells[values[0].0],
+            scan,
+            HitDraft {
+                kind: "stated_amount_paid",
+                display,
+                amount_text: Some(amount.clone()),
+                period_start: None,
+                period_end: None,
+            },
+        );
+    } else if !labels.is_empty() && !values.is_empty() {
+        push_ambiguous(
+            source,
+            cells,
+            &labels,
+            &values
+                .iter()
+                .map(|(index, _, _)| *index)
+                .collect::<Vec<_>>(),
+            scan,
+            "stated_amount_paid",
+        );
+    }
+}
+
+fn pair_period(cells: &[RowCell], source: &str, scan: &mut Scan) {
+    let mut labels = Vec::new();
+    let mut values = Vec::new();
+    for (index, cell) in cells.iter().enumerate() {
+        let Some(line) = single_line(&cell.lines) else {
+            continue;
+        };
+        if line == "Service period" || line == "Service period:" {
+            labels.push(index);
+        } else if let Some((start, end)) = period_cell(line) {
+            values.push((index, start, end, line.to_string()));
+        }
+    }
+    if labels.len() == 1 && values.len() == 1 {
+        let (_, start, end, value_line) = &values[0];
+        let display = format!("Service period: {value_line}");
+        if !matches!(
+            body::stated_line(&display),
+            StatedLine::Period(ref parsed_start, ref parsed_end)
+                if parsed_start == start && parsed_end == end
+        ) {
+            return;
+        }
+        push_row(
+            source,
+            &cells[labels[0]],
+            &cells[values[0].0],
+            scan,
+            HitDraft {
+                kind: "stated_service_period",
+                display,
+                amount_text: None,
+                period_start: Some(start.clone()),
+                period_end: Some(end.clone()),
+            },
+        );
+    } else if !labels.is_empty() && !values.is_empty() {
+        push_ambiguous(
+            source,
+            cells,
+            &labels,
+            &values
+                .iter()
+                .map(|(index, _, _, _)| *index)
+                .collect::<Vec<_>>(),
+            scan,
+            "stated_service_period",
+        );
+    }
+}
+
+struct HitDraft {
+    kind: &'static str,
+    display: String,
+    amount_text: Option<String>,
+    period_start: Option<String>,
+    period_end: Option<String>,
+}
+
+fn push_row(source: &str, label: &RowCell, value: &RowCell, scan: &mut Scan, draft: HitDraft) {
+    let Some(span) = cover(source, &label.span, &value.span) else {
+        scan.span_broken = true;
+        return;
+    };
+    scan.hits.push(Hit {
+        kind: draft.kind,
+        display: draft.display,
+        usable: true,
+        reason: None,
+        amount_text: draft.amount_text,
+        period_start: draft.period_start,
+        period_end: draft.period_end,
+        byte_start: span.byte_start,
+        byte_end: span.byte_end,
+        scalar_start: span.scalar_start,
+        scalar_end: span.scalar_end,
+        excerpt: span.excerpt,
+        element: "tr".to_string(),
+        display_version: Some(ROW_DISPLAY),
+    });
+}
+
+fn push_ambiguous(
+    source: &str,
+    cells: &[RowCell],
+    labels: &[usize],
+    values: &[usize],
+    scan: &mut Scan,
+    kind: &'static str,
+) {
+    let mut involved = labels.to_vec();
+    involved.extend_from_slice(values);
+    let Some(first) = involved.first().copied() else {
+        return;
+    };
+    let Some(found) = cover(source, &cells[first].span, &cells[first].span) else {
+        scan.span_broken = true;
+        return;
+    };
+    let mut span = found;
+    for index in involved.into_iter().skip(1) {
+        let Some(next) = cover(source, &span, &cells[index].span) else {
+            scan.span_broken = true;
+            return;
+        };
+        span = next;
+    }
+    scan.hits.push(Hit {
+        kind,
+        display: String::new(),
+        usable: false,
+        reason: Some("ambiguous_association"),
+        amount_text: None,
+        period_start: None,
+        period_end: None,
+        byte_start: span.byte_start,
+        byte_end: span.byte_end,
+        scalar_start: span.scalar_start,
+        scalar_end: span.scalar_end,
+        excerpt: span.excerpt,
+        element: "tr".to_string(),
+        display_version: None,
+    });
+}
+
+fn amount_cell(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("USD ")?;
+    if body::usd_amount_text(rest) && !rest.contains(' ') {
+        Some(rest.to_string())
+    } else {
+        None
+    }
+}
+
+fn period_cell(line: &str) -> Option<(String, String)> {
+    let display = format!("Service period: {line}");
+    match body::stated_line(&display) {
+        StatedLine::Period(start, end) => Some((start, end)),
+        _ => None,
+    }
+}
+
+fn single_line(lines: &[String]) -> Option<&str> {
+    if lines.len() == 1 {
+        Some(lines[0].as_str())
+    } else {
+        None
+    }
+}
+
+fn cover(source: &str, left: &OwnedSpan, right: &OwnedSpan) -> Option<OwnedSpan> {
+    let start = left.byte_start.min(right.byte_start);
+    let end = left.byte_end.max(right.byte_end);
+    if !source.is_char_boundary(start) || !source.is_char_boundary(end) || end < start {
+        return None;
+    }
+    let excerpt = &source[start..end];
+    let scalar_start = source[..start].chars().count();
+    Some(OwnedSpan {
+        byte_start: start,
+        byte_end: end,
+        scalar_start,
+        scalar_end: scalar_start + excerpt.chars().count(),
+        excerpt: excerpt.to_string(),
+    })
 }
 
 fn is_block(name: &str) -> bool {
@@ -1188,9 +1528,72 @@ mod tests {
         );
         assert!(prepared.hits[0].excerpt.starts_with("<td>"));
         assert!(prepared.hits[0].excerpt.contains("&#46;"));
-        let split = "<table><tr><th>Amount paid</th><td>USD 15.99</td></tr></table>";
-        let split_prepared = extract(split);
-        assert_eq!(split_prepared.status, "no_match");
-        assert!(split_prepared.hits.is_empty());
+        assert_eq!(prepared.hits[0].display_version, Some("html-collapse-1"));
+    }
+
+    #[test]
+    fn same_tr_explicit_label_and_value_uses_one_source_slice() {
+        let source = concat!(
+            "<table>",
+            "<tr><th>Total</th><td>USD 40.00</td></tr>",
+            "<tr><th>Amount due</th><td>USD 40.00</td></tr>",
+            "<tr><th>Amount paid</th><td>USD <b>15&#46;99</b></td></tr>",
+            "<tr><th>Service period</th><td>2026-09-01 through 2026-09-30</td></tr>",
+            "</table>"
+        );
+        let prepared = extract(source);
+        assert_eq!(
+            prepared.status,
+            "matched",
+            "{}",
+            prepared.reason.clone().unwrap_or_default()
+        );
+        assert_eq!(prepared.hits.len(), 2);
+        let amount = &prepared.hits[0];
+        assert_eq!(amount.display, "Amount paid USD 15.99");
+        assert_eq!(amount.display_version, Some("html-row-stated-1"));
+        assert_eq!(amount.element, "tr");
+        assert_eq!(&source[amount.byte_start..amount.byte_end], amount.excerpt);
+        assert_eq!(
+            amount.excerpt,
+            "<th>Amount paid</th><td>USD <b>15&#46;99</b></td>"
+        );
+        assert_ne!(amount.excerpt, amount.display);
+        assert!(!amount.excerpt.contains("40.00"));
+        let period = &prepared.hits[1];
+        assert_eq!(
+            period.display,
+            "Service period: 2026-09-01 through 2026-09-30"
+        );
+        assert_eq!(period.display_version, Some("html-row-stated-1"));
+        assert_eq!(&source[period.byte_start..period.byte_end], period.excerpt);
+        assert!(period.excerpt.starts_with("<th>Service period</th>"));
+        assert_ne!(period.excerpt, period.display);
+
+        let wrong_row = concat!(
+            "<table><tr><th>Amount paid</th></tr>",
+            "<tr><td>USD 15.99</td></tr></table>"
+        );
+        assert_eq!(extract(wrong_row).status, "no_match");
+        let other_table = concat!(
+            "<table><tr><th>Amount paid</th></tr></table>",
+            "<table><tr><td>USD 15.99</td></tr></table>"
+        );
+        assert_eq!(extract(other_table).status, "no_match");
+        let nested = concat!(
+            "<table><tr><th>Amount paid</th><td><table><tr><td>USD 15.99</td></tr></table></td></tr></table>"
+        );
+        assert_eq!(extract(nested).status, "no_match");
+        let hidden = "<table><tr><th hidden>Amount paid</th><td>USD 15.99</td></tr></table>";
+        assert_eq!(extract(hidden).status, "no_match");
+        let ambiguous =
+            "<table><tr><th>Amount paid</th><td>USD 15.99</td><td>USD 10.00</td></tr></table>";
+        let ambiguous_prepared = extract(ambiguous);
+        assert_eq!(ambiguous_prepared.status, "conflict");
+        assert_eq!(
+            ambiguous_prepared.reason.as_deref(),
+            Some("ambiguous_association")
+        );
+        assert!(ambiguous_prepared.hits.iter().all(|hit| !hit.usable));
     }
 }

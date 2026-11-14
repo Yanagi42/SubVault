@@ -361,6 +361,16 @@ fn candidate_anchor(conn: &Connection, candidate_id: &str, source_id: &str) -> R
             map.insert("display_excerpt".into(), display);
         }
     }
+    if let Some(version) = anchor
+        .get("locator")
+        .and_then(|item| item.get("display_version"))
+        .filter(|item| item.is_string())
+        .cloned()
+    {
+        if let Some(map) = anchor.as_object_mut() {
+            map.insert("display_version".into(), version);
+        }
+    }
     Ok(anchor)
 }
 

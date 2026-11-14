@@ -144,7 +144,7 @@ fn a_table_cell_bill_round_trips_without_joining_neighbor_cells() {
         BILL.as_bytes()
     );
     let config = sql(&vault, "SELECT config_json FROM extraction_runs;");
-    assert!(config.contains("stated-html-blocks-2"), "{config}");
+    assert!(config.contains("stated-html-blocks-3"), "{config}");
     assert!(config.contains("td,th"), "{config}");
 
     let (code, facts) = run(&["facts", "--vault", vault.to_str().unwrap()]);
@@ -167,6 +167,7 @@ fn a_table_cell_bill_round_trips_without_joining_neighbor_cells() {
         amount["locator"]["display_excerpt"],
         "Amount paid USD 15.99"
     );
+    assert_eq!(amount["locator"]["display_version"], "html-collapse-1");
     assert!(!serde_json::to_string(&facts).unwrap().contains("99.99"));
 
     let fact_id = amount["fact_id"].as_str().unwrap();
@@ -354,11 +355,25 @@ fn table_limits_stay_closed() {
     .unwrap();
     let (code, body) = html(&split_vault, "split", &split);
     assert_eq!(code, 0, "{body}");
-    assert_eq!(body["extraction"], "no_match");
+    assert_eq!(body["extraction"], "matched");
     assert_eq!(body["preservation"], "preserved");
     let (code, facts) = run(&["facts", "--vault", split_vault.to_str().unwrap()]);
     assert_eq!(code, 0, "{facts}");
-    assert!(facts["facts"].as_array().unwrap().is_empty());
+    let paid = &facts["facts"][0];
+    assert_eq!(paid["fact_type"], "stated_amount_paid");
+    assert_eq!(paid["value"]["amount_text"], "15.99");
+    assert_eq!(paid["value"]["payment_verified"], false);
+    assert_eq!(paid["locator"]["display_version"], "html-row-stated-1");
+    let excerpt = paid["locator"]["locator"]["excerpt"].as_str().unwrap();
+    let bytes = fs::read(&split).unwrap();
+    let start = paid["locator"]["locator"]["byte_start"].as_u64().unwrap() as usize;
+    let end = paid["locator"]["locator"]["byte_end"].as_u64().unwrap() as usize;
+    assert_eq!(&bytes[start..end], excerpt.as_bytes());
+    assert_eq!(excerpt, "<th>Amount paid</th><td>USD 15.99</td>");
+    assert_ne!(
+        excerpt,
+        paid["locator"]["display_excerpt"].as_str().unwrap()
+    );
 
     let caption_vault = tmp.path.join("caption");
     let (code, body) = run(&[
