@@ -2,7 +2,7 @@
 
 这是可丢弃的合成验证，不是可试用产品。保护方式和主要输入都还没有选定。这里的明文库只用于测试，安全设计没有完成。
 
-T0 准备虚构原文和两份独立预期。T1 只证明一件事：原件字节被单独托管，并且失败时不会假装已经保全。T1 不解析订阅、不判断金额、不建立购买或权益，也不提供整理、全文搜索或提取。
+T0 准备虚构原文和两份独立预期。T1 只证明一件事：原件字节被单独托管，并且失败时不会假装已经保全。T1 不解析订阅、不判断金额、不建立购买或权益，也不提供整理或全文搜索。正文片段命令会另记来源载明的候选；那些候选不是事实，也不是购买或账户关系。
 
 ## T0
 
@@ -41,7 +41,7 @@ python3 synthetic/generate_corpus.py --check
 
 ## 命令与退出码
 
-`help`、`version`、`init`、`open`、`verify`、`recover`、`hold`、`import`、`read`、`marker`、`cancel`。标准输出是 JSON。每条回执都带 `slice=T1`、`user_ready=false`、`security_complete=false`、`purchase_id=null`、`entitlement_id=null`。
+`help`、`version`、`init`、`open`、`verify`、`recover`、`hold`、`import`、`read`、`marker`、`cancel`，以及下面的 `fragment` 和 `candidates`。T1 回执带 `slice=T1`。正文命令的回执带 `slice=T2a-body`。两者都带 `user_ready=false`、`security_complete=false`、`purchase_id=null`、`entitlement_id=null`。
 
 | 码 | 结果 |
 | --- | --- |
@@ -65,7 +65,7 @@ python3 synthetic/generate_corpus.py --check
 
 `--stop-at` 把检查点写到指定文件后发送 `SIGSTOP`。检查点文件出现只说明文件已经写完。行为测试再读到 `/proc/<pid>/status` 的 `State: T` 才发送 `SIGCONT`。等待的是这个状态。只在这台 Linux 上这样验证。`--inject enospc:POINT` 或 `--inject io_error:POINT` 把见证写到指定文件后返回未保全。注入回执里的 `injected` 是 true，并写明这不是磁盘真的满了。见证文件没有出现时，注入不算已经发生。`db_commit` 注入发生在真正的 `COMMIT` 之前，事务回滚，命令行不存在；它只证明确定的回滚，不是提交结果不确定。
 
-`cancel --kind extraction` 只返回 `extraction_cancel_not_available`。它不创建提取目录，也没有提取实现。保全命令在提交前可以取消。写者已经提交、但仍持有锁时，取消用 `mode=ro` 读取 WAL 里的命令行，返回 `AlreadyCommitted`，`cancel_applied` 为 false，`preservation` 为 `preserved`，不写 control 文件。版本检查仍用 `immutable=1`，那条连接故意看不见尚未检查点的 WAL，不能拿来判断命令是否提交，也不能用 journal 上的状态文字代替数据库。0 字节库、坏文件头和更高的 `user_version` 走与打开相同的非破坏边界。
+`cancel --kind extraction` 只返回 `extraction_cancel_not_available`。它不创建提取目录，也没有 PDF 提取实现。`cancel --kind fragment` 只取消一次正文提交。保全命令在提交前可以取消。写者已经提交、但仍持有锁时，取消用 `mode=ro` 读取 WAL 里的命令行，返回 `AlreadyCommitted`，`cancel_applied` 为 false，`preservation` 为 `preserved`，不写 control 文件。版本检查仍用 `immutable=1`，那条连接故意看不见尚未检查点的 WAL，不能拿来判断命令是否提交，也不能用 journal 上的状态文字代替数据库。0 字节库、坏文件头和更高的 `user_version` 走与打开相同的非破坏边界。
 
 SQLite 的 `COMMIT` 本身返回错误时，另开一条能看见 WAL 的连接：看得到命令行就是已提交，确定没有就是未保全。查询也失败才是退出码 21，reason 是 `commit_visibility_unknown`，`during` 是 `after_commit_error`。这条没有实跑。它和 `vault_unseen` 不是一路：`vault_unseen` 只说明还没看见历史，不说明 `COMMIT` 返回过错误。
 
@@ -113,6 +113,18 @@ scripts/run-t1-evidence.sh
 
 满盘注入始终标成注入。脚本里的 tmpfs 实验如果没有免密 `sudo`，会记为跳过；它不会去写满宿主盘。宿主盘满、WAL 的 `fsync` 返回 EIO 或 ENOSPC、提交语句中途被杀，都没有测。
 
+## 正文片段
+
+`fragment` 只接受调用者给出的一个文件。它不读标准输入、邮箱或剪贴板。文件必须是 UTF-8。空文件、超过 65536 字节、单行超过 1024 字节、以及超过 64 条候选，都拒绝发布候选。超长文件在读入正文之前拒绝，回执里的 `bytes_read` 是 0。接受下来的原始字节原样放进 `objects/`，不改外部文件，也不做 Unicode 规范化。
+
+媒体类型固定为 `text/plain;charset=utf-8`，`role` 是 `user_provided_fragment`。这不是完整邮件，`eml` 是 null。定位是这段版本化字符串上的 Unicode 标量区间，外加对应的 UTF-8 字节区间。规范化名是 `identity-utf8-scalars-1`，拼接名是 `single-fragment-1`，规则名是 `stated-lines-1`。这些和提取器 `subvault-body` 1 一起进入 logical key。
+
+候选只记录原文里写明的句子。`Amount paid USD 15.99`、带订单说明的 `Total USD 15.99`、带贷项说明的 `Total USD 15.99` 是三种语义，金额相同也不合并。单独的 `Total`、两处 `Total` 配一条说明、或两条互相冲突的说明，都是 `unresolved_total`，`usable` 为 false。服务期和“之后没有状态”不产生观察时间，`observed_at` 保持 null，`current_status` 保持 `unknown`。两行账户邮箱和一行掩码邮箱各自保留，`attributed` 为 false，不写账户关系。认不出来的行不生成候选。
+
+同 logical key 已经成功时，另一次提交返回 `AlreadyPublished`，不新增候选。失败和取消不写入永久失败；下一次提交使用新的 attempt。取消或晚到的发布不写入新的可用候选，已成功的候选和原件字节保留。`user_version` 保持 1。正文表由第一次成功路径上的事务添加，`meta.body_schema` 记为 `1`。这步失败会回滚，不改已有的 T1 行，也不抬高 `user_version`。已有 T1 库仍按原来的打开规则工作。PDF、OCR、T3 采纳和其它平台都没有做。
+
+`candidates` 只读查询。它不建表，也不写库。
+
 ## 这轮没有做
 
-整理、全文搜索、订阅规则、购买、权益、提取、导出、加密、真实数据导入、桌面壳和遥测都没有实现。T0/T1 通过不等于产品完成。
+整理、全文搜索、订阅规则、购买、权益、PDF 提取、OCR、导出、加密、真实数据导入、桌面壳和遥测都没有实现。正文候选不是事实。T0/T1 通过不等于产品完成。Linux 上的结果不代表 Windows。
