@@ -25,7 +25,12 @@ use super::{
     CancelRequest, HookRun, Hooks, RECOGNIZED_INJECTS,
 };
 
-const STOPS: &[&str] = &["before_journal", "before_copy", "before_publish"];
+const STOPS: &[&str] = &[
+    "before_journal",
+    "before_copy",
+    "object_ready",
+    "before_publish",
+];
 const INJECTS: &[&str] = &[
     "body_schema",
     "extract_status",
@@ -251,15 +256,29 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
 
     let object = place_object(&session.root, &session.conn, &bytes, &hash, &mut journal)?;
     let opened = open_attempt(&session.conn, &req, &journal, &object, &hash, &key)?;
-    journal.source_id = Some(opened.source_id.clone());
-    journal.object_id = Some(opened.object_id.clone());
-    journal.state = "object_ready".into();
-    write_journal(&session.root, &journal)?;
-    // The source row is committed. Later failures of this call must not fall
-    // through note_uncommitted's default NotPreserved. Pre-commit failures,
-    // including body_schema, return above this line and keep that default.
+    // open_attempt has committed the source row. Every return from here on,
+    // including the object_ready journal write, uses that boundary. Failures
+    // before this line, including body_schema, stay outside it.
     let source_id = opened.source_id.clone();
     let kept_hash = hash.clone();
+    let bound = |fail| after_source_committed(fail, &source_id, &kept_hash);
+    journal.source_id = Some(source_id.clone());
+    journal.object_id = Some(opened.object_id.clone());
+    journal.state = "object_ready".into();
+    hooks
+        .stop(
+            "object_ready",
+            checkpoint_map(
+                &req.command_id,
+                bytes.len() as u64,
+                Some(bytes.len() as u64),
+                Some(&hash),
+                true,
+                true,
+            ),
+        )
+        .map_err(&bound)?;
+    write_journal(&session.root, &journal).map_err(&bound)?;
     continue_after_source(
         &session,
         &req,
@@ -269,7 +288,7 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
         &text,
         &mut hooks,
     )
-    .map_err(|fail| after_source_committed(fail, &source_id, &kept_hash))
+    .map_err(bound)
 }
 
 fn continue_after_source(

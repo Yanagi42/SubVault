@@ -1291,6 +1291,97 @@ fn fragment_rejections_use_the_body_slice() {
     assert_eq!(opened.1["slice"], "T1");
 }
 
+#[test]
+fn object_ready_journal_io_keeps_the_committed_source() {
+    let tmp = Tmp::new("object-ready");
+    let vault = init(&tmp);
+    let old = tmp.path().join("old.txt");
+    write_file(&old, b"Amount paid USD 1.00\n");
+    let (code, first) = fragment(&vault, "old", &old);
+    assert_eq!(code, 0, "{first}");
+    let old_object = object_bytes(&vault, &first);
+    let old_candidate = first["candidate_ids"][0].clone();
+
+    let live = tmp.path().join("live.txt");
+    let live_bytes = b"Amount paid USD 9.00\n";
+    write_file(&live, live_bytes);
+    let checkpoint = tmp.path().join("ready.json");
+    let mut child = Command::new(bin())
+        .args([
+            "fragment",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            "live",
+            "--fragment",
+            live.to_str().unwrap(),
+            "--stop-at",
+            "object_ready",
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_stopped(&mut child, &checkpoint);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "2");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "1");
+    let journal_before = fs::read(vault.join("journal").join("live.json")).unwrap();
+    let mode = fs::metadata(vault.join("journal")).unwrap().permissions();
+    let mut blocked = mode.clone();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut blocked, 0o555);
+    fs::set_permissions(vault.join("journal"), blocked).unwrap();
+    resume(child.id());
+    let output = child.wait_with_output().unwrap();
+    fs::set_permissions(vault.join("journal"), mode).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(15),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["outcome"], "NotPublished");
+    assert_eq!(body["reason"], "io_error");
+    assert_eq!(body["during"], "journal_write");
+    assert_eq!(body["injected"], false);
+    assert_eq!(body["preservation"], "preserved");
+    assert_eq!(body["candidates_published"], false);
+    assert_eq!(body["new_effect"], false);
+    assert_eq!(body["slice"], "T2a-body");
+    let source_id = body["source_id"].as_str().unwrap();
+    assert!(source_id.starts_with("src_"));
+    assert_eq!(
+        fs::read(vault.join("journal").join("live.json")).unwrap(),
+        journal_before
+    );
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "2");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "1");
+    let rel = sql(
+        &vault,
+        &format!(
+            "SELECT relpath FROM objects WHERE object_id = (SELECT object_id FROM sources WHERE source_id='{source_id}');"
+        ),
+    );
+    assert_eq!(fs::read(vault.join(rel)).unwrap(), live_bytes);
+    assert_eq!(object_bytes(&vault, &first), old_object);
+
+    let (code, retried) = fragment(&vault, "live", &live);
+    assert_eq!(code, 0, "{retried}");
+    assert_eq!(retried["candidate_count"], 1);
+    assert_eq!(retried["preservation"], "preserved");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "2");
+    assert_eq!(object_bytes(&vault, &first), old_object);
+    let listed = candidates(&vault);
+    assert!(listed["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["candidate_id"] == old_candidate));
+}
+
 fn wait_stopped(child: &mut std::process::Child, checkpoint: &Path) {
     let start = Instant::now();
     loop {
