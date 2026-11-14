@@ -25,8 +25,9 @@ python3 synthetic/generate_corpus.py --check
 - 用随机的 `src_` 源身份指代这份原件。身份不是路径、文件名或内容哈希。
 - 把原始字节复制进 `objects/obj_<32 hex>`。对象名是内部身份，不是哈希，也不是原文件名。
 - 相同字节只保留一份对象。另一条路径或另一个文件名会新增一次 `occ_` 出现，并复用对象；这不会合并购买或权益，因为本层没有购买表。
-- 命令以调用者给出的 CommandId 记入 SQLite。同一 CommandId 再次执行时，先核对托管对象的当前字节。对象缺失或字节被改过时返回恢复所需，`new_effect` 为 false，不复制、不覆盖、不补回旧对象。托管字节仍完整时：外部路径已经不存在，返回当时的 `AlreadyCommitted`，`source_check` 为 `absent`，不再核对媒体类型，因为没有字节可读；路径还在但读不出来，返回 `source_unreadable`，这不是新的导入成功；路径可读且内容或媒体类型不同，返回 `payload_conflict`。显示名不在指纹里，只改显示名仍是 `AlreadyCommitted`，并保留第一次的显示名。
-- 回执里的 `preservation` 只有在 SQLite 提交成功之后才是 `preserved`。提交成功后的 journal、检查点或回执写入失败仍返回 `Committed`，并带 `post_commit_io`；这不能再写成确定的 `NotPreserved`。`arrangement` 固定为 `not_arranged`，`searchability` 固定为 `not_searchable`。数据库约束也拒绝其他值。
+- 命令以调用者给出的 CommandId 记入 SQLite。同一 CommandId 再次执行时，先核对托管对象的当前字节。对象缺失或字节被改过时返回恢复所需，`new_effect` 为 false，不复制、不覆盖、不补回旧对象。托管字节仍完整时：外部路径已经不存在，返回当时的 `AlreadyCommitted`，`source_check` 为 `absent`，不再核对媒体类型，因为没有字节可读；路径还在但读不出来，或路径不是普通文件，退出码 3，outcome 是 `ExternalUnverified`，reason 分别是 `source_unreadable` 和 `source_not_a_file`。`payload_verified` 为 false，`payload_matches` 为 null，`new_effect` 为 false。这条回执的 `preservation` 是刚才核对过的那个托管对象的 `preserved`，`object_intact` 为 true。读不到字节时不比较媒体类型，也不把这次失败当成载荷冲突。路径可读且内容或媒体类型不同，返回 `payload_conflict`，`payload_matches` 为 false，`new_effect` 为 false；这是本次请求被拒绝，已经核对过的托管对象仍是 `preserved`。显示名不在指纹里，只改显示名仍是 `AlreadyCommitted`，并保留第一次的显示名。
+- 回执里的 `preservation` 只有在 SQLite 提交成功并且这次调用核对过托管字节之后，才对那个源写成 `preserved`。提交成功后的 journal、检查点或回执写入失败仍返回 `Committed`，并带 `post_commit_io`；这不能再写成确定的 `NotPreserved`。`arrangement` 固定为 `not_arranged`，`searchability` 固定为 `not_searchable`。数据库约束也拒绝其他值。
+- 打开、`verify` 和 `recover` 共用一条路径。命令行已经存在而 journal 标签写不回去时，不把这次失败写成整个库 `NotPreserved`。各源仍按自己的行报告 `preservation=preserved` 和 `object_intact`。标签没写成是这次调用的另一件事：退出码 3，`IntegrityAlert`，`journal_label_update` 为 `failed`，`new_effect` 为 false。重复打开的回执相同，不改对象字节，journal 文件保持原文字。同一条已提交命令再次导入仍是 `AlreadyCommitted`，回执同时带上标签没能更新；这不是 `NotPreserved`。还没有命令行的 journal 不会被改写成已提交，那条未完成命令仍是 `not_preserved`，已经提交的源仍是 `preserved`。`vault.db` 这个文件读不出来时退出码 21，reason 是 `vault_unreadable`，`new_effect` 为 null，回执里没有 `preservation`。那是这次打不开数据库文件，不是 `COMMIT` 失败，也不是断电或坏盘。
 
 `user_marker` 是一条已提交的观察用文本，用来确认后来的导入、失败和重试没有改掉旧值。它不是订阅事实。导入不会改写它。
 
@@ -38,19 +39,19 @@ python3 synthetic/generate_corpus.py --check
 | --- | --- |
 | 0 | 完成、已提交过、已取消、取消已挂起，或打开后就绪 |
 | 2 | 用法错误 |
-| 3 | 有告警且引用没有悬空，例如对象路径被拒绝但规范路径上的字节仍完整 |
+| 3 | 有告警且引用没有悬空。对象路径被拒绝但规范路径上的字节仍完整，或 journal 标签没能改写但托管字节仍完整，都走这里。已提交命令的外部路径读不出或不是文件时，导入也用 3，outcome 是 `ExternalUnverified` |
 | 10 | 不是库。缺失路径不会被创建 |
 | 11 | 另一个进程持有写锁 |
 | 12 | 需要恢复：对象缺失或哈希不符、悬空引用、无法读取的 journal、成功回执不是 JSON 对象 |
 | 13 | 数据库头损坏。打开和取消都不重建该文件 |
 | 14 | `user_version` 高于 1。打开和取消都不迁移、不覆盖 |
-| 15 | 没有保全。包含真实 IO 错误，以及测试注入的错误 |
+| 15 | 没有保全。用于这次命令还没有提交成功，包括真实 IO 错误和测试注入。已经核对过托管字节的历史命令，不用这个结果否定那次保全 |
 | 16 | 拒绝。载荷冲突、代次不符，或提取取消 |
 | 17 | 请求的故障点在这次命令上不可能到达。命令不会假装成功 |
 | 18 | 文件系统被识别为 NFS 或 SMB/CIFS |
 | 19 | 横幅不是合成库横幅 |
 | 20 | 请求的停止点没有到达 |
-| 21 | 提交结果无法确定。回执带 CommandId，`new_effect` 为 null，不猜测是否已保全。这次没有能安全造出的实测 |
+| 21 | 提交结果无法确定，或这次读不到 `vault.db`。读不到文件时 reason 是 `vault_unreadable`，`new_effect` 为 null，不写 `preservation`。这是真实的权限错误，不是注入，也不是 `COMMIT` 或 WAL `fsync` 失败。后两条仍没有实测 |
 
 `--stop-at during_copy` 在对象发布前停下，包括 0 字节、1 字节、2 字节，以及把第一次 `read` 强制成 1 字节的情况。多字节读取会留下短于全文的前缀。这个强制短读只作用于路径名含 `SHORTREAD-` 的文件，不是 ext4 自然短读，也不是故障注入。一次复制只停一次，恢复后把剩余字节写完。
 
@@ -76,7 +77,7 @@ control/<command-id>
 
 SQLite 使用捆绑的 3.46.0，WAL，`synchronous=FULL`，`foreign_keys=ON`，`busy_timeout=0`，`user_version=1`。表是 `meta`、`objects`、`sources`、`occurrences`、`commands`。打开和取消在 `Connection::open` 之前先检查 `SQLite format 3` 文件头，避免 0 字节或坏文件被 SQLite 初始化成空库。
 
-打开、`verify` 和 `recover` 走同一条内部路径：删除 `staging/` 里的临时文件以及 journal 的临时名，不删除 `objects/` 里的文件。journal 只有在对应命令行已经存在时才标成 committed；恢复不会根据对象文件名插入源或购买。未引用对象保持未引用，直到同一个 CommandId 带着匹配字节重试。恢复可以重复执行。
+打开、`verify` 和 `recover` 走同一条内部路径：删除 `staging/` 里的临时文件以及 journal 的临时名，不删除 `objects/` 里的文件。journal 只有在对应命令行已经存在时才尝试标成 committed。标签写失败留在 `journal_label_update=failed`，不中断这份报告，也不把已提交的源改成未保全。恢复不会根据对象文件名插入源或购买。未引用对象保持未引用，直到同一个 CommandId 带着匹配字节重试。恢复可以重复执行。
 
 journal 是一份字段表生成的 JSON。未知键被忽略。可选字段缺失和 JSON null 相同。进行中的 journal 可以还没有 `payload_fingerprint`；这表示哈希还没记下，不是已提交结果被二次套用。手改删掉指纹属于损坏，不按普通的双应用缺陷处理。成功回执若不是 JSON 对象，重放返回退出码 12，不另建一套回执模式。
 
@@ -100,7 +101,7 @@ scripts/run-t1-evidence.sh
 
 证据脚本把环境、测试输出、JSONL、二进制哈希、许可证文本和可选的小 tmpfs 实验写到 `/opt/cursor/artifacts/subvault-t0-t1/`。测试耗时只是该次运行的起止时间，不是用户版本的性能结论。
 
-行为测试依赖 `sha256sum`、`sqlite3`、`python3`、`cp`、`kill` 和 `gcc`。`sqlite3` 只用来篡改已经写成文档的库格式。`gcc` 只编译测试里的短读探针。短读探针、`--inject` 和真实的目录权限错误是三件不同的事：探针强制一次 1 字节读取，注入在回执里标 `injected: true`，journal 目录 `0555` 是真实的 `EACCES`，不是满盘，也不是注入。
+行为测试依赖 `sha256sum`、`sqlite3`、`python3`、`cp`、`kill` 和 `gcc`。`sqlite3` 只用来篡改已经写成文档的库格式。`gcc` 只编译测试里的短读探针。短读探针、`--inject` 和真实的目录权限错误是三件不同的事：探针强制一次 1 字节读取，注入在回执里标 `injected: true`，journal 目录 `0555` 是真实的 `EACCES`，不是满盘，也不是注入。提交后的导入回执仍是 `Committed`；目录保持不可写时，随后的打开是退出码 3 的告警。`vault.db` 被设成 `000` 时打开是退出码 21 的 `vault_unreadable`，不是未保全，也不是就绪。
 
 满盘注入始终标成注入。脚本里的 tmpfs 实验如果没有免密 `sudo`，会记为跳过；它不会去写满宿主盘。宿主盘满、WAL 的 `fsync` 返回 EIO 或 ENOSPC、提交语句中途被杀，都没有测。
 

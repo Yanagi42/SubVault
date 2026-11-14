@@ -22,9 +22,10 @@ use crate::journal::{
 use crate::lockfile::{self, sigstop, VaultLock, LOCK_TEXT};
 use crate::model::{
     capabilities, db_fail, honesty, io_fail, platform_limits, Fail, Report, EXIT_DAMAGED,
-    EXIT_FAULT_MISSED, EXIT_LOCKED, EXIT_NOT_PRESERVED, EXIT_NOT_SYNTHETIC, EXIT_NOT_VAULT,
-    EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_STOP_MISSED, EXIT_UNCERTAIN, EXIT_UNSUPPORTED_FS,
-    EXIT_USAGE, EXIT_VERSION, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE, PRESERVED, VAULT_BANNER,
+    EXIT_FAULT_MISSED, EXIT_INTEGRITY, EXIT_LOCKED, EXIT_NOT_PRESERVED, EXIT_NOT_SYNTHETIC,
+    EXIT_NOT_VAULT, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_STOP_MISSED, EXIT_UNCERTAIN,
+    EXIT_UNSUPPORTED_FS, EXIT_USAGE, EXIT_VERSION, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE,
+    PRESERVED, VAULT_BANNER,
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
@@ -291,8 +292,9 @@ fn reopen(path: &Path) -> Report {
 fn reopen_inner(path: &Path) -> Result<Report, Fail> {
     let session = open_session(path)?;
     journal::clean_temps(&session.root)?;
-    journal::reconcile(&session.root, &session.conn)?;
-    let inspection = crate::inspect::report(&session.root, &session.conn, session.magic)?;
+    let label_misses = journal::reconcile(&session.root, &session.conn)?;
+    let mut inspection = crate::inspect::report(&session.root, &session.conn, session.magic)?;
+    apply_label_misses(&mut inspection, &label_misses);
     store::checkpoint(&session.conn).map_err(|err| db_fail(err, "checkpoint"))?;
     Ok(inspection)
 }
@@ -367,11 +369,14 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
         }
     }
     let session = open_session(&req.vault)?;
-    journal::reconcile(&session.root, &session.conn)?;
+    let label_misses = journal::reconcile(&session.root, &session.conn)?;
     if let Some(existing) = store::command(&session.conn, &req.command_id)
         .map_err(|err| db_fail(err, "command_lookup"))?
     {
-        return replay_committed(&session, &req, &existing);
+        return match replay_committed(&session, &req, &existing) {
+            Ok(body) => Ok(stamp_label_misses_value(body, &label_misses)),
+            Err(fail) => Err(stamp_label_misses_fail(fail, &label_misses)),
+        };
     }
     let meta = require_new_source(&req.source)?;
     let display_default = req
@@ -697,12 +702,10 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
                 "FaultNotReached",
                 "command_already_committed",
             )
-            .extra("injected", json!(req.hooks.inject_point.is_some())));
+            .extra("injected", json!(req.hooks.inject_point.is_some()))
+            .extra("new_effect", json!(false))
+            .extra("command_id", json!(req.command_id)));
         }
-        if existing.payload_fingerprint != fingerprint {
-            return Err(payload_conflict(&req.command_id));
-        }
-        let receipt = already_committed(&existing)?;
         let source = store::source_by_id(&session.conn, &req.source_id)
             .map_err(|err| db_fail(err, "source_lookup"))?
             .ok_or_else(|| {
@@ -710,7 +713,10 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
                     .extra("new_effect", json!(false))
             })?;
         confirm_source_bytes(&session, &source, &req.command_id)?;
-        return Ok(receipt);
+        if existing.payload_fingerprint != fingerprint {
+            return Err(checked_conflict(&req.command_id, &source));
+        }
+        return already_committed(&existing);
     }
     let source = store::source_by_id(&session.conn, &req.source_id)
         .map_err(|err| db_fail(err, "source_lookup"))?
@@ -1037,12 +1043,28 @@ fn banner_exact(path: &Path) -> Result<bool, Fail> {
 }
 
 fn sqlite_header_ok(path: &Path) -> Result<bool, Fail> {
-    let mut file = File::open(path).map_err(|err| io_fail(err, "sqlite_header"))?;
+    // Opening the file failed, or the read itself failed. That is this call's
+    // inability to see the database, not a COMMIT result and not evidence that
+    // the stored bytes are unpreserved. A short or mismatched header is still
+    // a damaged file, because those bytes were actually read.
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) => return Err(vault_unreadable(&err, "sqlite_header")),
+    };
     let mut buf = [0u8; 16];
-    let n = file
-        .read(&mut buf)
-        .map_err(|err| io_fail(err, "sqlite_header"))?;
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(err) => return Err(vault_unreadable(&err, "sqlite_header")),
+    };
     Ok(n == 16 && &buf == b"SQLite format 3\0")
+}
+
+fn vault_unreadable(err: &io::Error, during: &str) -> Fail {
+    Fail::new(EXIT_UNCERTAIN, "Uncertain", "vault_unreadable")
+        .extra("during", json!(during))
+        .extra("os_error", json!(err.to_string()))
+        .extra("new_effect", Value::Null)
+        .extra("injected", json!(false))
 }
 
 fn inspect_version_readonly(path: &Path) -> Result<(), Fail> {
@@ -1580,6 +1602,8 @@ enum SourceView {
     Ready { hash: String, len: u64 },
 }
 
+/// What the external path looks like on this call. This does not say whether
+/// a previously hosted object is intact; the caller already checked that.
 fn classify_source(path: &Path) -> SourceView {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -1598,6 +1622,8 @@ fn classify_source(path: &Path) -> SourceView {
     }
 }
 
+/// First import of a command that has no hosted object yet. A missing or
+/// unreadable source here means this command was not preserved.
 fn require_new_source(path: &Path) -> Result<fs::Metadata, Fail> {
     let meta = fs::symlink_metadata(path).map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
@@ -1639,7 +1665,8 @@ fn replay_committed(
             "command_already_committed",
         )
         .extra("injected", json!(req.hooks.inject_point.is_some()))
-        .extra("preservation", json!(NOT_PRESERVED)));
+        .extra("new_effect", json!(false))
+        .extra("command_id", json!(req.command_id)));
     }
     let mut receipt = already_committed(existing)?;
     let source_id = receipt
@@ -1674,32 +1701,30 @@ fn replay_committed(
             }
             Ok(receipt)
         }
-        SourceView::Unreadable(message) => {
-            Err(
-                Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "source_unreadable")
-                    .extra("os_error", json!(message))
-                    .extra("new_effect", json!(false))
-                    .extra("injected", json!(false))
-                    .extra("preservation", json!(NOT_PRESERVED))
-                    .extra("command_id", json!(req.command_id)),
-            )
-        }
-        SourceView::NotFile => {
-            Err(
-                Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "source_not_a_file")
-                    .extra("new_effect", json!(false))
-                    .extra("injected", json!(false))
-                    .extra("preservation", json!(NOT_PRESERVED))
-                    .extra("command_id", json!(req.command_id)),
-            )
-        }
-        SourceView::TooLarge(len) => {
-            Err(payload_conflict(&req.command_id).extra("byte_length", json!(len)))
-        }
+        SourceView::Unreadable(message) => Err(external_unverified(
+            &receipt,
+            &req.command_id,
+            &req.media_type,
+            "source_unreadable",
+            "unreadable",
+            Some(message),
+        )),
+        SourceView::NotFile => Err(external_unverified(
+            &receipt,
+            &req.command_id,
+            &req.media_type,
+            "source_not_a_file",
+            "not_a_file",
+            None,
+        )),
+        SourceView::TooLarge(len) => Err(checked_conflict(&req.command_id, &source)
+            .extra("byte_length", json!(len))
+            .extra("requested_media_type", json!(req.media_type))),
         SourceView::Ready { hash, len } => {
             let fingerprint = fingerprint(&["import", &hash, &req.media_type]);
             if fingerprint != existing.payload_fingerprint || len as i64 != source.byte_length {
-                return Err(payload_conflict(&req.command_id));
+                return Err(checked_conflict(&req.command_id, &source)
+                    .extra("requested_media_type", json!(req.media_type)));
             }
             if let Some(map) = receipt.as_object_mut() {
                 map.insert("source_check".into(), json!("matched"));
@@ -1774,8 +1799,122 @@ fn bad_object(reason: &str) -> Fail {
 fn payload_conflict(command_id: &str) -> Fail {
     Fail::new(EXIT_REJECTED, "Rejected", "payload_conflict")
         .extra("command_id", json!(command_id))
-        .extra("preservation", json!(NOT_PRESERVED))
         .extra("new_effect", json!(false))
+        .extra("payload_matches", json!(false))
+        .extra("request_result", json!("rejected"))
+}
+
+fn checked_conflict(command_id: &str, source: &SourceRow) -> Fail {
+    payload_conflict(command_id)
+        .extra("preservation", json!(PRESERVED))
+        .extra("object_intact", json!(true))
+        .extra("source_id", json!(source.source_id))
+        .extra("object_id", json!(source.object_id))
+        .extra("content_sha256", json!(source.content_sha256))
+        .extra("media_type", json!(source.media_type))
+}
+
+/// Hosted bytes for this command were checked. This call could not read the
+/// external path, so the payload match is unknown and the hosted source stays
+/// preserved. Media type is not compared here: unread bytes are not a conflict.
+fn external_unverified(
+    receipt: &Value,
+    command_id: &str,
+    requested_media: &str,
+    reason: &'static str,
+    source_check: &str,
+    os_error: Option<String>,
+) -> Fail {
+    let mut fail = Fail::new(EXIT_INTEGRITY, "ExternalUnverified", reason)
+        .extra("preservation", json!(PRESERVED))
+        .extra("object_intact", json!(true))
+        .extra("new_effect", json!(false))
+        .extra("injected", json!(false))
+        .extra("payload_verified", json!(false))
+        .extra("payload_matches", Value::Null)
+        .extra("source_check", json!(source_check))
+        .extra("journal_label_update", json!("not_attempted"))
+        .extra("request_result", json!("external_unverified"))
+        .extra("command_id", json!(command_id))
+        .extra("requested_media_type", json!(requested_media));
+    if let Some(message) = os_error {
+        fail = fail.extra("os_error", json!(message));
+    }
+    for key in [
+        "source_id",
+        "object_id",
+        "content_sha256",
+        "byte_length",
+        "media_type",
+        "occurrence_id",
+    ] {
+        if let Some(value) = receipt.get(key) {
+            fail = fail.extra(key, value.clone());
+        }
+    }
+    fail
+}
+
+fn label_miss_json(misses: &[journal::LabelMiss]) -> Value {
+    json!(misses
+        .iter()
+        .map(|miss| {
+            json!({
+                "command_id": miss.command_id,
+                "during": miss.during,
+                "os_error": miss.os_error,
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+fn stamp_label_misses_value(mut body: Value, misses: &[journal::LabelMiss]) -> Value {
+    if misses.is_empty() {
+        return body;
+    }
+    if let Some(map) = body.as_object_mut() {
+        map.insert("journal_label_update".into(), json!("failed"));
+        map.insert("journal_write_errors".into(), label_miss_json(misses));
+    }
+    body
+}
+
+fn stamp_label_misses_fail(fail: Fail, misses: &[journal::LabelMiss]) -> Fail {
+    if misses.is_empty() {
+        return fail;
+    }
+    fail.extra("journal_label_update", json!("failed"))
+        .extra("journal_write_errors", label_miss_json(misses))
+}
+
+fn apply_label_misses(report: &mut Report, misses: &[journal::LabelMiss]) {
+    if misses.is_empty() {
+        return;
+    }
+    let Some(body) = report.body.as_object_mut() else {
+        return;
+    };
+    if let Some(alerts) = body
+        .entry("alerts")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+    {
+        for miss in misses {
+            alerts.push(json!({
+                "code": "journal_label_not_updated",
+                "command_id": miss.command_id,
+                "during": miss.during,
+                "os_error": miss.os_error,
+            }));
+        }
+    }
+    body.insert("journal_label_update".into(), json!("failed"));
+    body.insert("journal_write_errors".into(), label_miss_json(misses));
+    body.insert("new_effect".into(), json!(false));
+    if report.code == EXIT_OK {
+        report.code = EXIT_INTEGRITY;
+        body.insert("outcome".into(), json!("IntegrityAlert"));
+    }
 }
 
 fn refuse_unreached_object_fsync(hooks: &HookRun) -> Result<(), Fail> {

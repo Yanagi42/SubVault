@@ -234,7 +234,17 @@ pub(crate) fn scan(root: &Path) -> Result<Scan, Fail> {
     Ok(scan)
 }
 
-pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<(), Fail> {
+pub(crate) struct LabelMiss {
+    pub command_id: String,
+    pub during: String,
+    pub os_error: String,
+}
+
+/// Rewrite a journal label only when that command row is already committed.
+/// A failed rewrite is returned to the caller. It is not a verdict that the
+/// committed row or its hosted bytes were lost.
+pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<Vec<LabelMiss>, Fail> {
+    let mut missed = Vec::new();
     for journal in scan(root)?.valid {
         if journal.state == "committed" {
             continue;
@@ -246,10 +256,26 @@ pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<(), Fail> {
             let mut journal = journal;
             journal.state = "committed".into();
             journal.reason = None;
-            write(root, &journal)?;
+            if let Err(fail) = write(root, &journal) {
+                missed.push(LabelMiss {
+                    command_id: journal.command_id,
+                    during: fail
+                        .extra
+                        .get("during")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("journal_write")
+                        .to_string(),
+                    os_error: fail
+                        .extra
+                        .get("os_error")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(fail.reason.as_str())
+                        .to_string(),
+                });
+            }
         }
     }
-    Ok(())
+    Ok(missed)
 }
 
 pub(crate) fn clean_temps(root: &Path) -> Result<(), Fail> {
