@@ -643,12 +643,109 @@ fn html_boundaries_do_not_wipe_or_invent_facts() {
     assert_eq!(sql(&replay, "SELECT count(*) FROM sources;"), "1");
     assert_eq!(object_bytes(&replay, &object_id), BILL.as_bytes());
 
+    let facts_before = sql(&replay, "SELECT count(*) FROM facts;");
     let same = write_source(&tmp, "same.html", BILL.as_bytes());
     let (code, preserved) = html(&replay, "same", &same);
     assert_eq!(code, 0, "{preserved}");
     assert_eq!(preserved["outcome"], "AlreadyPreserved");
     assert_eq!(preserved["new_effect"], false);
+    assert_eq!(preserved["facts_created"], false);
+    assert_eq!(preserved["content_identity"], "same_bytes");
+    assert_eq!(preserved["db_committed"], true);
+    assert_eq!(preserved["source_id"], first["source_id"]);
     assert_eq!(sql(&replay, "SELECT count(*) FROM sources;"), "1");
+    assert_eq!(sql(&replay, "SELECT count(*) FROM facts;"), facts_before);
+    assert_eq!(
+        sql(
+            &replay,
+            "SELECT count(*) FROM commands WHERE command_id = 'same';"
+        ),
+        "1"
+    );
+    assert_eq!(
+        sql(
+            &replay,
+            "SELECT count(*) FROM t3_receipts WHERE command_id = 'same';"
+        ),
+        "1"
+    );
+    fs::remove_file(&same).unwrap();
+    let (code, unread) = html(&replay, "same", &same);
+    assert_eq!(code, 0, "{unread}");
+    assert_eq!(unread["new_effect"], false);
+    assert_eq!(unread["facts_created"], false);
+    assert_eq!(unread["external_reread"], false);
+    assert!(unread["payload_matches"].is_null());
+    assert_eq!(sql(&replay, "SELECT count(*) FROM facts;"), facts_before);
+    fs::write(&same, b"<p>Amount paid USD 3.00</p>").unwrap();
+    let (code, again) = html(&replay, "same", &same);
+    assert_eq!(code, 16, "{again}");
+    assert_eq!(again["reason"], "payload_conflict");
+    assert_eq!(again["new_effect"], false);
+    assert_eq!(sql(&replay, "SELECT count(*) FROM sources;"), "1");
+    assert_eq!(sql(&replay, "SELECT count(*) FROM facts;"), facts_before);
+    assert_eq!(object_bytes(&replay, &object_id), BILL.as_bytes());
+}
+
+#[test]
+fn html_command_ids_stay_occupied_across_kinds() {
+    let tmp = Tmp::new("occupy");
+    let vault = init(&tmp, "vault", "4");
+    let source = write_source(&tmp, "a.html", BILL.as_bytes());
+    let (code, imported) = html(&vault, "html-a", &source);
+    assert_eq!(code, 0, "{imported}");
+    let (code, facts) = run(&["facts", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{facts}");
+    let amount = fact_of(&facts, "stated_amount_paid");
+    let fact_id = amount["fact_id"].as_str().unwrap();
+    let (code, corrected) = run(&[
+        "correct",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "fix-a",
+        "--fact-id",
+        fact_id,
+        "--expected-revision",
+        "1",
+        "--amount-text",
+        "12.00",
+        "--actor-id",
+        ACTOR,
+    ]);
+    assert_eq!(code, 0, "{corrected}");
+    let other = write_source(&tmp, "b.html", b"<p>Amount paid USD 4.00</p>");
+    let (code, occupied) = html(&vault, "fix-a", &other);
+    assert_eq!(code, 16, "{occupied}");
+    assert_eq!(occupied["reason"], "command_kind_conflict");
+    assert_eq!(occupied["new_effect"], false);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "1");
+    let (code, reused) = run(&[
+        "correct",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "html-a",
+        "--fact-id",
+        fact_id,
+        "--expected-revision",
+        "2",
+        "--amount-text",
+        "8.00",
+        "--actor-id",
+        ACTOR,
+    ]);
+    assert_eq!(code, 16, "{reused}");
+    assert_eq!(reused["reason"], "payload_conflict");
+    assert_eq!(reused["decision_committed"], false);
+    assert_eq!(reused["facts_changed"], false);
+    let (code, facts_after) = run(&["facts", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{facts_after}");
+    assert_eq!(
+        fact_of(&facts_after, "stated_amount_paid")["value"]["amount_text"],
+        "12.00"
+    );
+    assert_eq!(fact_of(&facts_after, "stated_amount_paid")["revision"], 2);
 }
 
 #[test]

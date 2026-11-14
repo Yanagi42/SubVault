@@ -91,20 +91,17 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
     {
         return replay(&session, &req, &existing);
     }
+    // A T3 receipt occupies this command id for every kind. Preservation is
+    // not a second fact commit.
+    super::decide::reject_if_t3_command(&session.conn, &req.command_id)?;
     let bytes = read_html(&req.source)?;
     let text = std::str::from_utf8(&bytes).expect("read_html accepted utf-8");
-    if let Some(source) = store::source_by_hash(&session.conn, &sha256_bytes(&bytes))
-        .map_err(|err| db_fail(err, "source_lookup"))?
+    let hash = sha256_bytes(&bytes);
+    if let Some(source) =
+        store::source_by_hash(&session.conn, &hash).map_err(|err| db_fail(err, "source_lookup"))?
     {
         confirm_object(&session.root, &source)?;
-        let mut body = honesty("AlreadyPreserved");
-        body.insert("new_effect".into(), json!(false));
-        body.insert("preservation".into(), json!(PRESERVED));
-        body.insert("object_intact".into(), json!(true));
-        body.insert("source_id".into(), json!(source.source_id));
-        body.insert("content_sha256".into(), json!(source.content_sha256));
-        body.insert("media_type".into(), json!(source.media_type));
-        return Ok(Value::Object(body));
+        return persist_reuse(&session, &req, &source, &hash);
     }
     let sources = store::list_sources(&session.conn).map_err(|err| db_fail(err, "list_sources"))?;
     if !sources.is_empty() {
@@ -113,7 +110,6 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
             .extra("preservation", json!(PRESERVED)));
     }
     let mut journal = start_journal(&session.root, &req)?;
-    let hash = sha256_bytes(&bytes);
     let key = logical_key(&hash);
     journal.content_sha256 = Some(hash.clone());
     journal.byte_length = Some(bytes.len() as i64);
@@ -313,6 +309,145 @@ fn confirm_hosted(root: &Path, object: &ObjectRow, hash: &str, len: i64) -> Resu
         );
     }
     Ok(())
+}
+
+fn persist_reuse(
+    session: &super::Session,
+    req: &HtmlRequest,
+    source: &SourceRow,
+    hash: &str,
+) -> Result<Value, Fail> {
+    let key = logical_key(hash);
+    let mut journal = start_journal(&session.root, req)?;
+    journal.content_sha256 = Some(hash.to_string());
+    journal.byte_length = Some(source.byte_length);
+    journal.payload_fingerprint = Some(key.clone());
+    journal.object_id = Some(source.object_id.clone());
+    journal.source_id = Some(source.source_id.clone());
+    journal.storage_reused = Some(true);
+    journal.media_type = Some(source.media_type.clone());
+    journal::write(&session.root, &journal)?;
+    let result = (|| -> Result<Value, Fail> {
+        let tx = session
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| db_fail(err, "begin"))?;
+        if store::command(&tx, &req.command_id)
+            .map_err(|err| db_fail(err, "command_recheck"))?
+            .is_some()
+        {
+            return Err(
+                Fail::new(EXIT_REJECTED, "Rejected", "command_kind_conflict")
+                    .extra("new_effect", json!(false))
+                    .extra("facts_created", json!(false)),
+            );
+        }
+        super::decide::reject_if_t3_command(&tx, &req.command_id)?;
+        let current =
+            store::source_by_hash(&tx, hash).map_err(|err| db_fail(err, "source_recheck"))?;
+        let Some(current) = current else {
+            return Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_missing")
+                    .extra("new_effect", json!(false))
+                    .extra("facts_created", json!(false)),
+            );
+        };
+        if current.source_id != source.source_id || current.object_id != source.object_id {
+            return Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_missing")
+                    .extra("new_effect", json!(false))
+                    .extra("facts_created", json!(false)),
+            );
+        }
+        let occurrence_id = journal.occurrence_id.clone().ok_or_else(|| {
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "occurrence_missing")
+                .extra("new_effect", json!(false))
+                .extra("facts_created", json!(false))
+        })?;
+        store::insert_occurrence(
+            &tx,
+            &OccurrenceRow {
+                occurrence_id,
+                source_id: source.source_id.clone(),
+                command_id: req.command_id.clone(),
+                batch_id: journal.batch_id.clone().unwrap_or_default(),
+                display_name: journal
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| "source".into()),
+                external_path: journal.external_path.clone(),
+                storage_reused: true,
+                recorded_at: super::now_ms(),
+            },
+        )
+        .map_err(|err| db_fail(err, "insert_occurrence"))?;
+        let mut body = reuse_body(req, source, hash, &key);
+        let encoded = serde_json::to_string(&body)
+            .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
+        store::insert_command(
+            &tx,
+            &CommandRow {
+                command_id: req.command_id.clone(),
+                kind: "html".into(),
+                payload_fingerprint: key.clone(),
+                result_json: encoded.clone(),
+                outcome: "AlreadyPreserved".into(),
+            },
+            super::now_ms(),
+        )
+        .map_err(|err| db_fail(err, "insert_command"))?;
+        let canonical = html_canonical(hash, &key, "reused");
+        super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+        tx.commit().map_err(|err| db_fail(err, "commit"))?;
+        if let Some(map) = body.as_object_mut() {
+            map.insert("db_committed".into(), json!(true));
+        }
+        Ok(body)
+    })();
+    match result {
+        Ok(body) => {
+            journal.state = "committed".into();
+            journal.reason = None;
+            match journal::write(&session.root, &journal) {
+                Ok(()) => Ok(body),
+                Err(fail) => {
+                    let mut body = body;
+                    if let Some(map) = body.as_object_mut() {
+                        map.insert("post_commit_io".into(), json!(true));
+                        map.insert("journal_label_update".into(), json!("failed"));
+                        map.insert("new_effect".into(), json!(false));
+                        map.insert("facts_created".into(), json!(false));
+                        map.insert("preservation".into(), json!(PRESERVED));
+                        if let Some(during) = fail.extra.get("during") {
+                            map.insert("during".into(), during.clone());
+                        }
+                    }
+                    Ok(body)
+                }
+            }
+        }
+        Err(fail) => {
+            let _ = abort_journal(&session.root, &mut journal, "reuse_not_committed");
+            Err(fail.extra("facts_created", json!(false)))
+        }
+    }
+}
+
+fn reuse_body(req: &HtmlRequest, source: &SourceRow, hash: &str, key: &str) -> Value {
+    let mut body = honesty("AlreadyPreserved");
+    body.insert("new_effect".into(), json!(false));
+    body.insert("facts_created".into(), json!(false));
+    body.insert("preservation".into(), json!(PRESERVED));
+    body.insert("object_intact".into(), json!(true));
+    body.insert("content_identity".into(), json!("same_bytes"));
+    body.insert("command_id".into(), json!(req.command_id));
+    body.insert("source_id".into(), json!(source.source_id));
+    body.insert("object_id".into(), json!(source.object_id));
+    body.insert("content_sha256".into(), json!(hash));
+    body.insert("byte_length".into(), json!(source.byte_length));
+    body.insert("media_type".into(), json!(source.media_type));
+    body.insert("logical_key".into(), json!(key));
+    Value::Object(body)
 }
 
 fn replay(
