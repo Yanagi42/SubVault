@@ -85,7 +85,32 @@ mod linux {
         Ok(buf.f_type)
     }
 
-    /// `sync_all` on the opened directory. A failure is returned.
+    /// Parent directory already opened for one no-replace rename.
+    /// The caller syncs this same file, then drops it.
+    /// `Drop` closes the fd. It does not sync.
+    pub struct PublishedDir {
+        parent: File,
+    }
+
+    impl PublishedDir {
+        pub fn hold(parent: File) -> Self {
+            Self { parent }
+        }
+
+        /// `fstat` of this open file. This is not a path lookup.
+        pub fn device_and_inode(&self) -> io::Result<(u64, u64)> {
+            let meta = self.parent.metadata()?;
+            Ok((meta.dev(), meta.ino()))
+        }
+
+        /// `sync_all` on this already-open directory file.
+        pub fn sync(&self) -> io::Result<()> {
+            self.parent.sync_all()
+        }
+    }
+
+    /// `sync_all` on a directory opened by path. A failure is returned.
+    /// Publish does not use this. It syncs the `PublishedDir` it already holds.
     pub fn fsync_dir(path: &Path) -> io::Result<()> {
         let file = File::open(path)?;
         file.sync_all()
@@ -434,5 +459,5 @@ mod linux {
 pub use linux::{
     classify_rename_dir, directory_device_and_inode, exclusive_create_refused, filesystem_magic,
     final_directory_entry, fsync_dir, is_enospc, open_new_nofollow, raise_sigstop,
-    rename_dir_noreplace, try_lock_exclusive, unlock_exclusive, RenameDirClass,
+    rename_dir_noreplace, try_lock_exclusive, unlock_exclusive, PublishedDir, RenameDirClass,
 };

@@ -43,7 +43,7 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
     validate_hook_names(
         req.hooks.stop_at.as_deref(),
         req.hooks.inject_point.as_deref(),
-        &["before_dir_publish"],
+        &["before_dir_publish", "before_parent_sync"],
         EXPORT_INJECTS,
         EXPORT_INJECTS,
     )?;
@@ -152,44 +152,75 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
     stop_details.insert("published".into(), json!(false));
     super::stop_checkpoint(&req.hooks, "before_dir_publish", stop_details)
         .map_err(|fail| scratch.fail(fail))?;
-    publish_export_dir(&scratch.temp, &req.out)
-        .map_err(|err| scratch.fail(export_publish_failure(err)))?;
-    // The published name is req.out. scratch still names the old temporary
-    // path, so a later scratch.fail must not be used to represent this package.
-    let sync_error = fsutil::fsync_dir(parent).err().map(|err| err.to_string());
-    let injected = match note_export_dir(&req.hooks) {
-        Ok(value) => value,
-        Err(message) => {
-            return Ok((
+    let published = match publish_export_dir(&scratch.temp, &req.out) {
+        Ok(dir) => dir,
+        Err(err) => return Err(scratch.fail(export_publish_failure(err))),
+    };
+    // Rename succeeded. scratch still names the old temporary path, so a
+    // later scratch.fail must not represent this package. Dropping `published`
+    // only closes the fd; it does not sync.
+    let mut held = Map::new();
+    held.insert("published".into(), json!(true));
+    if let Ok((dev, ino)) = published.device_and_inode() {
+        held.insert("parent_dev".into(), json!(dev));
+        held.insert("parent_ino".into(), json!(ino));
+    }
+    if let Err(fail) = super::stop_checkpoint(&req.hooks, "before_parent_sync", held) {
+        return Ok((
+            EXIT_INTEGRITY,
+            export_published_fault(&req, completeness, &snapshot_id, &loaded, &fail, false),
+        ));
+    }
+    if let Err(err) = published.sync() {
+        drop(published);
+        return Ok((
+            EXIT_INTEGRITY,
+            export_published_fault(
+                &req,
+                completeness,
+                &snapshot_id,
+                &loaded,
+                &sync_io(err, "export_dir_fsync"),
+                false,
+            ),
+        ));
+    }
+    drop(published);
+    match note_export_dir(&req.hooks) {
+        Ok(false) => Ok((0, published_body(&req, completeness, &snapshot_id, &loaded))),
+        Ok(true) => {
+            let Some(action) = req.hooks.inject_action else {
+                return Ok((
+                    EXIT_INTEGRITY,
+                    export_published_fault(
+                        &req,
+                        completeness,
+                        &snapshot_id,
+                        &loaded,
+                        &Fail::new(EXIT_INTEGRITY, "Exported", "inject_action_required")
+                            .extra("during", json!("export_dir_fsync"))
+                            .extra("injected", json!(true)),
+                        true,
+                    ),
+                ));
+            };
+            Ok((
                 EXIT_INTEGRITY,
-                published_body(
+                export_published_fault(
                     &req,
                     completeness,
                     &snapshot_id,
                     &loaded,
-                    Some(message),
-                    false,
-                    None,
+                    &export_witness(action),
+                    true,
                 ),
-            ));
+            ))
         }
-    };
-
-    let body = published_body(
-        &req,
-        completeness,
-        &snapshot_id,
-        &loaded,
-        sync_error.clone(),
-        injected,
-        req.hooks.inject_action,
-    );
-    let code = if injected || sync_error.is_some() {
-        EXIT_INTEGRITY
-    } else {
-        0
-    };
-    Ok((code, body))
+        Err(fail) => Ok((
+            EXIT_INTEGRITY,
+            export_published_fault(&req, completeness, &snapshot_id, &loaded, &fail, true),
+        )),
+    }
 }
 
 fn published_body(
@@ -197,9 +228,6 @@ fn published_body(
     completeness: &str,
     snapshot_id: &str,
     loaded: &Loaded,
-    os_error: Option<String>,
-    injected: bool,
-    action: Option<InjectAction>,
 ) -> Value {
     let mut body = honesty(if completeness == "complete" {
         "Exported"
@@ -219,46 +247,96 @@ fn published_body(
     body.insert("live_directory_copy".into(), json!(false));
     body.insert("missing".into(), Value::Array(loaded.defects.clone()));
     body.insert("counts".into(), loaded.counts.clone());
-    if injected || os_error.is_some() {
-        body.insert("published".into(), json!(true));
-        body.insert("directory_durable".into(), json!(false));
-        body.insert("reason".into(), json!("directory_durability_unknown"));
-        body.insert("during".into(), json!("export_dir_fsync"));
-        body.insert("injected".into(), json!(injected));
-        if injected {
-            if let Some(action) = action {
-                body.insert("inject_point".into(), json!("export_dir_fsync"));
-                body.insert(
-                    "inject_action".into(),
-                    json!(match action {
-                        InjectAction::Enospc => "enospc",
-                        InjectAction::IoError => "io_error",
-                    }),
-                );
-            }
-            body.insert(
-                "note".into(),
-                json!("injected fault, not a full device and not a failed disk"),
-            );
-        }
-        if let Some(message) = os_error {
-            body.insert("os_error".into(), json!(message));
+    Value::Object(body)
+}
+
+/// `parent_fsync_returned_ok` follows the sync call. `directory_durable=false`
+/// means the final directory's durability is unconfirmed. `output` stays the
+/// requested path already stored by `published_body`.
+fn export_published_fault(
+    req: &ExportRequest,
+    completeness: &str,
+    snapshot_id: &str,
+    loaded: &Loaded,
+    fail: &Fail,
+    parent_fsync_returned_ok: bool,
+) -> Value {
+    let Value::Object(mut body) = published_body(req, completeness, snapshot_id, loaded) else {
+        unreachable!("published export body is an object");
+    };
+    let during = fail
+        .extra
+        .get("during")
+        .and_then(Value::as_str)
+        .unwrap_or("export_dir_fsync")
+        .to_string();
+    let injected = fail
+        .extra
+        .get("injected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    body.insert("published".into(), json!(true));
+    body.insert("directory_durable".into(), json!(false));
+    body.insert(
+        "parent_fsync_returned_ok".into(),
+        json!(parent_fsync_returned_ok),
+    );
+    body.insert("reason".into(), json!(fail.reason.as_str()));
+    body.insert("during".into(), json!(during));
+    body.insert("injected".into(), json!(injected));
+    for key in ["inject_point", "inject_action", "note", "os_error"] {
+        if let Some(value) = fail.extra.get(key) {
+            body.insert(key.to_string(), value.clone());
         }
     }
     Value::Object(body)
 }
 
-fn note_export_dir(hooks: &Hooks) -> Result<bool, String> {
+fn export_witness(action: InjectAction) -> Fail {
+    let (reason, name) = match action {
+        InjectAction::Enospc => ("injected_enospc", "enospc"),
+        InjectAction::IoError => ("injected_io_error", "io_error"),
+    };
+    Fail::new(EXIT_INTEGRITY, "Exported", reason)
+        .extra("during", json!("export_dir_fsync"))
+        .extra("injected", json!(true))
+        .extra("inject_point", json!("export_dir_fsync"))
+        .extra("inject_action", json!(name))
+        .extra(
+            "note",
+            json!("injected fault, not a full device and not a failed disk"),
+        )
+}
+
+fn sync_io(err: io::Error, during: &str) -> Fail {
+    Fail::new(
+        EXIT_INTEGRITY,
+        "Exported",
+        if crate::platform::is_enospc(&err) {
+            "enospc"
+        } else {
+            "io_error"
+        },
+    )
+    .extra("during", json!(during))
+    .extra("os_error", json!(err.to_string()))
+    .extra("injected", json!(false))
+}
+
+fn note_export_dir(hooks: &Hooks) -> Result<bool, Fail> {
     if hooks.inject_point.as_deref() != Some("export_dir_fsync") {
         return Ok(false);
     }
-    let action = hooks
-        .inject_action
-        .ok_or_else(|| "inject_action_required".to_string())?;
-    let path = hooks
-        .witness
-        .clone()
-        .ok_or_else(|| "witness_required".to_string())?;
+    let action = hooks.inject_action.ok_or_else(|| {
+        Fail::new(EXIT_INTEGRITY, "Exported", "inject_action_required")
+            .extra("during", json!("export_dir_fsync"))
+            .extra("injected", json!(false))
+    })?;
+    let path = hooks.witness.clone().ok_or_else(|| {
+        Fail::new(EXIT_INTEGRITY, "Exported", "witness_required")
+            .extra("during", json!("export_dir_fsync"))
+            .extra("injected", json!(false))
+    })?;
     let name = match action {
         InjectAction::Enospc => "enospc",
         InjectAction::IoError => "io_error",
@@ -269,8 +347,9 @@ fn note_export_dir(hooks: &Hooks) -> Result<bool, String> {
         "action": name,
         "published": true
     });
-    let bytes = serde_json::to_vec_pretty(&body).map_err(|_| "export_encode".to_string())?;
-    fsutil::atomic_write(&path, &bytes).map_err(|err| err.to_string())?;
+    let bytes = serde_json::to_vec_pretty(&body)
+        .map_err(|_| Fail::new(EXIT_INTEGRITY, "Exported", "export_encode"))?;
+    fsutil::atomic_write(&path, &bytes).map_err(|err| sync_io(err, "witness"))?;
     Ok(true)
 }
 
@@ -1392,7 +1471,7 @@ fn chain_fail(fact_id: &str) -> Fail {
     recovery("decision_chain_inconsistent").extra("fact_id", json!(fact_id))
 }
 
-fn publish_export_dir(temp: &Path, out: &Path) -> io::Result<()> {
+fn publish_export_dir(temp: &Path, out: &Path) -> io::Result<crate::platform::PublishedDir> {
     let parent = out
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1410,7 +1489,8 @@ fn publish_export_dir(temp: &Path, out: &Path) -> io::Result<()> {
             "export target has no file name",
         )
     })?;
-    crate::platform::rename_dir_noreplace(&parent_file, from, to)
+    crate::platform::rename_dir_noreplace(&parent_file, from, to)?;
+    Ok(crate::platform::PublishedDir::hold(parent_file))
 }
 
 pub(super) fn export_publish_failure(err: io::Error) -> Fail {
@@ -1488,5 +1568,75 @@ fn count_value(count: Option<usize>) -> Value {
     match count {
         None => Value::Null,
         Some(count) => json!(count as i64),
+    }
+}
+
+#[cfg(test)]
+mod published_sync_static {
+    use super::*;
+
+    fn loaded() -> Loaded {
+        Loaded {
+            vault_format: 1,
+            records: json!({}),
+            csv: None,
+            copies: Vec::new(),
+            defects: Vec::new(),
+            counts: json!({}),
+            blocking: None,
+        }
+    }
+
+    fn req() -> ExportRequest {
+        ExportRequest {
+            vault: PathBuf::from("/vault"),
+            out: PathBuf::from("/requested/pkg"),
+            allow_partial: false,
+            hooks: Hooks {
+                stop_at: None,
+                checkpoint: None,
+                inject_action: None,
+                inject_point: None,
+                witness: None,
+            },
+        }
+    }
+
+    /// Constructed `io::Error`. `sync_all` is not called. Not an observed
+    /// fsync failure, and not EACCES from opening a path.
+    #[test]
+    fn constructed_sync_error_stays_published_with_the_actual_reason() {
+        let fail = sync_io(
+            io::Error::from_raw_os_error(libc::ENOSPC),
+            "export_dir_fsync",
+        );
+        let body = export_published_fault(&req(), "complete", "snap", &loaded(), &fail, false);
+        assert_eq!(body["outcome"], "Exported");
+        assert_eq!(body["reason"], "enospc");
+        assert_ne!(body["reason"], "directory_durability_unknown");
+        assert_eq!(body["during"], "export_dir_fsync");
+        assert_eq!(body["injected"], false);
+        assert_eq!(body["published"], true);
+        assert_eq!(body["directory_durable"], false);
+        assert_eq!(body["parent_fsync_returned_ok"], false);
+        assert_eq!(body["output_written"], true);
+        assert_eq!(body["output"], "/requested/pkg");
+        assert_eq!(body["completeness"], "complete");
+        assert!(body.get("output_cleanup").is_none(), "{body}");
+        assert!(body.get("output_staging_path").is_none(), "{body}");
+    }
+
+    #[test]
+    fn witness_after_sync_ok_does_not_rewrite_that_ok_as_a_sync_failure() {
+        let fail = export_witness(InjectAction::IoError);
+        let body = export_published_fault(&req(), "complete", "snap", &loaded(), &fail, true);
+        assert_eq!(body["reason"], "injected_io_error");
+        assert_ne!(body["reason"], "directory_durability_unknown");
+        assert_eq!(body["parent_fsync_returned_ok"], true);
+        assert_eq!(body["directory_durable"], false);
+        assert_eq!(body["published"], true);
+        assert_eq!(body["output"], "/requested/pkg");
+        assert!(body["note"].as_str().unwrap().contains("not a failed disk"));
+        assert!(body.get("output_cleanup").is_none(), "{body}");
     }
 }

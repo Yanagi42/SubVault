@@ -875,6 +875,9 @@ fn injected_directory_fsync_keeps_the_published_directory() {
     assert_eq!(body["outcome"], "Initialized");
     assert_eq!(body["published"], true);
     assert_eq!(body["directory_durable"], false);
+    assert_eq!(body["parent_fsync_returned_ok"], true, "{body}");
+    assert_eq!(body["reason"], "injected_io_error", "{body}");
+    assert_ne!(body["reason"], "directory_durability_unknown");
     assert_eq!(body["created_new_vault"], true);
     assert_eq!(body["injected"], true);
     assert!(body.get("staging_cleanup").is_none(), "{body}");
@@ -906,6 +909,10 @@ fn injected_directory_fsync_keeps_the_published_directory() {
     assert_eq!(body["outcome"], "Exported");
     assert_eq!(body["published"], true);
     assert_eq!(body["directory_durable"], false);
+    assert_eq!(body["parent_fsync_returned_ok"], true, "{body}");
+    assert_eq!(body["reason"], "injected_enospc", "{body}");
+    assert_ne!(body["reason"], "directory_durability_unknown");
+    assert_eq!(body["output"], out.to_str().unwrap());
     assert_eq!(body["output_written"], true);
     assert_eq!(body["injected"], true);
     assert!(body.get("output_cleanup").is_none(), "{body}");

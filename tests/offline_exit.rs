@@ -947,8 +947,12 @@ fn parent_dir_fsync_after_publish_keeps_the_export_package() {
     assert_eq!(body["output_written"], true);
     assert_eq!(body["published"], true);
     assert_eq!(body["directory_durable"], false);
+    assert_eq!(body["parent_fsync_returned_ok"], true, "{body}");
     assert_eq!(body["completeness"], "complete");
-    assert_eq!(body["reason"], "directory_durability_unknown");
+    assert_eq!(body["reason"], "injected_io_error");
+    assert_ne!(body["reason"], "directory_durability_unknown");
+    assert_eq!(body["during"], "export_dir_fsync");
+    assert_eq!(body["output"], out.to_str().unwrap());
     assert_eq!(body["injected"], true);
     assert!(body.get("output_cleanup").is_none(), "{body}");
     assert!(body.get("output_staging_path").is_none(), "{body}");

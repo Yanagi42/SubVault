@@ -70,6 +70,9 @@ fn sql(vault: &Path, query: &str) -> String {
 
 #[test]
 fn init_parent_fsync_after_publish_does_not_say_not_created() {
+    // The inject is written after sync_all on the rename parent file returned
+    // Ok. parent_fsync_returned_ok records that Ok. directory_durable=false
+    // is unconfirmed and is not a sync failure. This is not a full disk.
     for (format, action) in [("1", "io_error"), ("3", "enospc")] {
         let tmp = Tmp::new(&format!("init{format}"));
         let vault = tmp.path().join("vault");
@@ -93,8 +96,17 @@ fn init_parent_fsync_after_publish_does_not_say_not_created() {
         assert_eq!(body["created_new_vault"], true);
         assert_eq!(body["published"], true);
         assert_eq!(body["directory_durable"], false);
-        assert_eq!(body["reason"], "directory_durability_unknown");
+        let expected_reason = if action == "enospc" {
+            "injected_enospc"
+        } else {
+            "injected_io_error"
+        };
+        assert_eq!(body["reason"], expected_reason);
+        assert_ne!(body["reason"], "directory_durability_unknown");
         assert_eq!(body["during"], "publish_dir_fsync");
+        assert_eq!(body["parent_fsync_returned_ok"], true, "{body}");
+        assert_eq!(body["output"], vault.to_str().unwrap());
+        assert!(body["note"].as_str().unwrap().contains("not a failed disk"));
         assert_eq!(body["new_effect"], true);
         assert_eq!(body["injected"], true);
         assert_eq!(body["inject_action"], action);

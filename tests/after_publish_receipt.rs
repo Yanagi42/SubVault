@@ -2,14 +2,14 @@
 //!
 //! Actual: formats 2 and 3 point `--checkpoint` at a directory whose mode is
 //! `000`. The process reaches that write only after the vault directory has
-//! been renamed and the parent `fsync` call has returned. The error is
-//! `EACCES` from that checkpoint write. It is not an inject, not a full disk,
-//! and not a parent `fsync` error. `enospc` is only the existing `io_fail`
-//! classification of `ENOSPC`; this file does not produce `ENOSPC`.
+//! been renamed and `sync_all` on that same parent file has returned `Ok`.
+//! The error is `EACCES` from that checkpoint write. It is not an inject, not
+//! a full disk, and not a parent sync error. `enospc` is only the existing
+//! `io_fail` classification of `ENOSPC`; this file does not produce `ENOSPC`.
 //! `directory_durable=false` here means final directory durability is
-//! unconfirmed. `parent_fsync_returned_ok=true` records the earlier call's
-//! `Ok`. Those two fields had no old definition. This does not show that the
-//! rename fd and the later path-reopened fd are the same handle.
+//! unconfirmed. `parent_fsync_returned_ok=true` records that sync call's `Ok`.
+//! This file does not compare the handle's device and inode; `parent_fd_sync`
+//! does that while the process is stopped before the sync.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

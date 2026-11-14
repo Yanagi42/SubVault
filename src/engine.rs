@@ -70,6 +70,7 @@ const INIT_STOPS: &[&str] = &[
     "before_sync_control",
     "before_sync_stage",
     "before_dir_publish",
+    "before_parent_sync",
     "after_publish",
 ];
 const INIT_INJECTS: &[&str] = &[
@@ -416,49 +417,78 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             fail.extra("created_new_vault", json!(false)),
         ));
     }
-    if let Err(fail) = publish_init_dir(&scratch, path) {
-        return Err(finish_init_scratch(&scratch, fail));
-    }
-    let sync_error = fsutil::fsync_dir(parent).err().map(|err| err.to_string());
-    let injected = match hooks.note_inject("publish_dir_fsync", init_point(true, format)) {
-        Ok(value) => value,
-        Err(fail) => {
-            return Ok(init_durability_alert(
-                &vault_id,
-                format,
-                magic,
-                false,
-                Some(sync_error.unwrap_or(fail.reason)),
-                None,
-            ));
-        }
+    let published = match publish_init_dir(&scratch, path) {
+        Ok(dir) => dir,
+        Err(fail) => return Err(finish_init_scratch(&scratch, fail)),
     };
-    if injected || sync_error.is_some() {
-        return Ok(init_durability_alert(
+    // Rename has succeeded. Later returns are published receipts. Dropping
+    // `published` only closes the fd; it does not sync.
+    let mut point = init_point(true, format);
+    if let Ok((dev, ino)) = published.device_and_inode() {
+        point.insert("parent_dev".into(), json!(dev));
+        point.insert("parent_ino".into(), json!(ino));
+    }
+    if let Err(fail) = hooks.stop("before_parent_sync", point) {
+        return Ok(report_published_init(
+            fail, &vault_id, format, magic, path, false,
+        ));
+    }
+    // Explicit sync of the same file renameat2 used. Release it after the
+    // call returns. Drop does not sync.
+    if let Err(err) = published.sync() {
+        drop(published);
+        return Ok(report_published_init(
+            io_fail(err, "publish_dir_fsync"),
             &vault_id,
             format,
             magic,
-            injected,
-            sync_error,
-            if injected {
-                hooks.hooks.inject_action
-            } else {
-                None
-            },
+            path,
+            false,
         ));
     }
-    // Rename and the parent fsync call have both returned Ok. A checkpoint
-    // write error here stays on the published directory: exit 3, Initialized,
-    // and not note_uncommitted. directory_durable=false means the final
-    // directory's durability is unconfirmed. It does not rewrite the Ok from
-    // that fsync. The rename fd and the later path-reopened fd are untouched.
+    drop(published);
+    let injected = match hooks.note_inject("publish_dir_fsync", init_point(true, format)) {
+        Ok(value) => value,
+        Err(fail) => {
+            return Ok(report_published_init(
+                fail, &vault_id, format, magic, path, true,
+            ));
+        }
+    };
+    if injected {
+        let Some(action) = hooks.hooks.inject_action else {
+            return Ok(report_published_init(
+                Fail::new(EXIT_INTEGRITY, "Initialized", "inject_action_required")
+                    .extra("during", json!("publish_dir_fsync"))
+                    .extra("injected", json!(true)),
+                &vault_id,
+                format,
+                magic,
+                path,
+                true,
+            ));
+        };
+        return Ok(report_published_init(
+            directory_witness("publish_dir_fsync", action),
+            &vault_id,
+            format,
+            magic,
+            path,
+            true,
+        ));
+    }
+    // Sync on the rename parent file has returned Ok. A later checkpoint
+    // write stays published. directory_durable=false means final durability
+    // is unconfirmed. It does not rewrite that Ok.
     match hooks.stop("after_publish", init_point(true, format)) {
         Ok(()) => Ok(init_ready(&vault_id, format, magic)),
-        Err(fail) => Ok(report_after_publish(fail, &vault_id, format, magic, path)),
+        Err(fail) => Ok(report_published_init(
+            fail, &vault_id, format, magic, path, true,
+        )),
     }
 }
 
-fn publish_init_dir(scratch: &Path, path: &Path) -> Result<(), Fail> {
+fn publish_init_dir(scratch: &Path, path: &Path) -> Result<crate::platform::PublishedDir, Fail> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -480,7 +510,8 @@ fn publish_init_dir(scratch: &Path, path: &Path) -> Result<(), Fail> {
         )
         .extra("created_new_vault", json!(false))
     })?;
-    crate::platform::rename_dir_noreplace(&parent_file, from, to).map_err(init_rename_failure)
+    crate::platform::rename_dir_noreplace(&parent_file, from, to).map_err(init_rename_failure)?;
+    Ok(crate::platform::PublishedDir::hold(parent_file))
 }
 
 fn init_rename_failure(err: io::Error) -> Fail {
@@ -545,60 +576,50 @@ fn init_body(vault_id: &str, format: u8, magic: i64) -> Map<String, Value> {
     body
 }
 
-/// The rename has already published the directory. A parent-directory fsync
-/// failure does not unpublish it and is not NotPreserved.
-fn init_durability_alert(
-    vault_id: &str,
-    format: u8,
-    magic: i64,
-    injected: bool,
-    os_error: Option<String>,
-    action: Option<InjectAction>,
-) -> Report {
-    let mut body = init_body(vault_id, format, magic);
-    body.insert("published".into(), json!(true));
-    body.insert("directory_durable".into(), json!(false));
-    body.insert("reason".into(), json!("directory_durability_unknown"));
-    body.insert("during".into(), json!("publish_dir_fsync"));
-    body.insert("injected".into(), json!(injected));
-    if let Some(action) = action {
-        body.insert("inject_point".into(), json!("publish_dir_fsync"));
-        body.insert("inject_action".into(), json!(action_name(action)));
-        body.insert(
-            "note".into(),
+fn directory_witness(point: &str, action: InjectAction) -> Fail {
+    let reason = match action {
+        InjectAction::Enospc => "injected_enospc",
+        InjectAction::IoError => "injected_io_error",
+    };
+    Fail::new(EXIT_INTEGRITY, "Initialized", reason)
+        .extra("during", json!(point))
+        .extra("injected", json!(true))
+        .extra("inject_point", json!(point))
+        .extra("inject_action", json!(action_name(action)))
+        .extra(
+            "note",
             json!("injected fault, not a full device and not a failed disk"),
-        );
-    }
-    if let Some(message) = os_error {
-        body.insert("os_error".into(), json!(message));
-    }
-    Report {
-        code: EXIT_INTEGRITY,
-        body: Value::Object(body),
-    }
+        )
 }
 
-/// Published-directory receipt for a stop that failed after rename.
+/// Published-directory receipt. The rename has already succeeded.
 ///
-/// Extra fields from the failure are copied first. The published facts are
-/// written after that, so a failure's `new_effect=false` cannot cover them.
-/// `directory_durable=false` is this receipt's statement that final directory
-/// durability is unconfirmed. `parent_fsync_returned_ok` records the earlier
-/// parent sync call's `Ok`. Neither field existed on the old receipt, and
-/// neither one identifies the rename fd with the path-reopened fd.
-/// `output` repeats the requested path. It is not a fresh identity check.
-fn report_after_publish(
+/// Extras are copied first. Published facts are written after that, so a
+/// failure's `new_effect=false` cannot cover them. Staging-cleanup keys are
+/// dropped. `parent_fsync_returned_ok` is true only when `sync_all` on the
+/// rename parent file returned `Ok`. `directory_durable=false` means final
+/// directory durability is unconfirmed. It does not mean the sync call failed.
+/// `output` is the requested path string. It is not updated if that parent is
+/// later renamed, and it is not an identity check.
+fn report_published_init(
     fail: Fail,
     vault_id: &str,
     format: u8,
     magic: i64,
     output: &Path,
+    parent_fsync_returned_ok: bool,
 ) -> Report {
     let mut body = init_body(vault_id, format, magic);
     for (key, value) in fail.extra {
         if matches!(
             key.as_str(),
-            "preservation" | "staging_cleanup" | "staging_cleanup_reason" | "staging_path"
+            "preservation"
+                | "staging_cleanup"
+                | "staging_cleanup_reason"
+                | "staging_path"
+                | "output_cleanup"
+                | "output_cleanup_reason"
+                | "output_staging_path"
         ) {
             continue;
         }
@@ -610,7 +631,10 @@ fn report_after_publish(
     body.insert("created_new_vault".into(), json!(true));
     body.insert("new_effect".into(), json!(true));
     body.insert("directory_durable".into(), json!(false));
-    body.insert("parent_fsync_returned_ok".into(), json!(true));
+    body.insert(
+        "parent_fsync_returned_ok".into(),
+        json!(parent_fsync_returned_ok),
+    );
     body.insert("output".into(), json!(output.display().to_string()));
     Report {
         code: EXIT_INTEGRITY,
@@ -3361,5 +3385,67 @@ mod rename_receipts {
         assert_ne!(export_full.code, EXIT_LOCKED);
         assert_ne!(export_access.body["os_error"], export_busy.body["os_error"]);
         assert_ne!(export_busy.body["os_error"], export_full.body["os_error"]);
+    }
+}
+
+#[cfg(test)]
+mod published_sync_static {
+    use super::*;
+
+    /// Constructed `io::Error` values. `sync_all` is not called. This is not
+    /// an observed fsync failure, and it is not EACCES from `File::open`.
+    #[test]
+    fn constructed_sync_error_stays_published_with_the_actual_reason() {
+        for (code, reason) in [(libc::ENOSPC, "enospc"), (libc::EIO, "io_error")] {
+            let fail = io_fail(io::Error::from_raw_os_error(code), "publish_dir_fsync");
+            let report = report_published_init(
+                fail,
+                "vlt_static",
+                1,
+                0,
+                Path::new("/requested/vault"),
+                false,
+            );
+            assert_eq!(report.code, EXIT_INTEGRITY);
+            let body = report.body.as_object().unwrap();
+            assert_eq!(body["outcome"], "Initialized");
+            assert_eq!(body["reason"], reason);
+            assert_ne!(body["reason"], "directory_durability_unknown");
+            assert_eq!(body["during"], "publish_dir_fsync");
+            assert_eq!(body["injected"], false);
+            assert_eq!(body["published"], true);
+            assert_eq!(body["created_new_vault"], true);
+            assert_eq!(body["new_effect"], true);
+            assert_eq!(body["directory_durable"], false);
+            assert_eq!(body["parent_fsync_returned_ok"], false);
+            assert_eq!(body["output"], "/requested/vault");
+            assert!(body.get("preservation").is_none(), "{body:?}");
+            assert!(body.get("staging_cleanup").is_none(), "{body:?}");
+            assert!(body.get("staging_path").is_none(), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn witness_after_sync_ok_does_not_rewrite_that_ok_as_a_sync_failure() {
+        let fail = directory_witness("publish_dir_fsync", InjectAction::IoError);
+        let report = report_published_init(
+            fail,
+            "vlt_static",
+            3,
+            0,
+            Path::new("/requested/vault"),
+            true,
+        );
+        assert_eq!(report.code, EXIT_INTEGRITY);
+        let body = report.body.as_object().unwrap();
+        assert_eq!(body["reason"], "injected_io_error");
+        assert_ne!(body["reason"], "directory_durability_unknown");
+        assert_eq!(body["during"], "publish_dir_fsync");
+        assert_eq!(body["injected"], true);
+        assert_eq!(body["parent_fsync_returned_ok"], true);
+        assert_eq!(body["directory_durable"], false);
+        assert_eq!(body["published"], true);
+        assert_eq!(body["output"], "/requested/vault");
+        assert!(body["note"].as_str().unwrap().contains("not a failed disk"));
     }
 }
