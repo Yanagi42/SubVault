@@ -5,19 +5,21 @@
 //! `source_versions.role`. It does not extract, migrate, publish, or change
 //! a fact, an original, or a decision.
 
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
+use crate::ids::hex_encode;
 use crate::model::{
     honesty, unseen_db, Fail, Report, EXIT_INTEGRITY, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED,
 };
 
-pub fn review_sheet(vault: &Path, out: &Path) -> Report {
+pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>) -> Report {
     let facts = super::query_facts(vault, None, None);
     if facts.code != EXIT_OK {
         return facts;
@@ -37,7 +39,8 @@ pub fn review_sheet(vault: &Path, out: &Path) -> Report {
         Ok(rows) => rows,
         Err(fail) => return fail.into_report(),
     };
-    let (text, fact_count, rest) = render(&facts.body, &candidates.body, &sources);
+    let link = export_link(package, &sources);
+    let (text, fact_count, rest) = render(&facts.body, &candidates.body, &sources, &link);
     match super::place_output(vault, out) {
         super::Place::Inside => return reject("output_inside_vault"),
         super::Place::Unresolved(message) => return reject_message("output_unresolved", message),
@@ -48,7 +51,15 @@ pub fn review_sheet(vault: &Path, out: &Path) -> Report {
     if let Err(report) = write_new(out, text.as_bytes()) {
         return report;
     }
-    reviewed(&facts.body, out, fact_count, rest, sources.len())
+    reviewed(
+        &facts.body,
+        out,
+        fact_count,
+        rest,
+        sources.len(),
+        package.is_some(),
+        link.verified(),
+    )
 }
 
 struct SourceLine {
@@ -119,10 +130,201 @@ fn load_sources(vault: &Path) -> Result<Vec<SourceLine>, Fail> {
     Ok(sources)
 }
 
+enum ExportLink {
+    Unset,
+    NoneMatched,
+    Paths(Vec<String>),
+}
+
+impl ExportLink {
+    fn verified(&self) -> usize {
+        match self {
+            ExportLink::Paths(paths) => paths.len(),
+            ExportLink::Unset | ExportLink::NoneMatched => 0,
+        }
+    }
+}
+
+fn export_link(package: Option<&Path>, sources: &[SourceLine]) -> ExportLink {
+    let Some(package) = package else {
+        return ExportLink::Unset;
+    };
+    let paths = verified_originals(package, sources);
+    if paths.is_empty() {
+        ExportLink::NoneMatched
+    } else {
+        ExportLink::Paths(paths)
+    }
+}
+
+fn verified_originals(package: &Path, sources: &[SourceLine]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for source in sources {
+        if !safe_object_id(&source.object_id) {
+            continue;
+        }
+        let relative = format!("originals/{}", source.object_id);
+        let path = package.join("originals").join(&source.object_id);
+        if original_matches(&path, &source.content_sha256, source.byte_length) {
+            paths.push(relative);
+        }
+    }
+    paths
+}
+
+fn safe_object_id(object_id: &str) -> bool {
+    !object_id.is_empty()
+        && object_id != "."
+        && object_id != ".."
+        && !object_id.contains(['/', '\\'])
+}
+
+fn original_matches(path: &Path, hash: &str, byte_length: i64) -> bool {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    bytes.len() as i64 == byte_length && sha256_bytes(&bytes) == hash
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_encode(&hasher.finalize())
+}
+
+fn push_conclusion(text: &mut String, facts: Option<&Vec<Value>>, link: &ExportLink) {
+    text.push_str("当前结论\n");
+    let rows: &[Value] = facts.map(Vec::as_slice).unwrap_or(&[]);
+    if rows.is_empty() {
+        text.push_str("当前没有事实。没有可写的当前金额或服务期。\n");
+    } else {
+        for fact in conclusion_order(rows) {
+            text.push_str(&conclusion_line(fact));
+            text.push('\n');
+        }
+        if shares_source(rows) {
+            text.push_str("同一来源上的多条事实不代表已核同一笔支付。\n");
+        }
+    }
+    let payment_unverified =
+        rows.is_empty() || rows.iter().all(|fact| fact["payment_verified"] == false);
+    let status_unknown = rows.is_empty()
+        || rows.iter().any(|fact| {
+            matches!(fact["current_status"].as_str(), None | Some("unknown"))
+                || matches!(fact["time_status"].as_str(), None | Some("unknown"))
+        });
+    if payment_unverified && status_unknown {
+        text.push_str("付款未核。不能证明订阅仍有效。\n");
+    } else if payment_unverified {
+        text.push_str("付款未核。\n");
+    } else if status_unknown {
+        text.push_str("不能证明订阅仍有效。\n");
+    }
+    text.push_str("摘录不是全文。\n");
+    match link {
+        ExportLink::Unset => text.push_str("单独生成，未关联导出目录。\n"),
+        ExportLink::NoneMatched => {
+            text.push_str("给出的导出目录里没有对上的原件，本单不写路径。\n");
+        }
+        ExportLink::Paths(paths) => {
+            for path in paths {
+                text.push_str(&format!("原件相对位置 {}\n", show(path)));
+            }
+            text.push_str(
+                "上面的相对位置在关联的导出目录内，已核对文件存在且内容哈希与库中的收录标识一致。\n",
+            );
+        }
+    }
+    text.push_str("请按源码查看，程序不打开、不渲染 HTML。\n");
+}
+
+fn conclusion_line(fact: &Value) -> String {
+    match fact["fact_type"].as_str().unwrap_or("") {
+        "stated_amount_paid" => amount_conclusion(fact, &fact["value"]),
+        "stated_service_period" => period_conclusion(&fact["value"]),
+        other => format!(
+            "有一条 {} 事实。当前值在详单里，这里不另起一个结论。",
+            show(other)
+        ),
+    }
+}
+
+fn amount_conclusion(fact: &Value, value: &Value) -> String {
+    let current = value["amount_text"].as_str().unwrap_or("");
+    let currency = value["currency"].as_str().unwrap_or("");
+    let money = if currency.is_empty() {
+        show(current)
+    } else {
+        format!("{} {}", show(currency), show(current))
+    };
+    match stated_amount(fact["decisions"].as_array()) {
+        Some(original) if original != current => format!(
+            "当前记录金额 {money} 是人工修改后的值，原件仍写 {}。",
+            show(&original)
+        ),
+        Some(_) => format!("当前记录金额 {money}，与原件所写相同。"),
+        None if current.is_empty() => "这条金额事实没有当前金额文本。".to_string(),
+        None => format!("当前记录金额 {money}。库里没有凭据金额。"),
+    }
+}
+
+fn period_conclusion(value: &Value) -> String {
+    let start = value["period_start"].as_str().unwrap_or("");
+    let end = value["period_end"].as_str().unwrap_or("");
+    if start.is_empty() && end.is_empty() {
+        "这条服务期事实没有起止。".to_string()
+    } else {
+        format!("服务期 {} 至 {}。", show(start), show(end))
+    }
+}
+
+fn conclusion_order(facts: &[Value]) -> Vec<&Value> {
+    let mut amounts = Vec::new();
+    let mut periods = Vec::new();
+    let mut rest = Vec::new();
+    for fact in facts {
+        match fact["fact_type"].as_str() {
+            Some("stated_amount_paid") => amounts.push(fact),
+            Some("stated_service_period") => periods.push(fact),
+            _ => rest.push(fact),
+        }
+    }
+    amounts.extend(periods);
+    amounts.extend(rest);
+    amounts
+}
+
+fn shares_source(facts: &[Value]) -> bool {
+    let mut seen = Vec::new();
+    for fact in facts {
+        let Some(id) = fact["source_id"].as_str() else {
+            continue;
+        };
+        if seen.iter().any(|kept: &String| kept == id) {
+            return true;
+        }
+        seen.push(id.to_string());
+    }
+    false
+}
+
 fn render(
     facts_body: &Value,
     candidates_body: &Value,
     sources: &[SourceLine],
+    link: &ExportLink,
 ) -> (String, usize, usize) {
     let facts = facts_body["facts"].as_array();
     let candidates = candidates_body["candidates"].as_array();
@@ -138,7 +340,12 @@ fn render(
         "\
 合成开发审阅单
 这不是 Windows 界面。
-付款未核。
+",
+    );
+    push_conclusion(&mut text, facts, link);
+    text.push_str(
+        "\
+详单
 这是合成开发库的只读文字。它不是完成的产品。
 原件里的 HTML 只按文字抄出，不渲染，也不打开链接，也不取远程资源。
 控制字符、换行和双向控制写成 \\u{XXXX}。反斜杠写成 \\\\。
@@ -501,6 +708,8 @@ fn reviewed(
     fact_count: usize,
     rest: usize,
     source_count: usize,
+    package_associated: bool,
+    originals_verified: usize,
 ) -> Report {
     let mut body = honesty("Reviewed");
     if let Some(slice) = facts.get("slice") {
@@ -513,6 +722,8 @@ fn reviewed(
     body.insert("fact_count".into(), json!(fact_count));
     body.insert("candidate_not_fact_count".into(), json!(rest));
     body.insert("source_count".into(), json!(source_count));
+    body.insert("package_associated".into(), json!(package_associated));
+    body.insert("originals_verified".into(), json!(originals_verified));
     body.insert(
         "filesystem_note".into(),
         json!("只读打开可能让 SQLite 碰到 -shm。已提交的逻辑数据、原件字节和决定记录不因这次审阅改写。这不证明目录里没有新文件。"),

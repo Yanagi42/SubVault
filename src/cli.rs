@@ -31,6 +31,7 @@ struct Flags {
     amount_text: Option<String>,
     actor_id: Option<String>,
     allow_partial: Option<bool>,
+    package: Option<PathBuf>,
 }
 
 impl Flags {
@@ -59,6 +60,7 @@ impl Flags {
             amount_text: None,
             actor_id: None,
             allow_partial: None,
+            package: None,
         }
     }
 }
@@ -86,6 +88,9 @@ pub fn execute(args: Vec<String>) -> Report {
     }
     if flags.allow_partial.is_some() && command != "export" {
         return usage("allow_partial_only_on_export");
+    }
+    if flags.package.is_some() && command != "review" {
+        return usage("package_only_on_review");
     }
     match command.as_str() {
         "init" => {
@@ -204,7 +209,7 @@ pub fn execute(args: Vec<String>) -> Report {
             let (Some(vault), Some(out)) = (flags.vault, flags.out) else {
                 return usage("review_required_flags");
             };
-            engine::review_sheet(&vault, &out)
+            engine::review_sheet(&vault, &out, flags.package.as_deref())
         }
         "export" => {
             let (Some(vault), Some(out)) = (flags.vault, flags.out) else {
@@ -326,6 +331,7 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
             "--expected-revision" => flags.expected_revision = Some(value),
             "--amount-text" => flags.amount_text = Some(value),
             "--actor-id" => flags.actor_id = Some(value),
+            "--package" => flags.package = Some(PathBuf::from(value)),
             "--allow-partial" => {
                 if value != "yes" {
                     return Err(Fail::new(EXIT_USAGE, "Usage", "bad_allow_partial"));

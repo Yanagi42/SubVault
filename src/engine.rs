@@ -225,7 +225,7 @@ pub fn help_report() -> Report {
     let mut body = honesty("Help");
     body.insert(
         "note".into(),
-        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. On a new format 3 vault, that same publish also records a stated paid amount and a stated service period as facts. Those facts are source statements, not verified payments, purchases, or account links. correct can replace the stated USD amount text, and undo appends a compensating decision. export writes one offline package outside the vault: originals, candidates, current facts, and the decision chain. It does not choose a protection mode. PDF extraction is not available. Security is not complete. This is not a user-ready product. format 4 takes one local UTF-8 HTML file and keeps those bytes. Its extraction is a limited static-text pass, not browser visibility, and it does not migrate an older vault. review writes one UTF-8 text sheet of stored facts and candidates outside the vault. It does not change them, and it is not a Windows screen."),
+        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. On a new format 3 vault, that same publish also records a stated paid amount and a stated service period as facts. Those facts are source statements, not verified payments, purchases, or account links. correct can replace the stated USD amount text, and undo appends a compensating decision. export writes one offline package outside the vault: originals, candidates, current facts, and the decision chain. It does not choose a protection mode. PDF extraction is not available. Security is not complete. This is not a user-ready product. format 4 takes one local UTF-8 HTML file and keeps those bytes. Its extraction is a limited static-text pass, not browser visibility, and it does not migrate an older vault. review writes one UTF-8 text sheet of stored facts and candidates outside the vault. It does not change them, and it is not a Windows screen. Optional --package names an existing export directory. The sheet writes originals/OBJECT only after that file exists and its bytes match the stored hash."),
     );
     body.insert(
         "commands".into(),
@@ -242,7 +242,7 @@ pub fn help_report() -> Report {
             "html --vault PATH --command-id ID --source PATH [--batch-id ID]",
             "candidates --vault PATH [--source-id ID]",
             "facts --vault PATH [--source-id ID] [--fact-id ID]",
-            "review --vault PATH --out PATH",
+            "review --vault PATH --out PATH [--package PATH]",
             "export --vault PATH --out PATH [--allow-partial yes]",
             "correct --vault PATH --command-id ID --fact-id ID --expected-revision N --amount-text TEXT --actor-id ID",
             "undo --vault PATH --command-id ID --decision-id ID --expected-revision N --actor-id ID",

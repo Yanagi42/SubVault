@@ -452,6 +452,8 @@ fn review_sheet_lists_html_facts_history_and_the_stored_non_fact() {
         vault.to_str().unwrap(),
         "--out",
         sheet.to_str().unwrap(),
+        "--package",
+        package.to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "{reviewed}");
     assert_eq!(reviewed["outcome"], "Reviewed");
@@ -464,6 +466,8 @@ fn review_sheet_lists_html_facts_history_and_the_stored_non_fact() {
     assert_eq!(reviewed["candidate_not_fact_count"], 1);
     assert_eq!(reviewed["source_count"], 1);
     assert_eq!(reviewed["slice"], "T4-html");
+    assert_eq!(reviewed["package_associated"], true);
+    assert_eq!(reviewed["originals_verified"], 1);
     assert!(reviewed.get("published").is_none(), "{reviewed}");
     assert!(reviewed["filesystem_note"]
         .as_str()
@@ -491,7 +495,24 @@ fn review_sheet_lists_html_facts_history_and_the_stored_non_fact() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines[0], "合成开发审阅单");
     assert_eq!(lines[1], "这不是 Windows 界面。");
-    assert_eq!(lines[2], "付款未核。");
+    assert_eq!(lines[2], "当前结论");
+    let head = text.split("\n详单\n").next().unwrap();
+    assert!(head.contains("当前记录金额 USD 12.00 是人工修改后的值，原件仍写 15.99。"));
+    assert!(head.contains("服务期 2026-09-01 至 2026-09-30。"));
+    assert!(head.find("当前记录金额").unwrap() < head.find("服务期").unwrap());
+    assert!(head.contains("同一来源上的多条事实不代表已核同一笔支付。"));
+    assert!(head.contains("付款未核。不能证明订阅仍有效。"));
+    assert!(head.contains("摘录不是全文。"));
+    assert!(head.contains(&format!("原件相对位置 originals/{object_id}")));
+    assert!(!head.contains("10.00"));
+    assert!(!head.contains("已撤销"));
+    assert!(!head.contains("ambiguous"));
+    assert!(!text.contains("/tmp"));
+    assert!(!text.contains("bill.html"));
+    assert_eq!(
+        fs::read(package.join("originals").join(object_id)).unwrap(),
+        BILL.as_bytes()
+    );
     assert_eq!(
         lines
             .iter()
@@ -766,6 +787,8 @@ fn review_sheet_reads_a_format3_fragment_without_a_contract_change() {
     ]);
     assert_eq!(code, 0, "{reviewed}");
     assert_eq!(reviewed["slice"], "T3-facts");
+    assert_eq!(reviewed["package_associated"], false);
+    assert_eq!(reviewed["originals_verified"], 0);
     assert_eq!(reviewed["fact_count"], 1);
     assert_eq!(reviewed["candidate_not_fact_count"], 1);
     assert_eq!(reviewed["read_only"], true);
@@ -777,6 +800,14 @@ fn review_sheet_reads_a_format3_fragment_without_a_contract_change() {
     assert!(PLAIN.contains("Not a stored line"));
     assert!(!text.contains("格式 4 不收纯文本片段。"));
     assert_eq!(text.lines().next(), Some("合成开发审阅单"));
+    let head = text.split("\n详单\n").next().unwrap();
+    assert!(head.contains("当前记录金额 USD 8.00，与原件所写相同。"));
+    assert!(!head.contains("人工修改后的值"));
+    assert!(!head.contains("服务期"));
+    assert!(!head.contains("同一来源上的多条事实"));
+    assert!(head.contains("付款未核。不能证明订阅仍有效。"));
+    assert!(head.contains("单独生成，未关联导出目录。"));
+    assert!(!head.contains("originals/"));
     let found = blocks(&text);
     let fact = found
         .iter()
@@ -888,8 +919,229 @@ fn review_refuses_old_vaults_hooks_and_a_missing_path() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|command| command == "review --vault PATH --out PATH"));
+        .any(|command| command == "review --vault PATH --out PATH [--package PATH]"));
     let note = help["note"].as_str().unwrap();
     assert!(note.contains("not a user-ready product"));
     assert!(note.contains("not a Windows screen"));
+}
+
+#[test]
+fn review_conclusion_follows_stored_fields_and_stays_empty_without_facts() {
+    let tmp = Tmp::new("other-amount");
+    let vault = init(&tmp, "vault", "3");
+    let source = tmp.path.join("note.txt");
+    let note = "Amount paid USD 4.00\nService period: 2024-01-02 through 2024-03-04\n";
+    fs::write(&source, note.as_bytes()).unwrap();
+    let (code, imported) = run(&[
+        "fragment",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "other",
+        "--fragment",
+        source.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{imported}");
+    let (code, facts) = run(&["facts", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{facts}");
+    let amount = facts["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["fact_type"] == "stated_amount_paid")
+        .unwrap();
+    let (code, corrected) = run(&[
+        "correct",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "other-fix",
+        "--fact-id",
+        amount["fact_id"].as_str().unwrap(),
+        "--expected-revision",
+        "1",
+        "--amount-text",
+        "6.50",
+        "--actor-id",
+        ACTOR,
+    ]);
+    assert_eq!(code, 0, "{corrected}");
+    let sheet = tmp.path.join("review.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    let text = fs::read_to_string(&sheet).unwrap();
+    let head = text.split("\n详单\n").next().unwrap();
+    assert!(head.contains("当前记录金额 USD 6.50 是人工修改后的值，原件仍写 4.00。"));
+    assert!(head.contains("服务期 2024-01-02 至 2024-03-04。"));
+    assert!(head.find("当前记录金额").unwrap() < head.find("服务期").unwrap());
+    assert!(head.contains("同一来源上的多条事实不代表已核同一笔支付。"));
+    assert!(!head.contains("12.00"));
+    assert!(!head.contains("15.99"));
+    assert!(!head.contains("2026-09"));
+    assert!(!head.contains("10.00"));
+    assert!(!head.contains("已撤销"));
+    let detail = text.split("\n详单\n").nth(1).unwrap();
+    assert!(detail.contains("你修改（原文仍写4.00）当前 6.50"));
+
+    let empty = init(&tmp, "empty", "4");
+    let blank = tmp.path.join("blank.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        empty.to_str().unwrap(),
+        "--out",
+        blank.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["fact_count"], 0);
+    let text = fs::read_to_string(&blank).unwrap();
+    let head = text.split("\n详单\n").next().unwrap();
+    assert!(head.contains("当前没有事实。没有可写的当前金额或服务期。"));
+    assert!(head.contains("付款未核。不能证明订阅仍有效。"));
+    assert!(!head.contains("USD"));
+    assert!(!head.contains("服务期 "));
+    assert!(!head.contains("同一来源上的多条事实"));
+}
+
+#[test]
+fn review_names_a_package_original_only_after_the_bytes_match() {
+    let tmp = Tmp::new("locate");
+    let vault = init(&tmp, "vault", "3");
+    let source = tmp.path.join("note.txt");
+    fs::write(&source, PLAIN.as_bytes()).unwrap();
+    let (code, imported) = run(&[
+        "fragment",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "locate",
+        "--fragment",
+        source.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{imported}");
+    let object_id = imported["object_id"].as_str().unwrap();
+    let package = tmp.path.join("package");
+    let (code, exported) = run(&[
+        "export",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        package.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{exported}");
+    let original = package.join("originals").join(object_id);
+    let packed = fs::read(&original).unwrap();
+    assert_eq!(packed, PLAIN.as_bytes());
+    assert_eq!(sha256(&packed), sha256(PLAIN.as_bytes()));
+
+    let alone = tmp.path.join("alone.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        alone.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["package_associated"], false);
+    let text = fs::read_to_string(&alone).unwrap();
+    assert!(text.contains("单独生成，未关联导出目录。"));
+    assert!(text.contains("摘录不是全文。"));
+    assert!(!text.contains("originals/"));
+    assert!(!text.contains(package.to_str().unwrap()));
+
+    let empty = tmp.path.join("empty-export");
+    fs::create_dir(&empty).unwrap();
+    let missed = tmp.path.join("missed.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        empty.to_str().unwrap(),
+        "--out",
+        missed.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["package_associated"], true);
+    assert_eq!(reviewed["originals_verified"], 0);
+    let text = fs::read_to_string(&missed).unwrap();
+    assert!(text.contains("给出的导出目录里没有对上的原件，本单不写路径。"));
+    assert!(!text.contains("originals/"));
+
+    let truncated = tmp.path.join("truncated");
+    fs::create_dir_all(truncated.join("originals")).unwrap();
+    fs::write(truncated.join("originals").join(object_id), b"nope").unwrap();
+    let short = tmp.path.join("short.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        truncated.to_str().unwrap(),
+        "--out",
+        short.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["originals_verified"], 0);
+    assert!(!fs::read_to_string(&short).unwrap().contains("originals/"));
+
+    let linked = tmp.path.join("linked");
+    fs::create_dir_all(linked.join("originals")).unwrap();
+    std::os::unix::fs::symlink(&original, linked.join("originals").join(object_id)).unwrap();
+    let link_sheet = tmp.path.join("link.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        linked.to_str().unwrap(),
+        "--out",
+        link_sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["originals_verified"], 0);
+    assert!(!fs::read_to_string(&link_sheet)
+        .unwrap()
+        .contains("originals/"));
+
+    let named = tmp.path.join("named.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        package.to_str().unwrap(),
+        "--out",
+        named.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["originals_verified"], 1);
+    let text = fs::read_to_string(&named).unwrap();
+    let head = text.split("\n详单\n").next().unwrap();
+    assert!(head.contains(&format!("原件相对位置 originals/{object_id}")));
+    assert_eq!(head.matches("原件相对位置").count(), 1);
+    assert!(!text.contains(package.to_str().unwrap()));
+    assert!(!text.contains(source.to_str().unwrap()));
+    assert_eq!(fs::read(&original).unwrap(), PLAIN.as_bytes());
+    assert_eq!(
+        sha256(&fs::read(&original).unwrap()),
+        sha256(PLAIN.as_bytes())
+    );
+
+    let (code, refused) = run(&[
+        "facts",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        package.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "{refused}");
+    assert_eq!(refused["reason"], "package_only_on_review");
 }
