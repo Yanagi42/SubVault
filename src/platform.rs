@@ -4,14 +4,15 @@
 //! the command returns. Directory identity is still this Linux device and
 //! inode. Exclusive create and directory fsync still return their errors.
 //! Nothing here chooses a Windows lock, a file id, a cross-volume rename, or
-//! a UI session. Another target does not compile a stand-in that succeeds.
+//! a UI session. The compile gate is `target_os = "linux"`. Android and other
+//! Unix targets stop here, before these calls. There is no second backend.
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 compile_error!(
-    "SubVault lock, directory identity, exclusive create, and directory fsync are the tested Linux calls. This target is not tested and has no success stand-in."
+    "SubVault's tested OS calls are Linux only (target_os = \"linux\"). Other targets, including other Unix, are not tested and have no success stand-in."
 );
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod linux {
     use std::fs::{self, File, OpenOptions};
     use std::io;
@@ -115,7 +116,7 @@ mod linux {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub use linux::{
     directory_device_and_inode, exclusive_create_refused, filesystem_magic, final_directory_entry,
     fsync_dir, is_enospc, open_new_nofollow, raise_sigstop, try_lock_exclusive, unlock_exclusive,

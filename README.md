@@ -99,7 +99,7 @@ journal 是一份字段表生成的 JSON。未知键被忽略。可选字段缺�
 
 这轮只在这台 Linux 云端虚拟机上验证。文件系统是 ext4（`findmnt` 的类型是 ext4，magic 是 `0xef53`；`stat -f` 的类型名可能显示成 ext2/ext3，以 magic 为准）。
 
-写锁是 Unix `flock`。这些已测调用集中在 Linux 实现里；其它目标拒绝编译，不提供一套返回成功的替代。一次命令持锁到返回，不是应用单实例。导出写包仍在锁外。没有测过 Windows 原生锁，也没有测过 Windows 的真实路径、大小写折叠和 junction。没有测过断电和坏盘。NFS magic `0x6969` 与 SMB/CIFS magic `0xFF534D42`、`0xFE534D42` 会拒绝，但本轮没有挂载这些文件系统。同步盘没有探测，也不支持。回执里的 `platform_limits` 使用这些原句，不能读成跨平台或同步盘已经通过。
+写锁是 Linux 上的 `flock`。编译门是 `target_os = "linux"`。不是 Linux 的目标，包括 Android 和其它 Unix，停在 `compile_error`，不进入这份实现，也没有另一套后端。一次命令持锁到返回，不是应用单实例。导出写包仍在锁外。没有测过 Windows 原生锁，也没有测过 Windows 的真实路径、大小写折叠和 junction。没有测过断电和坏盘。NFS magic `0x6969` 与 SMB/CIFS magic `0xFF534D42`、`0xFE534D42` 会拒绝，但本轮没有挂载这些文件系统。同步盘没有探测，也不支持。回执里的 `platform_limits` 使用这些原句，不能读成跨平台或同步盘已经通过。
 
 ## 复现
 
