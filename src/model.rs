@@ -101,6 +101,7 @@ pub fn capabilities() -> Value {
         "full_text_search": "not_available",
         "extraction": "not_available",
         "body_fragment": "available",
+        "stated_facts": "available",
         "pdf_extraction": "not_available",
         "ocr": "not_available",
         "purchases": "not_available",

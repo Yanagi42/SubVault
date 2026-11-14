@@ -31,9 +31,12 @@ use crate::model::{
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
+#[path = "decide.rs"]
+mod decide;
 #[path = "fragment.rs"]
 mod fragment;
 
+pub use decide::query_facts;
 pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
 
 const IMPORT_STOPS: &[&str] = &[
@@ -166,7 +169,7 @@ pub fn help_report() -> Report {
     let mut body = honesty("Help");
     body.insert(
         "note".into(),
-        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. Those candidates are not facts, purchases, or account links. PDF extraction is not available. Security is not complete. This is not a user-ready product."),
+        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. On a new format 3 vault, that same publish also records a stated paid amount and a stated service period as facts. Those facts are source statements, not verified payments, purchases, or account links. PDF extraction is not available. Security is not complete. This is not a user-ready product."),
     );
     body.insert(
         "commands".into(),
@@ -181,6 +184,7 @@ pub fn help_report() -> Report {
             "marker --vault PATH --command-id ID --source-id ID --value TEXT",
             "fragment --vault PATH --command-id ID --fragment PATH [--batch-id ID]",
             "candidates --vault PATH [--source-id ID]",
+            "facts --vault PATH [--source-id ID] [--fact-id ID]",
             "cancel --vault PATH --command-id ID --generation N [--kind preservation|fragment|extraction]",
             "recover --vault PATH",
             "hold --vault PATH --stop-at lock_held --checkpoint PATH"
@@ -291,6 +295,17 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             [&format_text],
         )
         .map_err(|err| db_fail(err, "init_version"))?;
+        if format == 3 {
+            conn.execute_batch(store::BODY_DDL)
+                .map_err(|err| db_fail(err, "init_schema"))?;
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('body_schema', ?1)",
+                [store::BODY_SCHEMA],
+            )
+            .map_err(|err| db_fail(err, "init_schema"))?;
+            conn.execute_batch(store::FACT_DDL)
+                .map_err(|err| db_fail(err, "init_schema"))?;
+        }
         hooks.stop("version_set", init_point(false, format))?;
         hooks.inject("version_checkpoint", init_point(false, format))?;
         publish_checkpoint(&conn)?;
@@ -2044,7 +2059,7 @@ fn display_name_fallback() -> String {
     "source".into()
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

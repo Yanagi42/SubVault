@@ -121,10 +121,10 @@ scripts/run-t1-evidence.sh
 
 候选只记录原文里写明的句子。`Amount paid USD 15.99`、带订单说明的 `Total USD 15.99`、带贷项说明的 `Total USD 15.99` 是三种语义，金额相同也不合并。单独的 `Total`、两处 `Total` 配一条说明、或两条互相冲突的说明，都是 `unresolved_total`，`usable` 为 false。服务期和“之后没有状态”不产生观察时间，`observed_at` 保持 null，`current_status` 保持 `unknown`。两行账户邮箱和一行掩码邮箱各自保留，`attributed` 为 false，不写账户关系。认不出来的行不生成候选。
 
-同 logical key 已经成功时，另一次提交返回 `AlreadyPublished`，不新增候选。失败和取消不写入永久失败；下一次提交使用新的 attempt。取消或晚到的发布不写入新的可用候选，已成功的候选和原件字节保留。来源行已经提交之后，这一次发布失败不会把该来源改写成 `not_preserved`；回执里的 `preservation` 是 `preserved`，`candidates_published` 是 false。状态行没有写上时，回执标明 `attempt_update` 或 `run_update` 为 `failed`，不把仍在 `running` 的 attempt 说成已经清理。来源提交之前的失败，包括 `body_schema`，仍然是 `not_preserved`。正文表由第一次成功路径上的事务添加，`meta.body_schema` 记为 `1`。这步失败会回滚，不改已有的 T1 行，也不再改 `user_version`。格式 1 仍按原来的 T1 读和保全工作。对格式 1 调用 `fragment` 或 `cancel --kind fragment`，在写任何新 journal 或正文 DDL 之前返回 `NeedsUpgrade`。格式 2 只来自新建库。journal 种类仍是 `fragment`，不改名成 `import`，也不另写一个旧程序能认出的 marker。已有格式 1 库不会被就地或自动升级。旧程序打开已发布的格式 2 库时，在加锁、写打开和清理之前返回 14。这不是成品升级或降级支持。PDF、OCR、T3 采纳和其它平台都没有做。
+同 logical key 已经成功时，另一次提交返回 `AlreadyPublished`，不新增候选。失败和取消不写入永久失败；下一次提交使用新的 attempt。取消或晚到的发布不写入新的可用候选，已成功的候选和原件字节保留。来源行已经提交之后，这一次发布失败不会把该来源改写成 `not_preserved`；回执里的 `preservation` 是 `preserved`，`candidates_published` 是 false。状态行没有写上时，回执标明 `attempt_update` 或 `run_update` 为 `failed`，不把仍在 `running` 的 attempt 说成已经清理。来源提交之前的失败，包括 `body_schema`，仍然是 `not_preserved`。正文表由第一次成功路径上的事务添加，`meta.body_schema` 记为 `1`。这步失败会回滚，不改已有的 T1 行，也不再改 `user_version`。格式 1 仍按原来的 T1 读和保全工作。对格式 1 调用 `fragment` 或 `cancel --kind fragment`，在写任何新 journal 或正文 DDL 之前返回 `NeedsUpgrade`。格式 2 只来自新建库。journal 种类仍是 `fragment`，不改名成 `import`，也不另写一个旧程序能认出的 marker。已有格式 1 库不会被就地或自动升级。旧程序打开已发布的格式 2 库时，在加锁、写打开和清理之前返回 14。这不是成品升级或降级支持。PDF、OCR 和其它平台都没有做。格式 3 会在候选发布的同一事务里记录写明的已付金额和服务期；那是来源声明，不是已核支付。手改和撤销还没有做。
 
 `candidates` 只读查询。它不建表，也不写库。候选的 `value_json` 或 `locator_json` 读不出来时，不返回 `value` 为 null 的候选。运行配置或 attempt 明细读不出来时同样留下告警。这些都是退出码 12，原件字节不改。
 
 ## 这轮没有做
 
-整理、全文搜索、订阅规则、购买、权益、PDF 提取、OCR、导出、加密、真实数据导入、桌面壳和遥测都没有实现。正文候选不是事实。T0/T1 通过不等于产品完成。Linux 上的结果不代表 Windows。
+整理、全文搜索、订阅规则、购买、权益、PDF 提取、OCR、导出、加密、真实数据导入、桌面壳和遥测都没有实现。正文候选本身不是事实。格式 3 另有事实表，只承接写明的已付金额和服务期。T0/T1 通过不等于产品完成。Linux 上的结果不代表 Windows。

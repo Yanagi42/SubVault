@@ -91,7 +91,9 @@ fn needs_upgrade() -> Fail {
 
 fn as_body_slice(mut report: Report) -> Report {
     if let Some(map) = report.body.as_object_mut() {
-        map.insert("slice".into(), json!("T2a-body"));
+        if map.get("slice").and_then(|value| value.as_str()) != Some("T3-facts") {
+            map.insert("slice".into(), json!("T2a-body"));
+        }
     }
     report
 }
@@ -196,6 +198,10 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
             return Err(missed("command_already_committed"));
         }
         return replay_command(&session, &req, &existing);
+    }
+    let format = store::user_version(&session.conn).map_err(|err| db_fail(err, "user_version"))?;
+    if format == 3 {
+        super::decide::require_fact_tables(&session.conn)?;
     }
     hooks.stop(
         "before_journal",
@@ -636,6 +642,32 @@ fn publish(
         .map_err(|err| db_fail(err, "insert_candidate"))?;
         ids.push(candidate_id);
     }
+    let format = store::user_version(&tx).map_err(|err| db_fail(err, "user_version"))?;
+    let adopted = if format == 3 {
+        let stated: Vec<super::decide::StatedDraft<'_>> = ids
+            .iter()
+            .zip(drafts.iter())
+            .filter(|(_, draft)| {
+                draft.usable
+                    && (draft.kind == "stated_amount_paid" || draft.kind == "stated_service_period")
+            })
+            .map(|(candidate_id, draft)| super::decide::StatedDraft {
+                candidate_id,
+                kind: draft.kind,
+                value: &draft.value,
+            })
+            .collect();
+        super::decide::adopt_statements(
+            &tx,
+            &req.command_id,
+            &opened.source_id,
+            &opened.source_version_id,
+            &opened.run_id,
+            &stated,
+        )?
+    } else {
+        Vec::new()
+    };
     tx.execute(
         "UPDATE extraction_attempts SET status = 'succeeded', published = 1, detail_json = ?2 WHERE attempt_id = ?1 AND status = 'running'",
         params![opened.attempt_id, json!({"reason": "published"}).to_string()],
@@ -646,7 +678,10 @@ fn publish(
         [&opened.run_id],
     )
     .map_err(|err| db_fail(err, "finish_run"))?;
-    let receipt = success_receipt(req, journal, opened, hash, &ids, true);
+    let mut receipt = success_receipt(req, journal, opened, hash, &ids, true);
+    if format == 3 {
+        attach_stated(&mut receipt, &adopted, true);
+    }
     hooks.inject(
         "result_encode",
         checkpoint_map(
@@ -666,12 +701,24 @@ fn publish(
             command_id: req.command_id.clone(),
             kind: "fragment".into(),
             payload_fingerprint: journal.payload_fingerprint.clone().unwrap_or_default(),
-            result_json: encoded,
+            result_json: encoded.clone(),
             outcome: "Committed".into(),
         },
         now_ms(),
     )
     .map_err(|err| db_fail(err, "insert_command"))?;
+    if format == 3 {
+        let key = journal.payload_fingerprint.clone().ok_or_else(|| {
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "logical_key_missing")
+                .extra("new_effect", json!(false))
+        })?;
+        super::decide::insert_receipt(
+            &tx,
+            &req.command_id,
+            &super::decide::fragment_canonical(hash, &key, "created"),
+            &encoded,
+        )?;
+    }
     if let Err(fail) = hooks.inject(
         "db_commit",
         checkpoint_map(
@@ -714,10 +761,14 @@ fn publish_replay(
             true,
         ),
     )?;
+    let format = store::user_version(conn).map_err(|err| db_fail(err, "user_version"))?;
     let tx = conn
         .unchecked_transaction()
         .map_err(|err| db_fail(err, "begin"))?;
-    let receipt = success_receipt(req, journal, opened, hash, &opened.candidate_ids, false);
+    let mut receipt = success_receipt(req, journal, opened, hash, &opened.candidate_ids, false);
+    if format == 3 {
+        attach_stated(&mut receipt, &[], false);
+    }
     let mut replay = receipt.clone();
     if let Some(map) = replay.as_object_mut() {
         map.insert("outcome".into(), json!("AlreadyPublished"));
@@ -743,12 +794,24 @@ fn publish_replay(
             command_id: req.command_id.clone(),
             kind: "fragment".into(),
             payload_fingerprint: journal.payload_fingerprint.clone().unwrap_or_default(),
-            result_json: encoded,
+            result_json: encoded.clone(),
             outcome: "AlreadyPublished".into(),
         },
         now_ms(),
     )
     .map_err(|err| db_fail(err, "insert_command"))?;
+    if format == 3 {
+        let key = journal.payload_fingerprint.clone().ok_or_else(|| {
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "logical_key_missing")
+                .extra("new_effect", json!(false))
+        })?;
+        super::decide::insert_receipt(
+            &tx,
+            &req.command_id,
+            &super::decide::fragment_canonical(hash, &key, "already"),
+            &encoded,
+        )?;
+    }
     tx.commit().map_err(|err| db_fail(err, "replay_commit"))?;
     Ok(replay)
 }
@@ -1722,6 +1785,46 @@ fn cancel_body(
         },
     );
     body
+}
+
+fn attach_stated(receipt: &mut Value, adopted: &[super::decide::Adopted], published: bool) {
+    let Some(map) = receipt.as_object_mut() else {
+        return;
+    };
+    map.insert("slice".into(), json!("T3-facts"));
+    map.insert("facts_published".into(), json!(published));
+    map.insert(
+        "fact_ids".into(),
+        json!(adopted
+            .iter()
+            .map(|row| row.fact_id.clone())
+            .collect::<Vec<_>>()),
+    );
+    map.insert(
+        "decision_ids".into(),
+        json!(adopted
+            .iter()
+            .map(|row| row.decision_id.clone())
+            .collect::<Vec<_>>()),
+    );
+    map.insert(
+        "fact_anchors".into(),
+        json!(adopted
+            .iter()
+            .map(|row| {
+                json!({
+                    "fact_id": row.fact_id,
+                    "decision_id": row.decision_id,
+                    "candidate_id": row.candidate_id,
+                    "fact_type": row.fact_type
+                })
+            })
+            .collect::<Vec<_>>()),
+    );
+    map.insert("observed_at".into(), Value::Null);
+    map.insert("time_status".into(), json!("unknown"));
+    map.insert("current_status".into(), json!("unknown"));
+    map.insert("payment_verified".into(), json!(false));
 }
 
 fn body_outcome(outcome: &str) -> Map<String, Value> {

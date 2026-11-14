@@ -247,6 +247,10 @@ fn classify(line: &str) -> Class {
     Class::Other
 }
 
+pub fn usd_amount_text(text: &str) -> bool {
+    money(text).is_some()
+}
+
 fn money(text: &str) -> Option<String> {
     let (whole, frac) = text.split_once('.')?;
     if whole.is_empty()

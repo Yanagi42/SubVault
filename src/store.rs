@@ -336,6 +336,8 @@ pub const BODY_TABLES: &[&str] = &[
     "candidates",
 ];
 
+pub const FACT_TABLES: &[&str] = &["facts", "decisions", "t3_receipts"];
+
 pub const BODY_DDL: &str = r#"
 CREATE TABLE source_versions (
     source_version_id TEXT PRIMARY KEY,
@@ -383,6 +385,55 @@ CREATE TABLE candidates (
     locator_json TEXT NOT NULL,
     adopted INTEGER NOT NULL CHECK (adopted = 0),
     UNIQUE (run_id, ordinal)
+);
+"#;
+
+/// Format 3 only. These tables are created with the vault, not by a later
+/// migration. `source_versions` stays the existing body table.
+pub const FACT_DDL: &str = r#"
+CREATE TABLE facts (
+    fact_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    source_version_id TEXT NOT NULL REFERENCES source_versions(source_version_id),
+    run_id TEXT NOT NULL REFERENCES extraction_runs(run_id),
+    candidate_id TEXT NOT NULL REFERENCES candidates(candidate_id),
+    fact_type TEXT NOT NULL CHECK (fact_type IN ('stated_amount_paid', 'stated_service_period')),
+    value_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    UNIQUE (candidate_id, fact_type)
+);
+CREATE TABLE decisions (
+    decision_id TEXT PRIMARY KEY,
+    fact_id TEXT NOT NULL REFERENCES facts(fact_id),
+    command_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL REFERENCES candidates(candidate_id),
+    slot TEXT NOT NULL CHECK (slot IN ('stated_amount_paid', 'stated_service_period')),
+    kind TEXT NOT NULL CHECK (kind IN ('rule_adopt', 'human_correct', 'undo')),
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('rule', 'human')),
+    actor_id TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL,
+    rule_version TEXT,
+    prior_value_json TEXT,
+    new_value_json TEXT NOT NULL,
+    target_decision_id TEXT REFERENCES decisions(decision_id),
+    CHECK (
+        (kind = 'rule_adopt' AND actor_kind = 'rule' AND rule_version IS NOT NULL
+            AND target_decision_id IS NULL AND prior_value_json IS NULL)
+        OR (kind = 'human_correct' AND actor_kind = 'human' AND rule_version IS NULL
+            AND target_decision_id IS NULL AND prior_value_json IS NOT NULL)
+        OR (kind = 'undo' AND actor_kind = 'human' AND rule_version IS NULL
+            AND target_decision_id IS NOT NULL AND prior_value_json IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX decisions_command_candidate_slot
+    ON decisions(command_id, candidate_id, slot);
+CREATE INDEX decisions_fact ON decisions(fact_id);
+CREATE TABLE t3_receipts (
+    command_id TEXT PRIMARY KEY,
+    payload_version TEXT NOT NULL CHECK (payload_version = 't3-payload-1'),
+    canonical_payload TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
 );
 "#;
 

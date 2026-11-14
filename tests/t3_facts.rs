@@ -440,13 +440,7 @@ fn format_3_publishes_only_after_the_main_header_matches() {
     assert_eq!(body["created_new_vault"], false);
     assert!(!vault3.exists());
 
-    let (code, body) = run(&[
-        "init",
-        "--vault",
-        vault3.to_str().unwrap(),
-        "--format",
-        "3",
-    ]);
+    let (code, body) = run(&["init", "--vault", vault3.to_str().unwrap(), "--format", "3"]);
     assert_eq!(code, 0, "{body}");
     assert_eq!(body["vault_format"], 3);
     assert_eq!(body["created_new_vault"], true);
@@ -462,10 +456,7 @@ fn format_3_publishes_only_after_the_main_header_matches() {
         "3"
     );
     assert_eq!(
-        sql(
-            &vault3,
-            "SELECT value FROM meta WHERE key='vault_format';"
-        ),
+        sql(&vault3, "SELECT value FROM meta WHERE key='vault_format';"),
         "3"
     );
     assert_eq!(
@@ -580,7 +571,10 @@ fn baseline_42364745_refuses_format_3_before_any_write() {
         assert!(!hold.exists());
     }
     assert_eq!(header_user_version(&vault.join("vault.db")), 3);
-    assert_eq!(tree(&vault.join("journal")), Vec::<(String, Vec<u8>)>::new());
+    assert_eq!(
+        tree(&vault.join("journal")),
+        Vec::<(String, Vec<u8>)>::new()
+    );
 }
 
 #[test]
@@ -602,4 +596,447 @@ fn a_newer_than_3_header_is_still_refused_without_a_rewrite() {
     assert_eq!(body["reason"], "newer_schema");
     assert_eq!(body["schema_version_found"], 4);
     assert_eq!(fs::read(vault.join("vault.db")).unwrap(), before);
+}
+
+fn init3(tmp: &Tmp) -> PathBuf {
+    let vault = tmp.path().join("vault");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "3"]);
+    assert_eq!(code, 0, "{body}");
+    assert_eq!(body["vault_format"], 3);
+    assert_eq!(header_user_version(&vault.join("vault.db")), 3);
+    vault
+}
+
+fn write_note(tmp: &Tmp, name: &str, text: &str) -> PathBuf {
+    note(tmp, name, text.as_bytes())
+}
+
+fn fragment(vault: &Path, command: &str, file: &Path) -> (i32, Value) {
+    run(&[
+        "fragment",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        command,
+        "--fragment",
+        file.to_str().unwrap(),
+    ])
+}
+
+fn facts(vault: &Path) -> Value {
+    let (code, body) = run(&["facts", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{body}");
+    assert_eq!(body["slice"], "T3-facts");
+    assert_eq!(body["read_only"], true);
+    assert_eq!(body["new_effect"], false);
+    assert_eq!(body["user_ready"], false);
+    body
+}
+
+fn of_type<'a>(body: &'a Value, fact_type: &str) -> Vec<&'a Value> {
+    body["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|fact| fact["fact_type"] == fact_type)
+        .collect()
+}
+
+#[test]
+fn one_command_records_paid_and_period_without_making_a_purchase() {
+    let tmp = Tmp::new("stated");
+    let vault = init3(&tmp);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('facts','decisions','t3_receipts','source_versions') ORDER BY name;"
+        ),
+        "decisions\nfacts\nsource_versions\nt3_receipts"
+    );
+    let decisions_sql = sql(
+        &vault,
+        "SELECT sql FROM sqlite_master WHERE name='decisions';",
+    );
+    assert!(!decisions_sql.contains("UNIQUE"), "{decisions_sql}");
+    let index_sql = sql(
+        &vault,
+        "SELECT sql FROM sqlite_master WHERE name='decisions_command_candidate_slot';",
+    );
+    assert!(index_sql.contains("command_id"), "{index_sql}");
+    assert!(index_sql.contains("candidate_id"), "{index_sql}");
+    assert!(index_sql.contains("slot"), "{index_sql}");
+
+    let file = write_note(
+        &tmp,
+        "stated.txt",
+        "Amount paid USD 15.99\nAmount paid USD 4.00\nTotal USD 15.99\nThis Total is an order total whose payment nature is not stated.\nService period: 2020-01-01 through 2020-01-31\nThis document states the service period above and no status after 2020-02-01.\nAccount email: one@example.test\nAccount email: two@example.test\n",
+    );
+    let (code, body) = fragment(&vault, "stated", &file);
+    assert_eq!(code, 0, "{body}");
+    assert_eq!(body["slice"], "T3-facts");
+    assert_eq!(body["facts_published"], true);
+    assert_eq!(body["candidates_published"], true);
+    assert_eq!(body["payment_verified"], false);
+    assert!(body["observed_at"].is_null());
+    assert_eq!(body["time_status"], "unknown");
+    assert_eq!(body["current_status"], "unknown");
+    assert!(body["purchase_id"].is_null());
+    let anchors = body["fact_anchors"].as_array().unwrap();
+    assert_eq!(anchors.len(), 3, "{body}");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE command_id='stated';"
+        ),
+        "3"
+    );
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(DISTINCT command_id) FROM decisions WHERE command_id='stated';"
+        ),
+        "1"
+    );
+    assert_eq!(sql(&vault, "SELECT count(*) FROM t3_receipts;"), "1");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM commands;"), "1");
+    assert_eq!(sql(&vault, "SELECT DISTINCT adopted FROM candidates;"), "0");
+
+    let listed = facts(&vault);
+    let paid = of_type(&listed, "stated_amount_paid");
+    let period = of_type(&listed, "stated_service_period");
+    assert_eq!(paid.len(), 2, "{listed}");
+    assert_eq!(period.len(), 1, "{listed}");
+    assert_eq!(listed["facts"].as_array().unwrap().len(), 3);
+    let amounts: Vec<_> = paid
+        .iter()
+        .map(|fact| fact["value"]["amount_text"].as_str().unwrap())
+        .collect();
+    assert!(amounts.contains(&"15.99"), "{amounts:?}");
+    assert!(amounts.contains(&"4.00"), "{amounts:?}");
+    for fact in listed["facts"].as_array().unwrap() {
+        assert_eq!(fact["revision"], 1, "{fact}");
+        assert!(fact["observed_at"].is_null(), "{fact}");
+        assert_eq!(fact["time_status"], "unknown");
+        assert_eq!(fact["current_status"], "unknown");
+        assert_eq!(fact["payment_verified"], false);
+        assert!(fact["purchase_id"].is_null());
+        assert!(fact["account_id"].is_null());
+        assert!(fact["value"]["account_id"].is_null());
+        assert_eq!(fact["value"]["statement"], "source_stated");
+        let decision = &fact["decisions"][0];
+        assert_eq!(decision["kind"], "rule_adopt");
+        assert_eq!(decision["actor_kind"], "rule");
+        assert_eq!(decision["actor_id"], "act_00000000000000000000000000000001");
+        assert_eq!(decision["rule_version"], "stated-lines-1");
+        assert_eq!(decision["command_id"], "stated");
+        assert!(decision["target_decision_id"].is_null());
+        assert!(decision["prior_value"].is_null());
+        assert_ne!(decision["recorded_at"], fact["observed_at"]);
+        assert!(decision["recorded_at"].as_i64().unwrap() > 0);
+        assert_eq!(fact["candidate_id"], decision["candidate_id"]);
+        assert_eq!(
+            fact["locator"]["excerpt"],
+            fact["locator"]["locator"]["excerpt"]
+        );
+    }
+    assert_eq!(period[0]["value"]["period_start"], "2020-01-01");
+    assert_eq!(period[0]["value"]["period_end"], "2020-01-31");
+    let (code, again) = fragment(&vault, "stated", &file);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again["outcome"], "AlreadyCommitted");
+    assert_eq!(again["new_effect"], false);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "3");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM decisions;"), "3");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM t3_receipts;"), "1");
+
+    let other = write_note(
+        &tmp,
+        "other.txt",
+        "Amount paid USD 15.99\nService period: 2026-10-01 through 2026-10-31\nA different source.\n",
+    );
+    let (code, second) = fragment(&vault, "other", &other);
+    assert_eq!(code, 0, "{second}");
+    assert_ne!(second["source_id"], body["source_id"]);
+    let listed = facts(&vault);
+    assert_eq!(listed["facts"].as_array().unwrap().len(), 5, "{listed}");
+    let first_paid = of_type(&facts(&vault), "stated_amount_paid")
+        .into_iter()
+        .find(|fact| {
+            fact["source_id"] == body["source_id"] && fact["value"]["amount_text"] == "15.99"
+        })
+        .unwrap()
+        .clone();
+    let other_paid = of_type(&listed, "stated_amount_paid")
+        .into_iter()
+        .find(|fact| fact["source_id"] == second["source_id"])
+        .unwrap()
+        .clone();
+    assert_ne!(first_paid["fact_id"], other_paid["fact_id"]);
+    assert_eq!(first_paid["revision"], 1);
+    assert_eq!(other_paid["revision"], 1);
+    assert_eq!(first_paid["value"]["amount_text"], "15.99");
+    assert_eq!(other_paid["value"]["amount_text"], "15.99");
+    assert!(first_paid["purchase_id"].is_null());
+    assert!(other_paid["purchase_id"].is_null());
+
+    let credit = write_note(
+        &tmp,
+        "credit.txt",
+        "Total USD 15.99\nThis Total is a credit-note total, not an amount paid.\nReceipt of the refund is not stated.\n",
+    );
+    let (code, credit_body) = fragment(&vault, "credit", &credit);
+    assert_eq!(code, 0, "{credit_body}");
+    assert_eq!(credit_body["facts_published"], true);
+    assert!(credit_body["fact_ids"].as_array().unwrap().is_empty());
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "5");
+    let (code, candidates) = run(&["candidates", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{candidates}");
+    assert!(candidates["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["kind"] == "stated_order_total" && row["value"]["amount_text"] == "15.99"));
+    assert!(candidates["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["kind"] == "stated_credit_note_total"));
+    assert!(candidates["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["kind"] == "stated_account_label"));
+    assert!(candidates["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| {
+            row["kind"] == "stated_status_absent" && row["value"]["current_status"] == "unknown"
+        }));
+}
+
+#[test]
+fn a_late_attempt_does_not_record_a_fact() {
+    let tmp = Tmp::new("late");
+    let vault = init3(&tmp);
+    let file = write_note(
+        &tmp,
+        "late.txt",
+        "Amount paid USD 8.00\nService period: 2026-08-01 through 2026-08-31\n",
+    );
+    let checkpoint = tmp.path().join("late.json");
+    let mut child = Command::new(bin())
+        .args([
+            "fragment",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            "late",
+            "--fragment",
+            file.to_str().unwrap(),
+            "--stop-at",
+            "before_publish",
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_stopped(&mut child, &checkpoint);
+    let (code, cancel) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "late",
+        "--generation",
+        "1",
+        "--kind",
+        "fragment",
+    ]);
+    assert_eq!(code, 0, "{cancel}");
+    assert_eq!(cancel["outcome"], "CancelPending");
+    resume(child.id());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let writer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(writer["outcome"], "Late");
+    assert_eq!(writer["late"], true);
+    assert_eq!(writer["candidates_published"], false);
+    assert_eq!(writer["preservation"], "preserved");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "0");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM t3_receipts;"), "0");
+    let (code, after) = fragment(&vault, "late", &file);
+    assert_eq!(code, 0, "{after}");
+    assert_eq!(after["fact_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "2");
+}
+
+#[test]
+fn format_2_and_format_1_do_not_gain_fact_tables() {
+    let tmp = Tmp::new("nofacts");
+    let v2 = tmp.path().join("v2");
+    let (code, body) = run(&["init", "--vault", v2.to_str().unwrap(), "--format", "2"]);
+    assert_eq!(code, 0, "{body}");
+    let file = write_note(
+        &tmp,
+        "v2.txt",
+        "Amount paid USD 15.99\nService period: 2026-09-01 through 2026-09-30\n",
+    );
+    let (code, body) = fragment(&v2, "v2", &file);
+    assert_eq!(code, 0, "{body}");
+    assert_eq!(body["slice"], "T2a-body");
+    assert!(body.get("facts_published").is_none(), "{body}");
+    assert_eq!(
+        sql(
+            &v2,
+            "SELECT count(*) FROM sqlite_master WHERE name='facts';"
+        ),
+        "0"
+    );
+    assert_eq!(
+        sql(
+            &v2,
+            "SELECT count(*) FROM sqlite_master WHERE name='t3_receipts';"
+        ),
+        "0"
+    );
+    let (code, refused) = run(&["facts", "--vault", v2.to_str().unwrap()]);
+    assert_eq!(code, 14, "{refused}");
+    assert_eq!(refused["reason"], "facts_require_format_3");
+    assert_eq!(refused["new_effect"], false);
+    assert_eq!(
+        sql(
+            &v2,
+            "SELECT count(*) FROM sqlite_master WHERE name='facts';"
+        ),
+        "0"
+    );
+
+    let v1 = tmp.path().join("v1");
+    let (code, body) = run(&["init", "--vault", v1.to_str().unwrap()]);
+    assert_eq!(code, 0, "{body}");
+    let (code, refused) = run(&["facts", "--vault", v1.to_str().unwrap()]);
+    assert_eq!(code, 14, "{refused}");
+    assert_eq!(refused["reason"], "needs_upgrade");
+    assert_eq!(
+        sql(
+            &v1,
+            "SELECT count(*) FROM sqlite_master WHERE name='facts';"
+        ),
+        "0"
+    );
+}
+
+#[test]
+fn source_can_be_preserved_before_the_fact_transaction_commits() {
+    let tmp = Tmp::new("split-commit");
+    let vault = init3(&tmp);
+    let file = write_note(
+        &tmp,
+        "both.txt",
+        "Amount paid USD 15.99\nService period: 2026-09-01 through 2026-09-30\n",
+    );
+    let witness = tmp.path().join("witness.json");
+    let (code, failed) = run(&[
+        "fragment",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "held",
+        "--fragment",
+        file.to_str().unwrap(),
+        "--inject",
+        "enospc:publish_tx",
+        "--witness",
+        witness.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 15, "{failed}");
+    assert_eq!(failed["injected"], true);
+    assert_eq!(failed["preservation"], "preserved");
+    assert_eq!(failed["candidates_published"], false);
+    assert_eq!(failed["new_effect"], false);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "1");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "0");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM decisions;"), "0");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM t3_receipts;"), "0");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM commands;"), "0");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "0");
+    let original = fs::read(&file).unwrap();
+
+    let (code, committed) = fragment(&vault, "held", &file);
+    assert_eq!(code, 0, "{committed}");
+    assert_eq!(committed["facts_published"], true);
+    assert_eq!(committed["fact_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "2");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM t3_receipts;"), "1");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM commands;"), "1");
+    assert_eq!(fs::read(&file).unwrap(), original);
+
+    let crash = write_note(
+        &tmp,
+        "crash.txt",
+        "Amount paid USD 3.00\nService period: 2026-11-01 through 2026-11-30\n",
+    );
+    let checkpoint = tmp.path().join("crash.json");
+    let mut child = Command::new(bin())
+        .args([
+            "fragment",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            "crash",
+            "--fragment",
+            crash.to_str().unwrap(),
+            "--stop-at",
+            "before_publish",
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_stopped(&mut child, &checkpoint);
+    kill_stopped(&mut child);
+    let killed = child.wait_with_output().unwrap();
+    assert_eq!(killed.status.code(), None);
+    assert!(killed.stdout.is_empty());
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "2");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "2");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM commands WHERE command_id='crash';"
+        ),
+        "0"
+    );
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM t3_receipts WHERE command_id='crash';"
+        ),
+        "0"
+    );
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    let (code, retried) = fragment(&vault, "crash", &crash);
+    assert_eq!(code, 0, "{retried}");
+    assert_eq!(retried["fact_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "4");
+
+    let listed = facts(&vault);
+    let bad = sql(
+        &vault,
+        "UPDATE facts SET value_json='{' WHERE fact_id=(SELECT fact_id FROM facts ORDER BY fact_id LIMIT 1);",
+    );
+    assert!(bad.is_empty(), "{bad}");
+    let (code, broken) = run(&["facts", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 12, "{broken}");
+    assert_eq!(broken["reason"], "fact_value_unreadable");
+    assert_eq!(broken["new_effect"], false);
+    let _ = listed;
 }

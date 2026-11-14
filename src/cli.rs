@@ -25,6 +25,7 @@ struct Flags {
     witness: Option<PathBuf>,
     fragment: Option<PathBuf>,
     format: Option<u8>,
+    fact_id: Option<String>,
 }
 
 impl Flags {
@@ -47,6 +48,7 @@ impl Flags {
             witness: None,
             fragment: None,
             format: None,
+            fact_id: None,
         }
     }
 }
@@ -159,6 +161,12 @@ pub fn execute(args: Vec<String>) -> Report {
             };
             engine::query_candidates(&vault, flags.source_id)
         }
+        "facts" => {
+            let Some(vault) = flags.vault else {
+                return usage("vault_required");
+            };
+            engine::query_facts(&vault, flags.source_id, flags.fact_id)
+        }
         "cancel" => {
             let (Some(vault), Some(command_id), Some(generation)) =
                 (flags.vault, flags.command_id, flags.generation)
@@ -208,6 +216,7 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
             "--inject" => flags.inject = Some(value),
             "--witness" => flags.witness = Some(PathBuf::from(value)),
             "--fragment" => flags.fragment = Some(PathBuf::from(value)),
+            "--fact-id" => flags.fact_id = Some(value),
             "--format" => {
                 flags.format = Some(match value.as_str() {
                     "1" => 1,
