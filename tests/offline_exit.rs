@@ -894,3 +894,93 @@ fn an_unreadable_object_is_not_omitted_as_a_partial_package() {
     assert_eq!(body["completeness"], "incomplete");
     assert!(!still.exists());
 }
+
+#[test]
+fn parent_dir_fsync_after_publish_keeps_the_export_package() {
+    let tmp = Tmp::new("dirsync");
+    let vault = init(&tmp, "1");
+    let out = tmp.path().join("pkg");
+    let witness = tmp.path().join("witness.json");
+    let (code, body) = run(&[
+        "export",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--inject",
+        "io_error:export_dir_fsync",
+        "--witness",
+        witness.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 3, "{body}");
+    assert_ne!(code, 15, "{body}");
+    assert_eq!(body["outcome"], "Exported");
+    assert_ne!(body["outcome"], "Incomplete");
+    assert_eq!(body["output_written"], true);
+    assert_eq!(body["published"], true);
+    assert_eq!(body["directory_durable"], false);
+    assert_eq!(body["completeness"], "complete");
+    assert_eq!(body["reason"], "directory_durability_unknown");
+    assert_eq!(body["injected"], true);
+    assert!(body.get("output_cleanup").is_none(), "{body}");
+    let seen = serde_json::from_str::<Value>(&fs::read_to_string(&witness).unwrap()).unwrap();
+    assert_eq!(seen["point"], "export_dir_fsync");
+    assert_eq!(seen["published"], true);
+    let records_before = fs::read(out.join("records.json")).unwrap();
+    let manifest_before = fs::read(out.join("manifest.json")).unwrap();
+    let script = tmp.path().join("read_pkg.py");
+    fs::write(
+        &script,
+        r#"
+import json, os, sys
+root = sys.argv[1]
+names = set(os.listdir(root))
+assert "vault.db" not in names, names
+assert "manifest.json" in names and "records.json" in names
+manifest = json.load(open(os.path.join(root, "manifest.json"), encoding="utf-8"))
+records = json.load(open(os.path.join(root, "records.json"), encoding="utf-8"))
+assert manifest["completeness"] == "complete"
+assert records["package_version"] == "offline-exit-1"
+assert records["vault_format"] == 1
+listed = {item["path"] for item in manifest["files"]}
+assert "manifest.json" not in listed
+assert "records.json" in listed
+assert listed <= names
+print("ok")
+"#,
+    )
+    .unwrap();
+    let checked = Command::new("python3")
+        .arg(&script)
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "independent read failed\n{}\n{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let scratch: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(".export-"))
+        .collect();
+    assert!(scratch.is_empty(), "{scratch:?}");
+    let (code, again) = run(&[
+        "export",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 16, "{again}");
+    assert_eq!(again["reason"], "output_exists");
+    assert_eq!(again["output_written"], false);
+    assert_eq!(fs::read(out.join("records.json")).unwrap(), records_before);
+    assert_eq!(
+        fs::read(out.join("manifest.json")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(sql(&vault, "SELECT count(*) FROM commands;"), "0");
+}

@@ -24,7 +24,7 @@ use crate::store::{self, ObjectRow, OccurrenceRow, SourceRow};
 use super::{validate_hook_names, Hooks, InjectAction, Place};
 
 const PACKAGE_VERSION: &str = "offline-exit-1";
-const EXPORT_INJECTS: &[&str] = &["export_write"];
+const EXPORT_INJECTS: &[&str] = &["export_write", "export_dir_fsync"];
 
 pub struct ExportRequest {
     pub vault: PathBuf,
@@ -35,12 +35,12 @@ pub struct ExportRequest {
 
 pub fn export_copy(req: ExportRequest) -> Report {
     match export_inner(req) {
-        Ok(body) => Report { code: 0, body },
+        Ok((code, body)) => Report { code, body },
         Err(fail) => fail.into_report(),
     }
 }
 
-fn export_inner(req: ExportRequest) -> Result<Value, Fail> {
+fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
     validate_hook_names(
         req.hooks.stop_at.as_deref(),
         req.hooks.inject_point.as_deref(),
@@ -99,10 +99,10 @@ fn export_inner(req: ExportRequest) -> Result<Value, Fail> {
         bytes: records_bytes,
         object_id: None,
     });
-    if let Some(csv) = loaded.csv {
+    if let Some(csv) = loaded.csv.as_ref() {
         files.push(Written {
             path: "facts.csv".into(),
-            bytes: csv,
+            bytes: csv.clone(),
             object_id: None,
         });
     }
@@ -151,13 +151,53 @@ fn export_inner(req: ExportRequest) -> Result<Value, Fail> {
     }
     fs::rename(&scratch.temp, &req.out)
         .map_err(|err| scratch.fail(copy_fail(err, "export_publish")))?;
-    if let Err(err) = fsutil::fsync_dir(parent) {
-        let published = Scratch {
-            temp: req.out.clone(),
-        };
-        return Err(published.fail(copy_fail(err, "export_sync")));
-    }
+    // The published name is req.out. scratch still names the old temporary
+    // path, so a later scratch.fail must not be used to represent this package.
+    let sync_error = fsutil::fsync_dir(parent).err().map(|err| err.to_string());
+    let injected = match note_export_dir(&req.hooks) {
+        Ok(value) => value,
+        Err(message) => {
+            return Ok((
+                EXIT_INTEGRITY,
+                published_body(
+                    &req,
+                    completeness,
+                    &snapshot_id,
+                    &loaded,
+                    Some(message),
+                    false,
+                    None,
+                ),
+            ));
+        }
+    };
 
+    let body = published_body(
+        &req,
+        completeness,
+        &snapshot_id,
+        &loaded,
+        sync_error.clone(),
+        injected,
+        req.hooks.inject_action,
+    );
+    let code = if injected || sync_error.is_some() {
+        EXIT_INTEGRITY
+    } else {
+        0
+    };
+    Ok((code, body))
+}
+
+fn published_body(
+    req: &ExportRequest,
+    completeness: &str,
+    snapshot_id: &str,
+    loaded: &Loaded,
+    os_error: Option<String>,
+    injected: bool,
+    action: Option<InjectAction>,
+) -> Value {
     let mut body = honesty(if completeness == "complete" {
         "Exported"
     } else {
@@ -174,9 +214,61 @@ fn export_inner(req: ExportRequest) -> Result<Value, Fail> {
     body.insert("new_effect".into(), json!(false));
     body.insert("read_only".into(), json!(true));
     body.insert("live_directory_copy".into(), json!(false));
-    body.insert("missing".into(), Value::Array(loaded.defects));
-    body.insert("counts".into(), loaded.counts);
-    Ok(Value::Object(body))
+    body.insert("missing".into(), Value::Array(loaded.defects.clone()));
+    body.insert("counts".into(), loaded.counts.clone());
+    if injected || os_error.is_some() {
+        body.insert("published".into(), json!(true));
+        body.insert("directory_durable".into(), json!(false));
+        body.insert("reason".into(), json!("directory_durability_unknown"));
+        body.insert("during".into(), json!("export_dir_fsync"));
+        body.insert("injected".into(), json!(injected));
+        if injected {
+            if let Some(action) = action {
+                body.insert("inject_point".into(), json!("export_dir_fsync"));
+                body.insert(
+                    "inject_action".into(),
+                    json!(match action {
+                        InjectAction::Enospc => "enospc",
+                        InjectAction::IoError => "io_error",
+                    }),
+                );
+            }
+            body.insert(
+                "note".into(),
+                json!("injected fault, not a full device and not a failed disk"),
+            );
+        }
+        if let Some(message) = os_error {
+            body.insert("os_error".into(), json!(message));
+        }
+    }
+    Value::Object(body)
+}
+
+fn note_export_dir(hooks: &Hooks) -> Result<bool, String> {
+    if hooks.inject_point.as_deref() != Some("export_dir_fsync") {
+        return Ok(false);
+    }
+    let action = hooks
+        .inject_action
+        .ok_or_else(|| "inject_action_required".to_string())?;
+    let path = hooks
+        .witness
+        .clone()
+        .ok_or_else(|| "witness_required".to_string())?;
+    let name = match action {
+        InjectAction::Enospc => "enospc",
+        InjectAction::IoError => "io_error",
+    };
+    let body = json!({
+        "reached": true,
+        "point": "export_dir_fsync",
+        "action": name,
+        "published": true
+    });
+    let bytes = serde_json::to_vec_pretty(&body).map_err(|_| "export_encode".to_string())?;
+    fsutil::atomic_write(&path, &bytes).map_err(|err| err.to_string())?;
+    Ok(true)
 }
 
 struct Scratch {
