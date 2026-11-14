@@ -125,6 +125,16 @@ scripts/run-t1-evidence.sh
 
 `candidates` 只读查询。它不建表，也不写库。候选的 `value_json` 或 `locator_json` 读不出来时，不返回 `value` 为 null 的候选。运行配置或 attempt 明细读不出来时同样留下告警。这些都是退出码 12，原件字节不改。
 
+## 离线退出
+
+`export --vault PATH --out PATH` 在现有写锁下，用只读连接读一份快照，再把包写到库外。`--out` 的落点规则和 `read --out` 相同：库内、解析不了、父目录不存在、或最后一级已经存在，都拒绝，并且不创建包。包不是活动库目录的副本，里面没有 `vault.db`。
+
+`records.json` 有来源、出现、原件身份、来源版本、候选和定位、当前事实，以及全部决定。格式 3 另有 `facts.csv`，只放当前值；空的金额留空，不写成 0。`manifest.json` 记录每个文件的 SHA-256 和长度。`snapshot_id` 是 `records.json` 字节的 SHA-256，不是 SQLite 的历史版本号。原件在 `originals/<object_id>`。保护方式仍是 `undecided`：这是合成库的明文副本，不是获准的真实资料出口。
+
+核对通过才把临时目录改名为 `--out`。此时 `completeness` 是 `complete`，退出码 0。确认缺件或哈希不符时，不带 `--allow-partial yes` 就不发布，退出码 12，`completeness` 是 `incomplete`。带了这个参数才发布 `partial`，缺件留在 `missing`，不把缺的字节补成完整。对象这次读不出来不是缺件，即使带了参数也不发布。决定链对不上、引用断了，同样不发布。写失败或 `--inject io_error:export_write` / `enospc:export_write` 会删掉临时目录，退出码 3，`output_written` 为 false；删不掉则 `output_cleanup` 为 `failed`。已有的成功包不会被这次失败覆盖。
+
+这里没有主体、购买、备份、对象租约、导出取消代次，也不选择加密。复制活动库目录仍然不算完整出口。只在这台 Linux 上核对过路径。
+
 ## 这轮没有做
 
-整理、全文搜索、订阅规则、购买、权益、PDF 提取、OCR、导出、加密、真实数据导入、桌面壳和遥测都没有实现。正文候选本身不是事实。格式 3 另有事实表，只承接写明的已付金额和服务期。T0/T1 通过不等于产品完成。Linux 上的结果不代表 Windows。
+整理、全文搜索、订阅规则、购买、权益、PDF 提取、OCR、加密、真实数据导入、桌面壳和遥测都没有实现。离线退出包不是备份，也不是保护方案。正文候选本身不是事实。格式 3 另有事实表，只承接写明的已付金额和服务期。T0/T1 通过不等于产品完成。Linux 上的结果不代表 Windows。
