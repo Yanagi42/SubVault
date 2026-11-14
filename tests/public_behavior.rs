@@ -4575,3 +4575,147 @@ fn read_out(tmp: &Tmp, scenario: &str, source_id: &str, out: &Path) -> Out {
         ],
     )
 }
+
+fn vault_tree(root: &Path) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    fn walk(root: &Path, dir: &Path, found: &mut Vec<(String, String)>) {
+        let mut entries = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for path in entries {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.file_type().is_symlink() {
+                found.push((
+                    rel,
+                    format!("link:{}", fs::read_link(&path).unwrap().display()),
+                ));
+            } else if meta.is_dir() {
+                found.push((rel, "dir".into()));
+                walk(root, &path, found);
+            } else {
+                found.push((rel, format!("file:{}:{}", meta.len(), sha256(&path))));
+            }
+        }
+    }
+    walk(root, root, &mut found);
+    found
+}
+
+#[test]
+fn read_output_does_not_enter_the_active_vault() {
+    let tmp = Tmp::new("read-namespace");
+    vault_init(&tmp);
+    let source = corpus().join("originals/v-2026-10-receipt.pdf");
+    let source_bytes = fs::read(&source).unwrap();
+    let source_hash = sha256(&source);
+    let imported = import(&tmp, "pdf", "application/pdf", &source);
+    let source_id = imported["source_id"].as_str().unwrap();
+    mark_old(&tmp, source_id);
+    let object_id = imported["object_id"].as_str().unwrap();
+    let object = vault(&tmp).join("objects").join(object_id);
+    let hosted = fs::read(&object).unwrap();
+    let before_open = open_vault(&tmp).1;
+    assert_eq!(before_open["sources"][0]["user_marker"], "human-edit-v1");
+    let before_tree = vault_tree(&vault(&tmp));
+
+    let ordinary = vault(&tmp).join("objects").join("extra-name");
+    let legal = vault(&tmp)
+        .join("objects")
+        .join("obj_0123456789abcdef0123456789abcdef");
+    let journal_name = vault(&tmp).join("journal").join("plain.txt");
+    let objects_link = tmp.path().join("objects-link");
+    std::os::unix::fs::symlink(vault(&tmp).join("objects"), &objects_link).unwrap();
+    let alias_file = objects_link.join("extra-name");
+    let alias_missing = objects_link.join("missing-dir").join("extra-name");
+    let escaped_inside = objects_link.join("..").join("extra-name");
+    let targets = [
+        ("read-direct-ordinary", ordinary.as_path()),
+        ("read-direct-legal-name", legal.as_path()),
+        ("read-direct-real-object", object.as_path()),
+        ("read-direct-journal", journal_name.as_path()),
+        ("read-alias-file", alias_file.as_path()),
+        ("read-alias-missing-dir", alias_missing.as_path()),
+        ("read-alias-dotdot-stays-inside", escaped_inside.as_path()),
+    ];
+    for (scenario, path) in targets {
+        let refused = read_out(&tmp, scenario, source_id, path);
+        assert_eq!(refused.code, Some(16), "{} {}", scenario, refused.stdout);
+        let body = parse(&refused);
+        assert_eq!(body["reason"], "output_inside_vault", "{scenario} {body}");
+        assert_eq!(body["new_effect"], false, "{scenario}");
+        assert!(body.get("preservation").is_none(), "{scenario} {body}");
+        assert!(body.get("output_written").is_none(), "{scenario} {body}");
+    }
+    assert!(!ordinary.exists());
+    assert!(!legal.exists());
+    assert!(!journal_name.exists());
+    assert!(!objects_link.join("missing-dir").exists());
+    assert!(!vault(&tmp).join("extra-name").exists());
+    assert_eq!(fs::read(&object).unwrap(), hosted);
+    assert_eq!(
+        fs::read_link(&objects_link).unwrap(),
+        vault(&tmp).join("objects")
+    );
+    assert_eq!(vault_tree(&vault(&tmp)), before_tree);
+    assert_eq!(sha256(&source), source_hash);
+    let (reopen_code, reopen) = open_vault(&tmp);
+    assert_eq!(reopen_code, 0);
+    assert_eq!(reopen, before_open);
+    let recovered = run(
+        "read-namespace-recover",
+        &["recover", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(recovered.code, Some(0), "{}", recovered.stdout);
+    assert_eq!(parse(&recovered), before_open);
+
+    let plain = tmp.path().join("plain.pdf");
+    fs::write(&plain, b"keep-plain").unwrap();
+    let plain_refused = read_out(&tmp, "read-namespace-plain", source_id, &plain);
+    assert_eq!(plain_refused.code, Some(16), "{}", plain_refused.stdout);
+    assert_eq!(parse(&plain_refused)["reason"], "output_exists");
+    assert_eq!(fs::read(&plain).unwrap(), b"keep-plain");
+    let dangling_target = tmp.path().join("do-not-create");
+    let dangling = tmp.path().join("dangling-out");
+    std::os::unix::fs::symlink(&dangling_target, &dangling).unwrap();
+    let dangling_refused = read_out(&tmp, "read-namespace-dangling", source_id, &dangling);
+    assert_eq!(
+        dangling_refused.code,
+        Some(16),
+        "{}",
+        dangling_refused.stdout
+    );
+    assert_eq!(parse(&dangling_refused)["reason"], "output_exists");
+    assert!(!dangling_target.exists());
+    assert_eq!(fs::read_link(&dangling).unwrap(), dangling_target);
+
+    let sibling = tmp.path().join("vault-extra");
+    fs::create_dir(&sibling).unwrap();
+    let sibling_out = sibling.join("out.pdf");
+    let copied = read_out(&tmp, "read-prefix-sibling", source_id, &sibling_out);
+    assert_eq!(copied.code, Some(0), "{}", copied.stdout);
+    let copied_body = parse(&copied);
+    assert_eq!(copied_body["outcome"], "Read");
+    assert_eq!(copied_body["preservation"], "preserved");
+    assert_eq!(copied_body["new_effect"], false);
+    assert_eq!(fs::read(&sibling_out).unwrap(), source_bytes);
+    assert_eq!(fs::read(&object).unwrap(), hosted);
+    let escaped = objects_link
+        .join("..")
+        .join("..")
+        .join("vault-extra")
+        .join("escaped.pdf");
+    let escaped_read = read_out(&tmp, "read-alias-dotdot-outside", source_id, &escaped);
+    assert_eq!(escaped_read.code, Some(0), "{}", escaped_read.stdout);
+    assert_eq!(fs::read(&escaped).unwrap(), source_bytes);
+    assert_eq!(vault_tree(&vault(&tmp)), before_tree);
+    let (final_code, final_open) = open_vault(&tmp);
+    assert_eq!(final_code, 0);
+    assert_eq!(final_open, before_open);
+}

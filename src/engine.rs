@@ -1,7 +1,8 @@
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
@@ -889,14 +890,25 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
     let file_path = session.root.join(&relpath);
     let hash = facts.actual_hash.clone().unwrap_or_default();
     let len = facts.actual_len.unwrap_or(0);
-    if let Some(parent) = req.out.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
+    match place_output(&session.root, &req.out) {
+        Place::Inside => {
+            return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_inside_vault"));
+        }
+        Place::Unresolved(message) => {
+            return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_unresolved")
+                .extra("os_error", json!(message)));
+        }
+        Place::MissingParent => {
             return Err(Fail::new(
                 EXIT_REJECTED,
                 "Rejected",
                 "output_parent_missing",
             ));
         }
+        Place::Exists => {
+            return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_exists"));
+        }
+        Place::Create => {}
     }
     if let Err(err) = copy_exclusive(&file_path, &req.out) {
         return Err(match err {
@@ -937,6 +949,123 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
     body.insert("object_path_rejected".into(), json!(path_rejected));
     body.insert("new_effect".into(), json!(false));
     Ok(Value::Object(body))
+}
+
+enum Place {
+    Inside,
+    Unresolved(String),
+    MissingParent,
+    Exists,
+    Create,
+}
+
+/// Where a new `--out` file would be created, before this call creates anything.
+/// Ancestor symlinks are followed. The final component is not. Identity is the
+/// directory's device and inode, not a string prefix. Linux only.
+fn place_output(vault: &Path, dst: &Path) -> Place {
+    let vault_id = match vault_identity(vault) {
+        Ok(id) => id,
+        Err(err) => return Place::Unresolved(err.to_string()),
+    };
+    let abs = match absolute_existing_base(dst) {
+        Ok(path) => path,
+        Err(err) => return Place::Unresolved(err.to_string()),
+    };
+    let mut parts = path_parts(&abs);
+    let Some(file_name) = parts.pop() else {
+        return Place::Unresolved("output path has no final component".into());
+    };
+    let mut cur = PathBuf::from("/");
+    let mut missing = false;
+    for part in parts {
+        if missing {
+            break;
+        }
+        let next = cur.join(&part);
+        match fs::symlink_metadata(&next) {
+            Ok(_) => match resolved_directory(&next) {
+                Ok(dir) => cur = dir,
+                Err(err) => return Place::Unresolved(err.to_string()),
+            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => missing = true,
+            Err(err) => return Place::Unresolved(err.to_string()),
+        }
+    }
+    match directory_is_vault_or_inside(vault_id, &cur) {
+        Ok(true) => return Place::Inside,
+        Ok(false) => {}
+        Err(err) => return Place::Unresolved(err.to_string()),
+    }
+    if missing {
+        return Place::MissingParent;
+    }
+    match fs::symlink_metadata(cur.join(file_name)) {
+        Ok(_) => Place::Exists,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Place::Create,
+        Err(err) => Place::Unresolved(err.to_string()),
+    }
+}
+
+fn vault_identity(vault: &Path) -> io::Result<(u64, u64)> {
+    let real = fs::canonicalize(vault)?;
+    directory_id(&real)
+}
+
+fn absolute_existing_base(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn path_parts(path: &Path) -> Vec<OsString> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_os_string()),
+            Component::ParentDir => Some(OsString::from("..")),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
+        })
+        .collect()
+}
+
+fn resolved_directory(path: &Path) -> io::Result<PathBuf> {
+    let real = fs::canonicalize(path)?;
+    let meta = fs::metadata(&real)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output ancestor is not a directory",
+        ));
+    }
+    Ok(real)
+}
+
+fn directory_id(path: &Path) -> io::Result<(u64, u64)> {
+    let meta = fs::metadata(path)?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+fn directory_is_vault_or_inside(vault_id: (u64, u64), dir: &Path) -> io::Result<bool> {
+    let mut cursor = fs::canonicalize(dir)?;
+    for _ in 0..256 {
+        if directory_id(&cursor)? == vault_id {
+            return Ok(true);
+        }
+        let parent = cursor.join("..");
+        if directory_id(&parent)? == directory_id(&cursor)? {
+            return Ok(false);
+        }
+        let next = fs::canonicalize(&parent)?;
+        if next == cursor {
+            return Ok(false);
+        }
+        cursor = next;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "output directory identity did not resolve",
+    ))
 }
 
 enum FreshCopy {

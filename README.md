@@ -34,7 +34,8 @@ python3 synthetic/generate_corpus.py --check
 - 库已经存在，但这轮还没有读到来源行时，退出码是 21，reason 是 `vault_unseen`，`new_effect` 为 null，没有 `preservation`，也没有 `sources`。`during` 标明步骤：`lock`、`open`、`pragma`、`statfs`、`canonicalize`，或 `list_sources`、`list_objects`、`list_occurrences`、`list_commands`、`reconcile` 这种目录查询。这和横幅、`vault.db` 读失败是同一类未知：这次还没看见历史。它不表示 `COMMIT` 返回过错误。`COMMIT` 返回错误之后可见性查询也失败，才是另一条 21，reason 是 `commit_visibility_unknown`；那条没有实跑。
 - 来源已经按当前规则列入打开报告之后，旁边的扫描、清理或 checkpoint 失败只追加告警，不改各源的 `preservation` 和 `object_intact`，也不编造 `incomplete_commands`。journal 目录列不出是 `journal_unlisted`；staging 目录列不出是 `staging_unlisted`；临时文件删不掉是 `journal_tmp_not_removed` 或 `staging_not_removed`；checkpoint 失败是 `checkpoint_failed`。原来是就绪时，退出码变成 3，`new_effect` 为 false。已经是 12 的缺失或损坏保持 12。
 - `read` 在托管哈希已经相符之后，`--out` 写不出来是退出码 3，`preservation=preserved`，`object_intact=true`，`new_effect=false`，`during=read_copy`，`output_written=false`。副本不算成功，托管字节不改。`output_written=false` 只说明这次输出不成功。`output_cleanup` 另说清理：`not_created` 是本调用没有创建文件；`removed` 是本调用创建的半成品已经删掉；`failed` 是删除没有成功，半成品可能还在，并带 `output_cleanup_error`。
-- `read --out` 的最后一级已经是目录项时，退出码 16，reason 是 `output_exists`。普通文件、目录和符号链接都算，悬空符号链接也算。不打开该目录项，不删除它，不创建或改写链接目标，也不写托管对象和外部原件。父目录不存在仍是 `output_parent_missing`。新建使用 Linux 的 `O_CREAT|O_EXCL|O_NOFOLLOW`。检查之后才出现的最后一级会使这次打开失败，并且不删除那个目录项；这个并发窗口没有单独跑。Windows 的符号链接和 `open` 语义没有测。
+- `read --out` 在创建任何目录或文件之前，沿目标路径解析已经存在的祖先，并跟随祖先上的符号链接。判定用目录的设备号和 inode，不用路径字符串前缀。落点是当前活动库本身或库内任一目录时，退出码 16，reason 是 `output_inside_vault`，不创建文件。库内直路径、指向库内目录的父链接、以及该链接后面尚不存在的子目录，都如此；名字是普通文件还是 `obj_<32 hex>` 不改变这个拒绝。`..` 在跟随祖先链接之后再解析，所以从库内目录往上跳出后落到库外的路径可以写入，停在库内的路径仍然拒绝。无法解析落点时退出码 16，reason 是 `output_unresolved`，同样不创建。库外、名称与库目录只共享字符串前缀的目录不是库内路径。
+- `read --out` 的最后一级已经是目录项，并且它所在的目录不在活动库内时，退出码 16，reason 是 `output_exists`。普通文件、目录和符号链接都算，悬空符号链接也算。不打开该目录项，不删除它，不创建或改写链接目标，也不写托管对象和外部原件。祖先已在库外、但直接父目录还不存在时，仍是 `output_parent_missing`。新建使用 Linux 的 `O_CREAT|O_EXCL|O_NOFOLLOW`。检查之后才出现的最后一级会使这次打开失败，并且不删除那个目录项；这个并发窗口没有单独跑。以上路径判定只在这台 Linux 上核对。Windows 的真实路径、大小写和 junction 没有跑，Linux 上的结果不表示这些语义已经通过。
 
 `user_marker` 是一条已提交的观察用文本，用来确认后来的导入、失败和重试没有改掉旧值。它不是订阅事实。导入不会改写它。
 
@@ -53,7 +54,7 @@ python3 synthetic/generate_corpus.py --check
 | 13 | 只读损坏。打开和取消都不重建、不覆盖。`sqlite_header` 表示文件头字节已经读到，但不是 16 字节的 `SQLite format 3\0`；读到的长度不足 16 字节，包括 0 字节文件，也是这个 reason。文件打不开，或读操作本身失败，不是 13，那是 21 的 `vault_unreadable`。同一退出码还有版本检查的只读连接打不开（`sqlite_unreadable`）、`user_version` 读失败（`user_version_unreadable`）、读到的 `user_version` 不是 1 且不高于 1（`unexpected_user_version`）、`schema_version` 那一行读失败（`meta_unreadable`）。读到的 `schema_version` 不是 `1` 是退出码 12；高于 1 的 `user_version` 是退出码 14。行为测试跑过坏头和 0 字节文件的打开与取消。独立复核还实跑过合法的 16 字节 `SQLite format 3\0` 头：打开返回退出码 13，reason 是 `user_version_unreadable`，文件字节保持不变。`sqlite_unreadable`、`unexpected_user_version`，以及版本检查里只读连接的 `meta_unreadable`，没有单独触发 |
 | 14 | `user_version` 高于 1。打开和取消都不迁移、不覆盖 |
 | 15 | 没有保全。只用于这次命令还没有提交成功，包括新导入、新标记、未提交取消、真实 IO 错误和测试注入。回执带 `preservation=not_preserved`。已经核对过的历史、还没看到来源行的打开，都不用 15 |
-| 16 | 拒绝。载荷冲突、代次不符，或提取取消。`read --out` 的最后一级已经存在时也是 16，reason 是 `output_exists`，包括普通文件、目录和符号链接；悬空符号链接不跟随，链接目标不被创建。不写托管对象、外部原件和已有输出。只在 Linux 上核对 |
+| 16 | 拒绝。载荷冲突、代次不符，或提取取消。`read --out` 的落点在活动库内是 `output_inside_vault`；落点解析不了是 `output_unresolved`。两者都不创建目录或文件。最后一级已在库外存在时是 `output_exists`，包括普通文件、目录和符号链接；悬空符号链接不跟随，链接目标不被创建。不写托管对象、外部原件和已有输出。只在 Linux 上核对；Windows 真实路径、大小写和 junction 没有跑 |
 | 17 | 请求的故障点在这次命令上不可能到达。命令不会假装成功 |
 | 18 | 文件系统被识别为 NFS 或 SMB/CIFS |
 | 19 | 横幅内容已经读到，并且不是合成库横幅。不改写横幅文件 |
@@ -96,7 +97,7 @@ journal 是一份字段表生成的 JSON。未知键被忽略。可选字段缺�
 
 这轮只在这台 Linux 云端虚拟机上验证。文件系统是 ext4（`findmnt` 的类型是 ext4，magic 是 `0xef53`；`stat -f` 的类型名可能显示成 ext2/ext3，以 magic 为准）。
 
-写锁是 Unix `flock`。没有测过 Windows 原生锁。没有测过断电和坏盘。NFS magic `0x6969` 与 SMB/CIFS magic `0xFF534D42`、`0xFE534D42` 会拒绝，但本轮没有挂载这些文件系统。同步盘没有探测，也不支持。回执里的 `platform_limits` 使用这些原句，不能读成跨平台或同步盘已经通过。
+写锁是 Unix `flock`。没有测过 Windows 原生锁，也没有测过 Windows 的真实路径、大小写折叠和 junction。没有测过断电和坏盘。NFS magic `0x6969` 与 SMB/CIFS magic `0xFF534D42`、`0xFE534D42` 会拒绝，但本轮没有挂载这些文件系统。同步盘没有探测，也不支持。回执里的 `platform_limits` 使用这些原句，不能读成跨平台或同步盘已经通过。
 
 ## 复现
 
