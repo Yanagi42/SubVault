@@ -23,6 +23,7 @@ struct Flags {
     checkpoint: Option<PathBuf>,
     inject: Option<String>,
     witness: Option<PathBuf>,
+    fragment: Option<PathBuf>,
 }
 
 impl Flags {
@@ -43,6 +44,7 @@ impl Flags {
             checkpoint: None,
             inject: None,
             witness: None,
+            fragment: None,
         }
     }
 }
@@ -132,6 +134,26 @@ pub fn execute(args: Vec<String>) -> Report {
                 hooks,
             })
         }
+        "fragment" => {
+            let (Some(vault), Some(command_id), Some(fragment)) =
+                (flags.vault, flags.command_id, flags.fragment)
+            else {
+                return usage("fragment_required_flags");
+            };
+            engine::submit_fragment(engine::FragmentRequest {
+                vault,
+                command_id,
+                fragment,
+                batch_id: flags.batch_id,
+                hooks,
+            })
+        }
+        "candidates" => {
+            let Some(vault) = flags.vault else {
+                return usage("vault_required");
+            };
+            engine::query_candidates(&vault, flags.source_id)
+        }
         "cancel" => {
             let (Some(vault), Some(command_id), Some(generation)) =
                 (flags.vault, flags.command_id, flags.generation)
@@ -180,6 +202,7 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
             "--checkpoint" => flags.checkpoint = Some(PathBuf::from(value)),
             "--inject" => flags.inject = Some(value),
             "--witness" => flags.witness = Some(PathBuf::from(value)),
+            "--fragment" => flags.fragment = Some(PathBuf::from(value)),
             _ => {
                 return Err(
                     Fail::new(EXIT_USAGE, "Usage", "unknown_flag").extra("flag", json!(flag))

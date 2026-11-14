@@ -31,6 +31,11 @@ use crate::model::{
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
+#[path = "fragment.rs"]
+mod fragment;
+
+pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
+
 const IMPORT_STOPS: &[&str] = &[
     "before_copy",
     "during_copy",
@@ -154,7 +159,7 @@ pub fn help_report() -> Report {
     let mut body = honesty("Help");
     body.insert(
         "note".into(),
-        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, extract, or accept real data. Security is not complete. This is not a user-ready product."),
+        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. Those candidates are not facts, purchases, or account links. PDF extraction is not available. Security is not complete. This is not a user-ready product."),
     );
     body.insert(
         "commands".into(),
@@ -167,7 +172,9 @@ pub fn help_report() -> Report {
             "import --vault PATH --command-id ID --media-type TYPE --source PATH [--batch-id ID] [--display-name NAME]",
             "read --vault PATH --source-id ID --out PATH",
             "marker --vault PATH --command-id ID --source-id ID --value TEXT",
-            "cancel --vault PATH --command-id ID --generation N [--kind preservation|extraction]",
+            "fragment --vault PATH --command-id ID --fragment PATH [--batch-id ID]",
+            "candidates --vault PATH [--source-id ID]",
+            "cancel --vault PATH --command-id ID --generation N [--kind preservation|fragment|extraction]",
             "recover --vault PATH",
             "hold --vault PATH --stop-at lock_held --checkpoint PATH"
         ]),
@@ -478,7 +485,7 @@ fn import_attempt(
         "before_copy",
         checkpoint_map(&command_id, 0, Some(expected_len), None, false, false),
     )?;
-    if take_cancel(&session.root, &command_id, journal.generation)? {
+    if take_cancel(&session.root, &command_id, journal.generation, "preservation")? {
         return Err(cancelled());
     }
     journal.state = "copying".into();
@@ -494,7 +501,7 @@ fn import_attempt(
         journal.generation,
         expected_len,
     )?;
-    if take_cancel(&session.root, &command_id, journal.generation)? {
+    if take_cancel(&session.root, &command_id, journal.generation, "preservation")? {
         return Err(cancelled());
     }
     let (hash, len) = sha256_file(&staging).map_err(|err| io_fail(err, "hash_staging"))?;
@@ -568,7 +575,7 @@ fn import_attempt(
         "before_db_commit",
         checkpoint_map(&command_id, len, Some(len), Some(&hash), true, false),
     )?;
-    if take_cancel(&session.root, &command_id, journal.generation)? {
+    if take_cancel(&session.root, &command_id, journal.generation, "preservation")? {
         return Err(cancelled());
     }
 
@@ -1157,6 +1164,9 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
     if !is_command_id(&req.command_id) || req.generation < 1 {
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_cancel"));
     }
+    if req.kind == "fragment" {
+        return fragment::cancel_fragment(req);
+    }
     if req.kind == "extraction" {
         let session = open_session(&req.vault)?;
         let _session = session;
@@ -1482,7 +1492,7 @@ fn copy_source(
             "during_copy",
             checkpoint_map(command_id, written, Some(expected_len), None, false, false),
         )?;
-        if take_cancel(root, command_id, generation)? {
+        if take_cancel(root, command_id, generation, "preservation")? {
             return Err(cancelled());
         }
         output
@@ -1496,7 +1506,7 @@ fn copy_source(
             "during_copy",
             checkpoint_map(command_id, written, Some(expected_len), None, false, false),
         )?;
-        if take_cancel(root, command_id, generation)? {
+        if take_cancel(root, command_id, generation, "preservation")? {
             return Err(cancelled());
         }
     }
@@ -1562,7 +1572,12 @@ fn unwind(root: &Path, journal: &mut Journal, phase: &Phase, fail: Fail) -> Resu
     Ok(fail)
 }
 
-fn take_cancel(root: &Path, command_id: &str, generation: i64) -> Result<bool, Fail> {
+fn take_cancel(
+    root: &Path,
+    command_id: &str,
+    generation: i64,
+    expected_kind: &str,
+) -> Result<bool, Fail> {
     let path = root.join("control").join(command_id);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -1583,7 +1598,7 @@ fn take_cancel(root: &Path, command_id: &str, generation: i64) -> Result<bool, F
     }
     if !cancel
         || seen_generation != Some(generation)
-        || kind.as_deref().unwrap_or("preservation") != "preservation"
+        || kind.as_deref().unwrap_or("preservation") != expected_kind
     {
         return Ok(false);
     }
@@ -1591,9 +1606,9 @@ fn take_cancel(root: &Path, command_id: &str, generation: i64) -> Result<bool, F
     Ok(true)
 }
 
-fn write_control(root: &Path, command_id: &str, generation: i64) -> Result<(), Fail> {
+fn write_control(root: &Path, command_id: &str, generation: i64, kind: &str) -> Result<(), Fail> {
     fs::create_dir_all(root.join("control")).map_err(|err| io_fail(err, "control_dir"))?;
-    let body = format!("cancel\ngeneration={generation}\nkind=preservation\n");
+    let body = format!("cancel\ngeneration={generation}\nkind={kind}\n");
     atomic_write(&root.join("control").join(command_id), body.as_bytes())
         .map_err(|err| io_fail(err, "control_write"))
 }
@@ -1815,7 +1830,7 @@ fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "generation_mismatch")
             .extra("cancel_applied", json!(false)));
     }
-    write_control(&req.vault, &req.command_id, req.generation)?;
+    write_control(&req.vault, &req.command_id, req.generation, &req.kind)?;
     let mut body = honesty("CancelPending");
     body.insert("command_id".into(), json!(req.command_id));
     body.insert("generation".into(), json!(req.generation));

@@ -187,6 +187,12 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
             if command_ids.contains(journal.command_id.as_str()) {
                 continue;
             }
+            let fragment_source = journal.kind == "fragment";
+            let source_kept = fragment_source
+                && journal
+                    .source_id
+                    .as_deref()
+                    .is_some_and(|id| sources.iter().any(|source| source.source_id == id));
             incomplete.push(json!({
                 "command_id": journal.command_id,
                 "kind": journal.kind,
@@ -194,8 +200,9 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
                 "reason": journal.reason,
                 "content_sha256": journal.content_sha256,
                 "byte_length": journal.byte_length,
-                "preservation": NOT_PRESERVED,
-                "source_id": null,
+                "preservation": if source_kept { PRESERVED } else { NOT_PRESERVED },
+                "source_id": if fragment_source { json!(journal.source_id) } else { Value::Null },
+                "candidates_published": if fragment_source { json!(false) } else { Value::Null },
                 "purchase_id": null
             }));
         }
