@@ -4340,6 +4340,8 @@ fn side_failures_do_not_rewrite_known_history() {
     assert_eq!(copy_body["object_intact"], true);
     assert_eq!(copy_body["new_effect"], false);
     assert_eq!(copy_body["output_written"], false);
+    assert_eq!(copy_body["output_cleanup"], "not_created");
+    assert!(copy_body["output_cleanup_error"].is_null());
     assert_eq!(copy_body["content_sha256"], pdf["content_sha256"]);
     assert!(!blocked.join("out.pdf").exists());
     assert_eq!(fs::read(&pdf_path).unwrap(), pdf_bytes);
@@ -4485,4 +4487,91 @@ fn catalog_query_failure_does_not_invent_preservation() {
     assert!(body["new_effect"].is_null(), "{body}");
     assert!(body.get("preservation").is_none(), "{body}");
     assert!(body.get("sources").is_none(), "{body}");
+}
+
+#[test]
+fn read_out_symlink_is_not_followed() {
+    let tmp = Tmp::new("read-symlink");
+    vault_init(&tmp);
+    let source = corpus().join("originals/v-2026-10-receipt.pdf");
+    let source_bytes = fs::read(&source).unwrap();
+    let source_hash = sha256(&source);
+    let imported = import(&tmp, "pdf", "application/pdf", &source);
+    let source_id = imported["source_id"].as_str().unwrap();
+    let object = vault(&tmp)
+        .join("objects")
+        .join(imported["object_id"].as_str().unwrap());
+    let hosted = fs::read(&object).unwrap();
+
+    let missing = tmp.path().join("do-not-create");
+    let dangling = tmp.path().join("dangling");
+    std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+    let refused = read_out(&tmp, "read-dangling", source_id, &dangling);
+    assert_eq!(refused.code, Some(16), "{}", refused.stdout);
+    let refused_body = parse(&refused);
+    assert_eq!(refused_body["reason"], "output_exists");
+    assert!(refused_body.get("preservation").is_none(), "{refused_body}");
+    assert!(
+        refused_body.get("output_written").is_none(),
+        "{refused_body}"
+    );
+    assert!(!missing.exists());
+    assert_eq!(fs::read_link(&dangling).unwrap(), missing);
+    assert!(fs::symlink_metadata(&dangling)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+
+    let hosted_link = tmp.path().join("hosted-link");
+    std::os::unix::fs::symlink(&object, &hosted_link).unwrap();
+    let hosted_refused = read_out(&tmp, "read-hosted-link", source_id, &hosted_link);
+    assert_eq!(hosted_refused.code, Some(16), "{}", hosted_refused.stdout);
+    assert_eq!(parse(&hosted_refused)["reason"], "output_exists");
+    assert_eq!(fs::read(&object).unwrap(), hosted);
+    assert_eq!(fs::read_link(&hosted_link).unwrap(), object);
+
+    let external = tmp.path().join("external.pdf");
+    fs::write(&external, &source_bytes).unwrap();
+    let external_link = tmp.path().join("external-link");
+    std::os::unix::fs::symlink(&external, &external_link).unwrap();
+    let external_refused = read_out(&tmp, "read-external-link", source_id, &external_link);
+    assert_eq!(
+        external_refused.code,
+        Some(16),
+        "{}",
+        external_refused.stdout
+    );
+    assert_eq!(parse(&external_refused)["reason"], "output_exists");
+    assert_eq!(fs::read(&external).unwrap(), source_bytes);
+    assert_eq!(fs::read_link(&external_link).unwrap(), external);
+
+    let plain = tmp.path().join("plain.pdf");
+    fs::write(&plain, b"keep-plain").unwrap();
+    let plain_refused = read_out(&tmp, "read-plain-exists", source_id, &plain);
+    assert_eq!(plain_refused.code, Some(16), "{}", plain_refused.stdout);
+    assert_eq!(parse(&plain_refused)["reason"], "output_exists");
+    assert_eq!(fs::read(&plain).unwrap(), b"keep-plain");
+
+    assert_eq!(fs::read(&object).unwrap(), hosted);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(sha256(&source), source_hash);
+    let fresh = tmp.path().join("fresh.pdf");
+    let copied = read_out(&tmp, "read-fresh", source_id, &fresh);
+    assert_eq!(copied.code, Some(0), "{}", copied.stdout);
+    assert_eq!(fs::read(&fresh).unwrap(), hosted);
+}
+
+fn read_out(tmp: &Tmp, scenario: &str, source_id: &str, out: &Path) -> Out {
+    run(
+        scenario,
+        &[
+            "read",
+            "--vault",
+            vault(tmp).to_str().unwrap(),
+            "--source-id",
+            source_id,
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    )
 }

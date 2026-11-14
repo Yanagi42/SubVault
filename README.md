@@ -33,7 +33,8 @@ python3 synthetic/generate_corpus.py --check
 - 还没有本命令提交行的新导入、新标记和未提交取消，失败仍是退出码 15，`preservation=not_preserved`。这只说明这次命令没有提交。
 - 库已经存在，但这轮还没有读到来源行时，退出码是 21，reason 是 `vault_unseen`，`new_effect` 为 null，没有 `preservation`，也没有 `sources`。`during` 标明步骤：`lock`、`open`、`pragma`、`statfs`、`canonicalize`，或 `list_sources`、`list_objects`、`list_occurrences`、`list_commands`、`reconcile` 这种目录查询。这和横幅、`vault.db` 读失败是同一类未知：这次还没看见历史。它不表示 `COMMIT` 返回过错误。`COMMIT` 返回错误之后可见性查询也失败，才是另一条 21，reason 是 `commit_visibility_unknown`；那条没有实跑。
 - 来源已经按当前规则列入打开报告之后，旁边的扫描、清理或 checkpoint 失败只追加告警，不改各源的 `preservation` 和 `object_intact`，也不编造 `incomplete_commands`。journal 目录列不出是 `journal_unlisted`；staging 目录列不出是 `staging_unlisted`；临时文件删不掉是 `journal_tmp_not_removed` 或 `staging_not_removed`；checkpoint 失败是 `checkpoint_failed`。原来是就绪时，退出码变成 3，`new_effect` 为 false。已经是 12 的缺失或损坏保持 12。
-- `read` 在托管哈希已经相符之后，`--out` 写不出来是退出码 3，`preservation=preserved`，`object_intact=true`，`new_effect=false`，`during=read_copy`，`output_written=false`。副本不算成功，托管字节不改。
+- `read` 在托管哈希已经相符之后，`--out` 写不出来是退出码 3，`preservation=preserved`，`object_intact=true`，`new_effect=false`，`during=read_copy`，`output_written=false`。副本不算成功，托管字节不改。`output_written=false` 只说明这次输出不成功。`output_cleanup` 另说清理：`not_created` 是本调用没有创建文件；`removed` 是本调用创建的半成品已经删掉；`failed` 是删除没有成功，半成品可能还在，并带 `output_cleanup_error`。
+- `read --out` 的最后一级已经是目录项时，退出码 16，reason 是 `output_exists`。普通文件、目录和符号链接都算，悬空符号链接也算。不打开该目录项，不删除它，不创建或改写链接目标，也不写托管对象和外部原件。父目录不存在仍是 `output_parent_missing`。新建使用 Linux 的 `O_CREAT|O_EXCL|O_NOFOLLOW`。检查之后才出现的最后一级会使这次打开失败，并且不删除那个目录项；这个并发窗口没有单独跑。Windows 的符号链接和 `open` 语义没有测。
 
 `user_marker` 是一条已提交的观察用文本，用来确认后来的导入、失败和重试没有改掉旧值。它不是订阅事实。导入不会改写它。
 
@@ -45,14 +46,14 @@ python3 synthetic/generate_corpus.py --check
 | --- | --- |
 | 0 | 完成、已提交过、已取消、取消已挂起，或打开后就绪 |
 | 2 | 用法错误 |
-| 3 | 有告警且引用没有悬空。对象路径被拒绝但规范路径上的字节仍完整，journal 标签没能改写，或来源报告已经列出之后扫描、清理、checkpoint 失败，都走这里。某一个托管对象、对象目录或未引用对象这次读不出，也走这里：读得出的源仍是 `preserved`，读不出的源不写保全结论。托管哈希已经相符但 `read --out` 失败同样是 3，`preservation=preserved`，`output_written=false`。已提交命令的外部路径读不出或不是文件时，导入也用 3，outcome 是 `ExternalUnverified` |
+| 3 | 有告警且引用没有悬空。对象路径被拒绝但规范路径上的字节仍完整，journal 标签没能改写，或来源报告已经列出之后扫描、清理、checkpoint 失败，都走这里。某一个托管对象、对象目录或未引用对象这次读不出，也走这里：读得出的源仍是 `preserved`，读不出的源不写保全结论。托管哈希已经相符但 `read --out` 失败同样是 3，`preservation=preserved`，`output_written=false`。`output_cleanup` 标明半成品是 `not_created`、`removed` 还是 `failed`；`output_written=false` 不等于删除成功。已提交命令的外部路径读不出或不是文件时，导入也用 3，outcome 是 `ExternalUnverified` |
 | 10 | 不是库。缺失路径不会被创建 |
 | 11 | 另一个进程持有写锁 |
 | 12 | 需要恢复：对象缺失或哈希不符、悬空引用、无法读取的 journal、成功回执不是 JSON 对象。单独 `read` 或重放某一个读不出的托管对象也是 12，`object_unreadable`，那条回执不写 `preservation` |
 | 13 | 只读损坏。打开和取消都不重建、不覆盖。`sqlite_header` 表示文件头字节已经读到，但不是 16 字节的 `SQLite format 3\0`；读到的长度不足 16 字节，包括 0 字节文件，也是这个 reason。文件打不开，或读操作本身失败，不是 13，那是 21 的 `vault_unreadable`。同一退出码还有版本检查的只读连接打不开（`sqlite_unreadable`）、`user_version` 读失败（`user_version_unreadable`）、读到的 `user_version` 不是 1 且不高于 1（`unexpected_user_version`）、`schema_version` 那一行读失败（`meta_unreadable`）。读到的 `schema_version` 不是 `1` 是退出码 12；高于 1 的 `user_version` 是退出码 14。行为测试跑过的是坏头和 0 字节文件的打开与取消。其余四个 reason 没有单独触发 |
 | 14 | `user_version` 高于 1。打开和取消都不迁移、不覆盖 |
 | 15 | 没有保全。只用于这次命令还没有提交成功，包括新导入、新标记、未提交取消、真实 IO 错误和测试注入。回执带 `preservation=not_preserved`。已经核对过的历史、还没看到来源行的打开，都不用 15 |
-| 16 | 拒绝。载荷冲突、代次不符，或提取取消 |
+| 16 | 拒绝。载荷冲突、代次不符，或提取取消。`read --out` 的最后一级已经存在时也是 16，reason 是 `output_exists`，包括普通文件、目录和符号链接；悬空符号链接不跟随，链接目标不被创建。不写托管对象、外部原件和已有输出。只在 Linux 上核对 |
 | 17 | 请求的故障点在这次命令上不可能到达。命令不会假装成功 |
 | 18 | 文件系统被识别为 NFS 或 SMB/CIFS |
 | 19 | 横幅内容已经读到，并且不是合成库横幅。不改写横幅文件 |

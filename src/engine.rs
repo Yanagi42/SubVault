@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -888,9 +889,6 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
     let file_path = session.root.join(&relpath);
     let hash = facts.actual_hash.clone().unwrap_or_default();
     let len = facts.actual_len.unwrap_or(0);
-    if req.out.exists() {
-        return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_exists"));
-    }
     if let Some(parent) = req.out.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             return Err(Fail::new(
@@ -900,19 +898,32 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
             ));
         }
     }
-    if let Err(err) = fs::copy(&file_path, &req.out) {
-        let _ = fs::remove_file(&req.out);
-        return Err(Fail::new(EXIT_INTEGRITY, "IntegrityAlert", "io_error")
-            .extra("during", json!("read_copy"))
-            .extra("os_error", json!(err.to_string()))
-            .extra("preservation", json!(PRESERVED))
-            .extra("object_intact", json!(true))
-            .extra("new_effect", json!(false))
-            .extra("injected", json!(false))
-            .extra("output_written", json!(false))
-            .extra("source_id", json!(source.source_id))
-            .extra("object_id", json!(source.object_id))
-            .extra("content_sha256", json!(hash)));
+    if let Err(err) = copy_exclusive(&file_path, &req.out) {
+        return Err(match err {
+            FreshCopy::Exists => Fail::new(EXIT_REJECTED, "Rejected", "output_exists"),
+            FreshCopy::Io {
+                err,
+                cleanup,
+                cleanup_error,
+            } => {
+                let mut fail = Fail::new(EXIT_INTEGRITY, "IntegrityAlert", "io_error")
+                    .extra("during", json!("read_copy"))
+                    .extra("os_error", json!(err.to_string()))
+                    .extra("preservation", json!(PRESERVED))
+                    .extra("object_intact", json!(true))
+                    .extra("new_effect", json!(false))
+                    .extra("injected", json!(false))
+                    .extra("output_written", json!(false))
+                    .extra("output_cleanup", json!(cleanup))
+                    .extra("source_id", json!(source.source_id))
+                    .extra("object_id", json!(source.object_id))
+                    .extra("content_sha256", json!(hash));
+                if let Some(message) = cleanup_error {
+                    fail = fail.extra("output_cleanup_error", json!(message));
+                }
+                fail
+            }
+        });
     }
     let mut body = honesty("Read");
     body.insert("source_id".into(), json!(source.source_id));
@@ -926,6 +937,77 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
     body.insert("object_path_rejected".into(), json!(path_rejected));
     body.insert("new_effect".into(), json!(false));
     Ok(Value::Object(body))
+}
+
+enum FreshCopy {
+    Exists,
+    Io {
+        err: io::Error,
+        cleanup: &'static str,
+        cleanup_error: Option<String>,
+    },
+}
+
+/// Create `dst` only when its final component is absent. An existing file,
+/// directory, or symlink — dangling or not — is left untouched. Linux
+/// `O_CREAT|O_EXCL|O_NOFOLLOW` covers a name that appears after the check.
+/// `output_written` is not this function's concern: `cleanup` says whether a
+/// file this call created was removed.
+fn copy_exclusive(src: &Path, dst: &Path) -> Result<(), FreshCopy> {
+    match fs::symlink_metadata(dst) {
+        Ok(_) => return Err(FreshCopy::Exists),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(FreshCopy::Io {
+                err,
+                cleanup: "not_created",
+                cleanup_error: None,
+            })
+        }
+    }
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dst)
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::AlreadyExists || refused_output(&err) {
+                FreshCopy::Exists
+            } else {
+                FreshCopy::Io {
+                    err,
+                    cleanup: "not_created",
+                    cleanup_error: None,
+                }
+            }
+        })?;
+    let copied = (|| -> io::Result<()> {
+        let mut reader = File::open(src)?;
+        let permissions = reader.metadata()?.permissions();
+        io::copy(&mut reader, &mut writer)?;
+        writer.flush()?;
+        writer.set_permissions(permissions)?;
+        Ok(())
+    })();
+    if let Err(err) = copied {
+        let (cleanup, cleanup_error) = match fs::remove_file(dst) {
+            Ok(()) => ("removed", None),
+            Err(remove_err) => ("failed", Some(remove_err.to_string())),
+        };
+        return Err(FreshCopy::Io {
+            err,
+            cleanup,
+            cleanup_error,
+        });
+    }
+    Ok(())
+}
+
+fn refused_output(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(code) if code == libc::EEXIST || code == libc::ELOOP
+    )
 }
 
 pub struct CancelRequest {
