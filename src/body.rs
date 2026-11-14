@@ -8,6 +8,7 @@ pub const EXTRACTOR_VERSION: &str = "1";
 pub const NORMALIZATION: &str = "identity-utf8-scalars-1";
 pub const JOIN: &str = "single-fragment-1";
 pub const RULES_VERSION: &str = "stated-lines-1";
+pub const LINE_ENDING: &str = "lf-or-crlf-1";
 pub const MEDIA_TYPE: &str = "text/plain;charset=utf-8";
 pub const ROLE: &str = "user_provided_fragment";
 pub const OFFSET_UNIT: &str = "unicode_scalar_in_versioned_extracted_string";
@@ -66,6 +67,7 @@ pub fn config_json() -> Value {
         "normalization": NORMALIZATION,
         "join": JOIN,
         "rules_version": RULES_VERSION,
+        "line_ending": LINE_ENDING,
         "max_fragment_bytes": MAX_FRAGMENT_BYTES,
         "max_line_bytes": MAX_LINE_BYTES,
         "max_candidates": MAX_CANDIDATES,
@@ -82,6 +84,7 @@ pub fn logical_key(content_sha256: &str) -> String {
         NORMALIZATION,
         JOIN,
         RULES_VERSION,
+        LINE_ENDING,
         &MAX_FRAGMENT_BYTES.to_string(),
         &MAX_LINE_BYTES.to_string(),
         &MAX_CANDIDATES.to_string(),
@@ -170,20 +173,29 @@ fn scan(text: &str) -> Result<Vec<Line>, ExtractError> {
             .position(|byte| *byte == b'\n')
             .map(|offset| byte_pos + offset)
             .unwrap_or(bytes.len());
-        if end - byte_start > MAX_LINE_BYTES {
+        // A CR immediately before LF is the other half of the line ending.
+        // It is not part of the sentence and it is not a Unicode rewrite.
+        let mut content_end = end;
+        if end < bytes.len() && content_end > byte_start && bytes[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+        if content_end - byte_start > MAX_LINE_BYTES {
             return Err(ExtractError::OverLine);
         }
-        let line = &text[byte_start..end];
+        let line = &text[byte_start..content_end];
         let scalars = line.chars().count();
         lines.push(Line {
             text: line.to_string(),
             scalar_start,
             scalar_end: scalar_start + scalars,
             byte_start,
-            byte_end: end,
+            byte_end: content_end,
             class: classify(line),
         });
         scalar_pos += scalars;
+        if content_end < end {
+            scalar_pos += 1;
+        }
         byte_pos = end;
         if byte_pos < bytes.len() && bytes[byte_pos] == b'\n' {
             byte_pos += 1;

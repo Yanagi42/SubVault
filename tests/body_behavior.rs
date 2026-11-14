@@ -1201,6 +1201,39 @@ fn a_damaged_stored_record_is_not_a_null_candidate() {
     assert_eq!(opened.1["outcome"], "Ready");
 }
 
+#[test]
+fn a_crlf_line_ending_is_not_part_of_the_sentence() {
+    let tmp = Tmp::new("crlf");
+    let vault = init(&tmp);
+    let file = tmp.path().join("paid.txt");
+    let bytes = b"Amount paid USD 2.00\r\n".to_vec();
+    write_file(&file, &bytes);
+    let (code, body) = fragment(&vault, "paid", &file);
+    assert_eq!(code, 0, "{body}");
+    assert_eq!(body["config"]["line_ending"], "lf-or-crlf-1");
+    assert_eq!(body["config"]["normalization"], "identity-utf8-scalars-1");
+    assert_eq!(body["config"]["rules_version"], "stated-lines-1");
+    assert_eq!(object_bytes(&vault, &body), bytes);
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+    let listed = candidates(&vault);
+    let paid = kind(&listed, "stated_amount_paid");
+    assert_eq!(paid.len(), 1);
+    assert_eq!(paid[0]["excerpt"], "Amount paid USD 2.00");
+    assert_eq!(paid[0]["value"]["amount_text"], "2.00");
+    points_at(&bytes, paid[0]);
+    assert_eq!(paid[0]["locator"]["byte_end"], 20);
+    assert_eq!(bytes[20], b'\r');
+    assert_eq!(bytes[21], b'\n');
+
+    let mixed = tmp.path().join("mixed.txt");
+    let mixed_bytes = b"Amount paid USD 2.00\rX\n".to_vec();
+    write_file(&mixed, &mixed_bytes);
+    let (code, mixed_body) = fragment(&vault, "mixed", &mixed);
+    assert_eq!(code, 0, "{mixed_body}");
+    assert_eq!(mixed_body["candidate_count"], 0);
+    assert_eq!(object_bytes(&vault, &mixed_body), mixed_bytes);
+}
+
 fn wait_stopped(child: &mut std::process::Child, checkpoint: &Path) {
     let start = Instant::now();
     loop {

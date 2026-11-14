@@ -117,7 +117,7 @@ scripts/run-t1-evidence.sh
 
 `fragment` 只接受调用者给出的一个文件。它不读标准输入、邮箱或剪贴板。文件必须是 UTF-8。空文件、超过 65536 字节、单行超过 1024 字节、以及超过 64 条候选，都拒绝发布候选。超长文件在读入正文之前拒绝，回执里的 `bytes_read` 是 0。接受下来的原始字节原样放进 `objects/`，不改外部文件，也不做 Unicode 规范化。
 
-媒体类型固定为 `text/plain;charset=utf-8`，`role` 是 `user_provided_fragment`。这不是完整邮件，`eml` 是 null。定位是这段版本化字符串上的 Unicode 标量区间，外加对应的 UTF-8 字节区间。规范化名是 `identity-utf8-scalars-1`，拼接名是 `single-fragment-1`，规则名是 `stated-lines-1`。这些和提取器 `subvault-body` 1 一起进入 logical key。
+媒体类型固定为 `text/plain;charset=utf-8`，`role` 是 `user_provided_fragment`。这不是完整邮件，`eml` 是 null。定位是这段版本化字符串上的 Unicode 标量区间，外加对应的 UTF-8 字节区间。规范化名是 `identity-utf8-scalars-1`，拼接名是 `single-fragment-1`，规则名是 `stated-lines-1`，行尾名是 `lf-or-crlf-1`。这些和提取器 `subvault-body` 1 一起进入 logical key。LF 和紧挨在 LF 前的 CR 都是行尾，不进入摘录，也不改原件字节。行中间的 CR 不是行尾。
 
 候选只记录原文里写明的句子。`Amount paid USD 15.99`、带订单说明的 `Total USD 15.99`、带贷项说明的 `Total USD 15.99` 是三种语义，金额相同也不合并。单独的 `Total`、两处 `Total` 配一条说明、或两条互相冲突的说明，都是 `unresolved_total`，`usable` 为 false。服务期和“之后没有状态”不产生观察时间，`observed_at` 保持 null，`current_status` 保持 `unknown`。两行账户邮箱和一行掩码邮箱各自保留，`attributed` 为 false，不写账户关系。认不出来的行不生成候选。
 
