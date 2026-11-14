@@ -30,6 +30,7 @@ struct Flags {
     expected_revision: Option<String>,
     amount_text: Option<String>,
     actor_id: Option<String>,
+    allow_partial: Option<bool>,
 }
 
 impl Flags {
@@ -57,6 +58,7 @@ impl Flags {
             expected_revision: None,
             amount_text: None,
             actor_id: None,
+            allow_partial: None,
         }
     }
 }
@@ -78,6 +80,9 @@ pub fn execute(args: Vec<String>) -> Report {
     };
     if flags.format.is_some() && command != "init" {
         return usage("format_only_on_init");
+    }
+    if flags.allow_partial.is_some() && command != "export" {
+        return usage("allow_partial_only_on_export");
     }
     match command.as_str() {
         "init" => {
@@ -174,6 +179,17 @@ pub fn execute(args: Vec<String>) -> Report {
                 return usage("vault_required");
             };
             engine::query_facts(&vault, flags.source_id, flags.fact_id)
+        }
+        "export" => {
+            let (Some(vault), Some(out)) = (flags.vault, flags.out) else {
+                return usage("export_required_flags");
+            };
+            engine::export_copy(engine::ExportRequest {
+                vault,
+                out,
+                allow_partial: flags.allow_partial.unwrap_or(false),
+                hooks,
+            })
         }
         "correct" => {
             let (
@@ -284,6 +300,12 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
             "--expected-revision" => flags.expected_revision = Some(value),
             "--amount-text" => flags.amount_text = Some(value),
             "--actor-id" => flags.actor_id = Some(value),
+            "--allow-partial" => {
+                if value != "yes" {
+                    return Err(Fail::new(EXIT_USAGE, "Usage", "bad_allow_partial"));
+                }
+                flags.allow_partial = Some(true);
+            }
             "--format" => {
                 flags.format = Some(match value.as_str() {
                     "1" => 1,

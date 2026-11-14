@@ -33,10 +33,13 @@ use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
 #[path = "decide.rs"]
 mod decide;
+#[path = "export.rs"]
+mod export;
 #[path = "fragment.rs"]
 mod fragment;
 
 pub use decide::{correct_fact, query_facts, undo_decision, CorrectRequest, UndoRequest};
+pub use export::{export_copy, ExportRequest};
 pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
 
 const IMPORT_STOPS: &[&str] = &[
@@ -169,7 +172,7 @@ pub fn help_report() -> Report {
     let mut body = honesty("Help");
     body.insert(
         "note".into(),
-        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. On a new format 3 vault, that same publish also records a stated paid amount and a stated service period as facts. Those facts are source statements, not verified payments, purchases, or account links. correct can replace the stated USD amount text, and undo appends a compensating decision. PDF extraction is not available. Security is not complete. This is not a user-ready product."),
+        json!("T1 preserves original bytes in a synthetic vault. It does not arrange, search, or accept real data. fragment publishes source-stated candidates for one user-submitted text fragment. On a new format 3 vault, that same publish also records a stated paid amount and a stated service period as facts. Those facts are source statements, not verified payments, purchases, or account links. correct can replace the stated USD amount text, and undo appends a compensating decision. export writes one offline package outside the vault: originals, candidates, current facts, and the decision chain. It does not choose a protection mode. PDF extraction is not available. Security is not complete. This is not a user-ready product."),
     );
     body.insert(
         "commands".into(),
@@ -185,6 +188,7 @@ pub fn help_report() -> Report {
             "fragment --vault PATH --command-id ID --fragment PATH [--batch-id ID]",
             "candidates --vault PATH [--source-id ID]",
             "facts --vault PATH [--source-id ID] [--fact-id ID]",
+            "export --vault PATH --out PATH [--allow-partial yes]",
             "correct --vault PATH --command-id ID --fact-id ID --expected-revision N --amount-text TEXT --actor-id ID",
             "undo --vault PATH --command-id ID --decision-id ID --expected-revision N --actor-id ID",
             "cancel --vault PATH --command-id ID --generation N [--kind preservation|fragment|extraction]",
