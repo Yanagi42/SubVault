@@ -24,6 +24,7 @@ struct Flags {
     inject: Option<String>,
     witness: Option<PathBuf>,
     fragment: Option<PathBuf>,
+    format: Option<u8>,
 }
 
 impl Flags {
@@ -45,6 +46,7 @@ impl Flags {
             inject: None,
             witness: None,
             fragment: None,
+            format: None,
         }
     }
 }
@@ -64,12 +66,15 @@ pub fn execute(args: Vec<String>) -> Report {
         Ok(hooks) => hooks,
         Err(fail) => return fail.into_report(),
     };
+    if flags.format.is_some() && command != "init" {
+        return usage("format_only_on_init");
+    }
     match command.as_str() {
         "init" => {
             let Some(vault) = flags.vault else {
                 return usage("vault_required");
             };
-            engine::init_vault(&vault)
+            engine::init_vault(&vault, flags.format.unwrap_or(1), hooks)
         }
         "open" | "verify" | "recover" => {
             let Some(vault) = flags.vault else {
@@ -203,6 +208,13 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
             "--inject" => flags.inject = Some(value),
             "--witness" => flags.witness = Some(PathBuf::from(value)),
             "--fragment" => flags.fragment = Some(PathBuf::from(value)),
+            "--format" => {
+                flags.format = Some(match value.as_str() {
+                    "1" => 1,
+                    "2" => 2,
+                    _ => return Err(Fail::new(EXIT_USAGE, "Usage", "bad_format")),
+                });
+            }
             _ => {
                 return Err(
                     Fail::new(EXIT_USAGE, "Usage", "unknown_flag").extra("flag", json!(flag))

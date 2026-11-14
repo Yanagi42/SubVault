@@ -51,8 +51,8 @@ python3 synthetic/generate_corpus.py --check
 | 10 | 不是库。缺失路径不会被创建 |
 | 11 | 另一个进程持有写锁 |
 | 12 | 需要恢复：对象缺失或哈希不符、悬空引用、无法读取的 journal、成功回执不是 JSON 对象。单独 `read` 或重放某一个读不出的托管对象也是 12，`object_unreadable`，那条回执不写 `preservation` |
-| 13 | 只读损坏。打开和取消都不重建、不覆盖。`sqlite_header` 表示文件头字节已经读到，但不是 16 字节的 `SQLite format 3\0`；读到的长度不足 16 字节，包括 0 字节文件，也是这个 reason。文件打不开，或读操作本身失败，不是 13，那是 21 的 `vault_unreadable`。同一退出码还有版本检查的只读连接打不开（`sqlite_unreadable`）、`user_version` 读失败（`user_version_unreadable`）、读到的 `user_version` 不是 1 且不高于 1（`unexpected_user_version`）、`schema_version` 那一行读失败（`meta_unreadable`）。读到的 `schema_version` 不是 `1` 是退出码 12；高于 1 的 `user_version` 是退出码 14。行为测试跑过坏头和 0 字节文件的打开与取消。独立复核还实跑过合法的 16 字节 `SQLite format 3\0` 头：打开返回退出码 13，reason 是 `user_version_unreadable`，文件字节保持不变。`sqlite_unreadable`、`unexpected_user_version`，以及版本检查里只读连接的 `meta_unreadable`，没有单独触发 |
-| 14 | `user_version` 高于 1。打开和取消都不迁移、不覆盖 |
+| 13 | 只读损坏。打开和取消都不重建、不覆盖。`sqlite_header` 表示文件头字节已经读到，但不是 16 字节的 `SQLite format 3\0`；读到的长度不足 16 字节，包括 0 字节文件，也是这个 reason。文件打不开，或读操作本身失败，不是 13，那是 21 的 `vault_unreadable`。同一退出码还有版本检查的只读连接打不开（`sqlite_unreadable`）、`user_version` 读失败（`user_version_unreadable`）、读到的 `user_version` 不是 1 且不高于 1（`unexpected_user_version`）、`schema_version` 那一行读失败（`meta_unreadable`）。读到的 `schema_version` 不是 `1` 是退出码 12。不认识的更高 `user_version` 是退出码 14。本程序认识的格式 2 见退出码 14。行为测试跑过坏头和 0 字节文件的打开与取消。独立复核还实跑过合法的 16 字节 `SQLite format 3\0` 头：打开返回退出码 13，reason 是 `user_version_unreadable`，文件字节保持不变。`sqlite_unreadable`、`unexpected_user_version`，以及版本检查里只读连接的 `meta_unreadable`，没有单独触发 |
+| 14 | 不认识的版本。`user_version` 高于 2，或等于 2 但主库没有配套的 `meta.vault_format=2` 且 `schema_version` 仍是 `1`，退出码 14，reason 分别是 `newer_schema` 和 `vault_format_unverified`。不恢复、不清理、不把版本号改小。格式 1 上的正文写入口在任何新 journal 或正文 DDL 之前返回 `NeedsUpgrade`。本程序可以打开新建的格式 2 库。没有成品升级或降级 |
 | 15 | 没有保全。只用于这次命令还没有提交成功，包括新导入、新标记、未提交取消、真实 IO 错误和测试注入。回执带 `preservation=not_preserved`。已经核对过的历史、还没看到来源行的打开，都不用 15 |
 | 16 | 拒绝。载荷冲突、代次不符，或提取取消。`read --out` 的落点在活动库内是 `output_inside_vault`；落点解析不了是 `output_unresolved`。两者都不创建目录或文件。最后一级已在库外存在时是 `output_exists`，包括普通文件、目录和符号链接；悬空符号链接不跟随，链接目标不被创建。不写托管对象、外部原件和已有输出。只在 Linux 上核对；Windows 真实路径、大小写和 junction 没有跑 |
 | 17 | 请求的故障点在这次命令上不可能到达。命令不会假装成功 |
@@ -63,7 +63,7 @@ python3 synthetic/generate_corpus.py --check
 
 `--stop-at during_copy` 在对象发布前停下，包括 0 字节、1 字节、2 字节，以及把第一次 `read` 强制成 1 字节的情况。多字节读取会留下短于全文的前缀。这个强制短读只作用于路径名含 `SHORTREAD-` 的文件，不是 ext4 自然短读，也不是故障注入。一次复制只停一次，恢复后把剩余字节写完。
 
-`--stop-at` 把检查点写到指定文件后发送 `SIGSTOP`。检查点文件出现只说明文件已经写完。行为测试再读到 `/proc/<pid>/status` 的 `State: T` 才发送 `SIGCONT`。等待的是这个状态。只在这台 Linux 上这样验证。`--inject enospc:POINT` 或 `--inject io_error:POINT` 把见证写到指定文件后返回未保全。注入回执里的 `injected` 是 true，并写明这不是磁盘真的满了。见证文件没有出现时，注入不算已经发生。`db_commit` 注入发生在真正的 `COMMIT` 之前，事务回滚，命令行不存在；它只证明确定的回滚，不是提交结果不确定。
+`--stop-at` 把检查点写到指定文件后发送 `SIGSTOP`。检查点文件出现只说明文件已经写完。行为测试再读到 `/proc/<pid>/status` 的 `State: T` 才发送 `SIGCONT` 或 `SIGKILL`。等待的是这个状态。只在这台 Linux 上这样验证。`SIGKILL` 只结束进程。它不是断电，也不是硬件 fsync 已经完成的证明。`--inject enospc:POINT` 或 `--inject io_error:POINT` 把见证写到指定文件后返回未保全。注入回执里的 `injected` 是 true，并写明这不是磁盘真的满了。见证文件没有出现时，注入不算已经发生。`db_commit` 注入发生在真正的 `COMMIT` 之前，事务回滚，命令行不存在；它只证明确定的回滚，不是提交结果不确定。
 
 `cancel --kind extraction` 只返回 `extraction_cancel_not_available`。它不创建提取目录，也没有 PDF 提取实现。`cancel --kind fragment` 只取消一次正文提交。保全命令在提交前可以取消。写者已经提交、但仍持有锁时，取消用 `mode=ro` 读取 WAL 里的命令行，返回 `AlreadyCommitted`，`cancel_applied` 为 false，`preservation` 为 `preserved`，不写 control 文件。版本检查仍用 `immutable=1`，那条连接故意看不见尚未检查点的 WAL，不能拿来判断命令是否提交，也不能用 journal 上的状态文字代替数据库。0 字节库、坏文件头和更高的 `user_version` 走与打开相同的非破坏边界。
 
@@ -83,7 +83,7 @@ control/<command-id>
 
 `writer.lock` 的文字只说明它是 `flock` 的目标。独占、非阻塞的 `flock` 才是锁。文件里的 pid 或过期时间不能授予锁，也不能阻止锁。进程被杀死后，由内核释放锁；恢复的是锁，不是去相信残留文字。
 
-SQLite 使用捆绑的 3.46.0，WAL，`synchronous=FULL`，`foreign_keys=ON`，`busy_timeout=0`，`user_version=1`。表是 `meta`、`objects`、`sources`、`occurrences`、`commands`。打开和取消在 `Connection::open` 之前先检查 `SQLite format 3` 文件头，避免 0 字节或坏文件被 SQLite 初始化成空库。
+SQLite 使用捆绑的 3.46.0，WAL，`synchronous=FULL`，`foreign_keys=ON`，`busy_timeout=0`。`init` 默认格式 1，主库 `user_version` 是 1。`init --format 2` 只新建一个隔离库，不改已有的格式 1 库。格式 2 在临时目录里写 `user_version=2` 和 `meta.vault_format=2`，`schema_version` 仍是 `1`。然后 `PRAGMA wal_checkpoint(TRUNCATE)` 必须成功且返回的 busy 是 0。再用和旧程序相同的 `immutable=1` 只读打开，确认主库能看见 `user_version` 2 和配套 meta，才把目录改名发布。检查点错误、busy 或这次核验失败都不发布，返回值不忽略。`immutable=1` 看不见还留在 WAL 里的页，所以只执行 `PRAGMA user_version=2` 不够。表是 `meta`、`objects`、`sources`、`occurrences`、`commands`。打开和取消在 `Connection::open` 之前先检查 `SQLite format 3` 文件头，避免 0 字节或坏文件被 SQLite 初始化成空库。
 
 打开、`verify` 和 `recover` 走同一条内部路径：删除 `staging/` 里的临时文件以及 journal 的临时名，不删除 `objects/` 里的文件。journal 只有在对应命令行已经存在时才尝试标成 committed。标签写失败留在 `journal_label_update=failed`，不中断这份报告，也不把已提交的源改成未保全。某一个对象读失败、对象目录列不出来或未引用对象哈希读失败，同样不中断其余来源；读不出的来源不写 `preserved` 或 `not_preserved`。恢复不会根据对象文件名插入源或购买。未引用对象保持未引用，直到同一个 CommandId 带着匹配字节重试。恢复可以重复执行。
 
@@ -121,7 +121,7 @@ scripts/run-t1-evidence.sh
 
 候选只记录原文里写明的句子。`Amount paid USD 15.99`、带订单说明的 `Total USD 15.99`、带贷项说明的 `Total USD 15.99` 是三种语义，金额相同也不合并。单独的 `Total`、两处 `Total` 配一条说明、或两条互相冲突的说明，都是 `unresolved_total`，`usable` 为 false。服务期和“之后没有状态”不产生观察时间，`observed_at` 保持 null，`current_status` 保持 `unknown`。两行账户邮箱和一行掩码邮箱各自保留，`attributed` 为 false，不写账户关系。认不出来的行不生成候选。
 
-同 logical key 已经成功时，另一次提交返回 `AlreadyPublished`，不新增候选。失败和取消不写入永久失败；下一次提交使用新的 attempt。取消或晚到的发布不写入新的可用候选，已成功的候选和原件字节保留。来源行已经提交之后，这一次发布失败不会把该来源改写成 `not_preserved`；回执里的 `preservation` 是 `preserved`，`candidates_published` 是 false。状态行没有写上时，回执标明 `attempt_update` 或 `run_update` 为 `failed`，不把仍在 `running` 的 attempt 说成已经清理。来源提交之前的失败，包括 `body_schema`，仍然是 `not_preserved`。`user_version` 保持 1。正文表由第一次成功路径上的事务添加，`meta.body_schema` 记为 `1`。这步失败会回滚，不改已有的 T1 行，也不抬高 `user_version`。已有 T1 库仍按原来的打开规则工作。PDF、OCR、T3 采纳和其它平台都没有做。
+同 logical key 已经成功时，另一次提交返回 `AlreadyPublished`，不新增候选。失败和取消不写入永久失败；下一次提交使用新的 attempt。取消或晚到的发布不写入新的可用候选，已成功的候选和原件字节保留。来源行已经提交之后，这一次发布失败不会把该来源改写成 `not_preserved`；回执里的 `preservation` 是 `preserved`，`candidates_published` 是 false。状态行没有写上时，回执标明 `attempt_update` 或 `run_update` 为 `failed`，不把仍在 `running` 的 attempt 说成已经清理。来源提交之前的失败，包括 `body_schema`，仍然是 `not_preserved`。正文表由第一次成功路径上的事务添加，`meta.body_schema` 记为 `1`。这步失败会回滚，不改已有的 T1 行，也不再改 `user_version`。格式 1 仍按原来的 T1 读和保全工作。对格式 1 调用 `fragment` 或 `cancel --kind fragment`，在写任何新 journal 或正文 DDL 之前返回 `NeedsUpgrade`。格式 2 只来自新建库。journal 种类仍是 `fragment`，不改名成 `import`，也不另写一个旧程序能认出的 marker。已有格式 1 库不会被就地或自动升级。旧程序打开已发布的格式 2 库时，在加锁、写打开和清理之前返回 14。这不是成品升级或降级支持。PDF、OCR、T3 采纳和其它平台都没有做。
 
 `candidates` 只读查询。它不建表，也不写库。候选的 `value_json` 或 `locator_json` 读不出来时，不返回 `value` 为 null 的候选。运行配置或 attempt 明细读不出来时同样留下告警。这些都是退出码 12，原件字节不改。
 

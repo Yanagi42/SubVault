@@ -231,6 +231,23 @@ pub fn checkpoint(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+pub enum CheckpointFailure {
+    Sqlite(rusqlite::Error),
+    Busy(i64),
+}
+
+/// Truncate the WAL into the main database. A busy result is an error.
+/// The caller must not publish when this returns Err.
+pub fn checkpoint_for_publish(conn: &Connection) -> Result<(), CheckpointFailure> {
+    let busy: i64 = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+        .map_err(CheckpointFailure::Sqlite)?;
+    if busy != 0 {
+        return Err(CheckpointFailure::Busy(busy));
+    }
+    Ok(())
+}
+
 fn map_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectRow> {
     Ok(ObjectRow {
         object_id: row.get(0)?,

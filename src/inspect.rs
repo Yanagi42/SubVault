@@ -247,7 +247,9 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
     body.insert("disposable".into(), json!(true));
     body.insert("protection".into(), json!("unanswered_synthetic_plaintext"));
     body.insert("primary_input".into(), json!("unanswered"));
+    let vault_format = store::user_version(conn).map_err(|err| unseen_db(err, "user_version"))?;
     body.insert("schema_version".into(), json!(1));
+    body.insert("vault_format".into(), json!(vault_format));
     body.insert("capabilities".into(), capabilities());
     body.insert("platform_limits".into(), platform_limits(Some(magic)));
     body.insert("has_incomplete".into(), json!(!incomplete.is_empty()));

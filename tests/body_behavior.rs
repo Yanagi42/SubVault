@@ -66,9 +66,10 @@ fn run(args: &[&str]) -> (i32, Value) {
 
 fn init(tmp: &Tmp) -> PathBuf {
     let vault = tmp.path().join("vault");
-    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap()]);
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "2"]);
     assert_eq!(code, 0, "{body}");
     assert_eq!(body["slice"], "T1");
+    assert_eq!(body["vault_format"], 2);
     assert_eq!(body["capabilities"]["extraction"], "not_available");
     assert_eq!(body["capabilities"]["pdf_extraction"], "not_available");
     vault
@@ -505,7 +506,7 @@ fn bad_fragments_and_old_imports_do_not_become_candidates() {
     assert_eq!(refused["preservation"], "preserved");
     assert_eq!(refused["candidates_published"], false);
     assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "0");
-    assert_eq!(sql(&vault, "PRAGMA user_version;"), "1");
+    assert_eq!(sql(&vault, "PRAGMA user_version;"), "2");
     assert_eq!(
         sql(
             &vault,
@@ -540,7 +541,7 @@ fn bad_fragments_and_old_imports_do_not_become_candidates() {
 }
 
 #[test]
-fn schema_failure_does_not_change_a_t1_vault() {
+fn schema_failure_does_not_raise_user_version() {
     let tmp = Tmp::new("schema");
     let vault = init(&tmp);
     let pdf = corpus().join("originals/v-2026-10-receipt.pdf");
@@ -582,7 +583,7 @@ fn schema_failure_does_not_change_a_t1_vault() {
     assert_eq!(body["reason"], "injected_enospc");
     assert_eq!(body["injected"], true);
     assert_eq!(body["preservation"], "not_preserved");
-    assert_eq!(sql(&vault, "PRAGMA user_version;"), "1");
+    assert_eq!(sql(&vault, "PRAGMA user_version;"), "2");
     assert_eq!(
         sql(
             &vault,
@@ -602,7 +603,7 @@ fn schema_failure_does_not_change_a_t1_vault() {
     let (code, published) = fragment(&vault, "schema", &note);
     assert_eq!(code, 0, "{published}");
     assert_eq!(published["candidate_count"], 1);
-    assert_eq!(sql(&vault, "PRAGMA user_version;"), "1");
+    assert_eq!(sql(&vault, "PRAGMA user_version;"), "2");
     assert_eq!(
         fs::read(
             vault
@@ -625,7 +626,7 @@ fn schema_failure_does_not_change_a_t1_vault() {
     let (code, refused) = fragment(&other, "next", &next);
     assert_eq!(code, 16, "{refused}");
     assert_eq!(refused["reason"], "body_schema_unsupported");
-    assert_eq!(sql(&other, "PRAGMA user_version;"), "1");
+    assert_eq!(sql(&other, "PRAGMA user_version;"), "2");
     assert_eq!(
         sql(&other, "SELECT value FROM meta WHERE key='body_schema';"),
         "9"

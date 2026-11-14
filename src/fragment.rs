@@ -13,8 +13,8 @@ use crate::ids::{
 use crate::journal::{self, Journal};
 use crate::model::{
     db_fail, honesty, io_fail, unseen_db, Fail, Report, EXIT_FAULT_MISSED, EXIT_INTEGRITY,
-    EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_USAGE, NOT_PRESERVED,
-    PRESERVED,
+    EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_USAGE, EXIT_VERSION,
+    NOT_PRESERVED, PRESERVED,
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
@@ -25,7 +25,7 @@ use super::{
     CancelRequest, HookRun, Hooks, RECOGNIZED_INJECTS,
 };
 
-const STOPS: &[&str] = &["before_copy", "before_publish"];
+const STOPS: &[&str] = &["before_journal", "before_copy", "before_publish"];
 const INJECTS: &[&str] = &[
     "body_schema",
     "extract_status",
@@ -63,6 +63,26 @@ pub fn query_candidates(vault: &Path, source_id: Option<String>) -> Report {
     }
 }
 
+fn require_body_format(vault: &Path) -> Result<(), Fail> {
+    match super::read_vault_format(vault)? {
+        1 => Err(needs_upgrade()),
+        2 => Ok(()),
+        version => Err(
+            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
+                .extra("schema_version_found", json!(version))
+                .extra("new_effect", json!(false)),
+        ),
+    }
+}
+
+fn needs_upgrade() -> Fail {
+    Fail::new(EXIT_VERSION, "NeedsUpgrade", "needs_upgrade")
+        .extra("slice", json!("T2a-body"))
+        .extra("new_effect", json!(false))
+        .extra("vault_format", json!(1))
+        .extra("created_new_vault", json!(false))
+}
+
 fn as_body_slice(mut report: Report) -> Report {
     if let Some(map) = report.body.as_object_mut() {
         map.insert("slice".into(), json!("T2a-body"));
@@ -73,6 +93,13 @@ fn as_body_slice(mut report: Report) -> Report {
 pub fn cancel_fragment(req: CancelRequest) -> Result<Report, Fail> {
     if !is_command_id(&req.command_id) || req.generation < 1 {
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_cancel"));
+    }
+    if let Err(fail) = require_body_format(&req.vault) {
+        return Err(if fail.reason == "needs_upgrade" {
+            fail.extra("cancel_applied", json!(false))
+        } else {
+            fail
+        });
     }
     let Some(lock) = crate::lockfile::VaultLock::try_acquire(&req.vault.join("writer.lock"))
         .map_err(|err| super::unseen_io(err, "lock"))?
@@ -148,6 +175,7 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
         }
     }
     let stat_len = stat_fragment(&req.fragment)?;
+    require_body_format(&req.vault)?;
     let session = open_session(&req.vault)?;
     let mut hooks = HookRun::new(req.hooks.clone());
     if let Some(existing) = store::command(&session.conn, &req.command_id)
@@ -158,6 +186,10 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
         }
         return replay_command(&session, &req, &existing);
     }
+    hooks.stop(
+        "before_journal",
+        checkpoint_map(&req.command_id, 0, Some(stat_len), None, false, false),
+    )?;
     let mut journal = load_journal(&session.root, &req)?;
     hooks.stop(
         "before_copy",

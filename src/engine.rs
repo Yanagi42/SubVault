@@ -49,6 +49,13 @@ const IMPORT_INJECTS: &[&str] = &["after_staging_fsync", "object_fsync", "db_com
 const MARKER_STOPS: &[&str] = &["before_db_commit", "after_db_commit", "before_receipt"];
 const MARKER_INJECTS: &[&str] = &["db_commit"];
 const RECOGNIZED_INJECTS: &[&str] = &["after_staging_fsync", "object_fsync", "db_commit"];
+const INIT_STOPS: &[&str] = &[
+    "version_set",
+    "version_checkpoint",
+    "before_publish",
+    "after_publish",
+];
+const INIT_INJECTS: &[&str] = &["version_checkpoint", "version_verify"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InjectAction {
@@ -166,7 +173,7 @@ pub fn help_report() -> Report {
         json!([
             "help",
             "version",
-            "init --vault PATH",
+            "init --vault PATH [--format 1|2]",
             "open --vault PATH",
             "verify --vault PATH",
             "import --vault PATH --command-id ID --media-type TYPE --source PATH [--batch-id ID] [--display-name NAME]",
@@ -200,6 +207,7 @@ pub fn version_report() -> Report {
     let mut body = honesty("Version");
     body.insert("git_sha".into(), json!(env!("SUBVAULT_GIT_SHA")));
     body.insert("vault_format".into(), json!(1));
+    body.insert("supported_vault_formats".into(), json!([1, 2]));
     body.insert("capabilities".into(), capabilities());
     body.insert("platform_limits".into(), platform_limits(None));
     Report {
@@ -208,14 +216,14 @@ pub fn version_report() -> Report {
     }
 }
 
-pub fn init_vault(path: &Path) -> Report {
-    match init_inner(path) {
+pub fn init_vault(path: &Path, format: u8, hooks: Hooks) -> Report {
+    match init_inner(path, format, hooks) {
         Ok(report) => report,
         Err(fail) => note_uncommitted(fail).into_report(),
     }
 }
 
-fn init_inner(path: &Path) -> Result<Report, Fail> {
+fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     if path.exists() {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "vault_path_exists")
             .extra("created_new_vault", json!(false)));
@@ -232,11 +240,32 @@ fn init_inner(path: &Path) -> Result<Report, Fail> {
     if network_filesystem(magic) {
         return Err(unsupported_fs(magic));
     }
+    if format == 1 {
+        if hooks.stop_at.is_some() || hooks.inject_point.is_some() {
+            return Err(
+                Fail::new(EXIT_USAGE, "Usage", "format_1_has_no_version_hook")
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
+    } else if format == 2 {
+        validate_hook_names(
+            hooks.stop_at.as_deref(),
+            hooks.inject_point.as_deref(),
+            INIT_STOPS,
+            INIT_INJECTS,
+            INIT_INJECTS,
+        )?;
+    } else {
+        return Err(
+            Fail::new(EXIT_USAGE, "Usage", "bad_format").extra("created_new_vault", json!(false))
+        );
+    }
     let scratch = parent.join(format!(
         ".subvault-init-{}",
         ids::random_id("tmp").map_err(|err| io_fail(err, "random"))?
     ));
     fs::create_dir(&scratch).map_err(|err| io_fail(err, "init_dir"))?;
+    let mut hooks = HookRun::new(hooks);
     let built = (|| -> Result<String, Fail> {
         fs::write(scratch.join("SYNTHETIC_ONLY"), VAULT_BANNER)
             .map_err(|err| io_fail(err, "banner"))?;
@@ -250,7 +279,34 @@ fn init_inner(path: &Path) -> Result<Report, Fail> {
         store::configure(&conn).map_err(|err| db_fail(err, "init_pragma"))?;
         let vault_id = ids::random_id("vlt_").map_err(|err| io_fail(err, "random"))?;
         store::init_schema(&conn, &vault_id).map_err(|err| db_fail(err, "init_schema"))?;
-        store::checkpoint(&conn).map_err(|err| db_fail(err, "init_checkpoint"))?;
+        if format == 1 {
+            store::checkpoint(&conn).map_err(|err| db_fail(err, "init_checkpoint"))?;
+            return Ok(vault_id);
+        }
+        conn.execute_batch("PRAGMA user_version = 2;")
+            .map_err(|err| db_fail(err, "init_version"))?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('vault_format', '2')",
+            [],
+        )
+        .map_err(|err| db_fail(err, "init_version"))?;
+        hooks.stop("version_set", init_point(false))?;
+        hooks.inject("version_checkpoint", init_point(false))?;
+        publish_checkpoint(&conn)?;
+        drop(conn);
+        hooks.stop("version_checkpoint", init_point(false))?;
+        let (seen, companion, schema) = visible_main_format(&scratch.join("vault.db"))?;
+        if seen != 2 || companion.as_deref() != Some("2") || schema.as_deref() != Some("1") {
+            return Err(
+                Fail::new(EXIT_VERSION, "VersionUnsupported", "version_not_in_main_db")
+                    .extra("schema_version_found", json!(seen))
+                    .extra("vault_format_seen", json!(companion))
+                    .extra("created_new_vault", json!(false))
+                    .extra("published", json!(false)),
+            );
+        }
+        hooks.inject("version_verify", init_point(false))?;
+        hooks.stop("before_publish", init_point(false))?;
         Ok(vault_id)
     })();
     let vault_id = match built {
@@ -265,8 +321,10 @@ fn init_inner(path: &Path) -> Result<Report, Fail> {
         return Err(io_fail(err, "init_rename").extra("created_new_vault", json!(false)));
     }
     let _ = fsutil::fsync_dir(parent);
+    hooks.stop("after_publish", init_point(true))?;
     let mut body = honesty("Initialized");
     body.insert("vault_id".into(), json!(vault_id));
+    body.insert("vault_format".into(), json!(format));
     body.insert("created_new_vault".into(), json!(true));
     body.insert("protection".into(), json!("unanswered_synthetic_plaintext"));
     body.insert("primary_input".into(), json!("unanswered"));
@@ -277,6 +335,29 @@ fn init_inner(path: &Path) -> Result<Report, Fail> {
         code: EXIT_OK,
         body: Value::Object(body),
     })
+}
+
+fn init_point(published: bool) -> Map<String, Value> {
+    map_of(&[("published", json!(published)), ("vault_format", json!(2))])
+}
+
+fn publish_checkpoint(conn: &Connection) -> Result<(), Fail> {
+    match store::checkpoint_for_publish(conn) {
+        Ok(()) => Ok(()),
+        Err(store::CheckpointFailure::Sqlite(err)) => Err(db_fail(err, "init_checkpoint")
+            .extra("created_new_vault", json!(false))
+            .extra("published", json!(false))),
+        Err(store::CheckpointFailure::Busy(busy)) => {
+            Err(
+                Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "checkpoint_busy")
+                    .extra("during", json!("init_checkpoint"))
+                    .extra("checkpoint_busy", json!(busy))
+                    .extra("injected", json!(false))
+                    .extra("created_new_vault", json!(false))
+                    .extra("published", json!(false)),
+            )
+        }
+    }
 }
 
 pub fn open_vault(path: &Path) -> Report {
@@ -485,7 +566,12 @@ fn import_attempt(
         "before_copy",
         checkpoint_map(&command_id, 0, Some(expected_len), None, false, false),
     )?;
-    if take_cancel(&session.root, &command_id, journal.generation, "preservation")? {
+    if take_cancel(
+        &session.root,
+        &command_id,
+        journal.generation,
+        "preservation",
+    )? {
         return Err(cancelled());
     }
     journal.state = "copying".into();
@@ -501,7 +587,12 @@ fn import_attempt(
         journal.generation,
         expected_len,
     )?;
-    if take_cancel(&session.root, &command_id, journal.generation, "preservation")? {
+    if take_cancel(
+        &session.root,
+        &command_id,
+        journal.generation,
+        "preservation",
+    )? {
         return Err(cancelled());
     }
     let (hash, len) = sha256_file(&staging).map_err(|err| io_fail(err, "hash_staging"))?;
@@ -575,7 +666,12 @@ fn import_attempt(
         "before_db_commit",
         checkpoint_map(&command_id, len, Some(len), Some(&hash), true, false),
     )?;
-    if take_cancel(&session.root, &command_id, journal.generation, "preservation")? {
+    if take_cancel(
+        &session.root,
+        &command_id,
+        journal.generation,
+        "preservation",
+    )? {
         return Err(cancelled());
     }
 
@@ -1260,6 +1356,11 @@ fn guard_vault(path: &Path) -> Result<i64, Fail> {
     Ok(magic)
 }
 
+fn read_vault_format(path: &Path) -> Result<i64, Fail> {
+    guard_vault(path)?;
+    inspect_version_readonly(path)
+}
+
 fn open_session(path: &Path) -> Result<Session, Fail> {
     let magic = guard_vault(path)?;
     let lock = lockfile::VaultLock::try_acquire(&path.join("writer.lock"))
@@ -1328,21 +1429,21 @@ fn vault_unreadable(err: &io::Error, reason: &'static str, during: &str) -> Fail
         .extra("injected", json!(false))
 }
 
-fn inspect_version_readonly(path: &Path) -> Result<(), Fail> {
-    let uri = readonly_uri(&path.join("vault.db"))?;
-    let conn = Connection::open_with_flags(
-        &uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_unreadable")
-            .extra("created_new_vault", json!(false))
-    })?;
-    let version = store::user_version(&conn).map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "user_version_unreadable")
-            .extra("created_new_vault", json!(false))
-    })?;
-    if version > 1 {
+fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
+    let (version, format, schema) = visible_main_format(&path.join("vault.db"))?;
+    if version == 2 {
+        if format.as_deref() == Some("2") && schema.as_deref() == Some("1") {
+            return Ok(2);
+        }
+        return Err(Fail::new(
+            EXIT_VERSION,
+            "VersionUnsupported",
+            "vault_format_unverified",
+        )
+        .extra("schema_version_found", json!(version))
+        .extra("created_new_vault", json!(false)));
+    }
+    if version > 2 {
         return Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(version))
@@ -1356,17 +1457,42 @@ fn inspect_version_readonly(path: &Path) -> Result<(), Fail> {
                 .extra("created_new_vault", json!(false)),
         );
     }
-    let schema = store::meta(&conn, "schema_version").map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
-            .extra("created_new_vault", json!(false))
-    })?;
     if schema.as_deref() != Some("1") {
         return Err(
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "schema_mismatch")
                 .extra("created_new_vault", json!(false)),
         );
     }
-    Ok(())
+    Ok(1)
+}
+
+fn visible_main_format(db: &Path) -> Result<(i64, Option<String>, Option<String>), Fail> {
+    let uri = readonly_uri(db)?;
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_unreadable")
+            .extra("created_new_vault", json!(false))
+            .extra("published", json!(false))
+    })?;
+    let version = store::user_version(&conn).map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "user_version_unreadable")
+            .extra("created_new_vault", json!(false))
+            .extra("published", json!(false))
+    })?;
+    let format = store::meta(&conn, "vault_format").map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
+            .extra("created_new_vault", json!(false))
+            .extra("published", json!(false))
+    })?;
+    let schema = store::meta(&conn, "schema_version").map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
+            .extra("created_new_vault", json!(false))
+            .extra("published", json!(false))
+    })?;
+    Ok((version, format, schema))
 }
 
 fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
