@@ -1669,7 +1669,10 @@ fn cancel_while_busy(req: &CancelRequest) -> Result<Report, Fail> {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
-    if journal.generation != req.generation || journal.kind != "fragment" {
+    if journal.kind != "fragment" {
+        return Err(refused("command_kind_conflict").extra("cancel_applied", json!(false)));
+    }
+    if journal.generation != req.generation {
         return Err(refused("generation_mismatch").extra("cancel_applied", json!(false)));
     }
     write_control(&req.vault, &req.command_id, req.generation, "fragment")?;

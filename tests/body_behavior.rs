@@ -1382,6 +1382,338 @@ fn object_ready_journal_io_keeps_the_committed_source() {
         .any(|row| row["candidate_id"] == old_candidate));
 }
 
+#[test]
+fn preservation_cancel_leaves_a_fragment_journal_unchanged() {
+    let tmp = Tmp::new("kind");
+    let vault = init(&tmp);
+    let old_file = tmp.path().join("old.txt");
+    write_file(&old_file, b"Amount paid USD 1.00\n");
+    let (code, old) = fragment(&vault, "old", &old_file);
+    assert_eq!(code, 0, "{old}");
+    let old_object = object_bytes(&vault, &old);
+    let old_candidate = old["candidate_ids"][0].clone();
+    let (code, late) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "old",
+        "--generation",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{late}");
+    assert_eq!(late["outcome"], "AlreadyCommitted");
+    assert_eq!(late["preservation"], "preserved");
+    assert_eq!(late["cancel_applied"], false);
+    assert_eq!(
+        fs::read(vault.join("journal").join("old.json")).unwrap(),
+        journal_bytes_containing(&vault, "old", "committed")
+    );
+    assert_eq!(object_bytes(&vault, &old), old_object);
+
+    let live_file = tmp.path().join("live.txt");
+    write_file(&live_file, b"Amount paid USD 2.00\n");
+    let checkpoint = tmp.path().join("live.json");
+    let mut child = spawn_fragment(&vault, "live", &live_file, "before_publish", &checkpoint);
+    wait_stopped(&mut child, &checkpoint);
+    kill_child(&mut child);
+    let ready = fs::read(vault.join("journal").join("live.json")).unwrap();
+    assert!(ready.windows(12).any(|bytes| bytes == b"object_ready"));
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "2");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "1");
+    for (label, args) in [
+        ("kind", vec!["--kind", "mystery"]),
+        ("again", vec![]),
+        ("repeat", vec![]),
+    ] {
+        let mut cmd = vec![
+            "cancel",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            "live",
+            "--generation",
+            "1",
+        ];
+        cmd.extend(args);
+        let (code, body) = run(&cmd);
+        if label == "kind" {
+            assert_eq!(code, 2, "{body}");
+            assert_eq!(body["reason"], "bad_cancel_kind");
+        } else {
+            assert_eq!(code, 16, "{label} {body}");
+            assert_eq!(body["outcome"], "Rejected");
+            assert_eq!(body["reason"], "command_kind_conflict");
+            assert_eq!(body["cancel_applied"], false);
+            assert!(body.get("preservation").is_none(), "{body}");
+        }
+        assert_eq!(
+            fs::read(vault.join("journal").join("live.json")).unwrap(),
+            ready
+        );
+        assert!(!vault.join("control").join("live").exists());
+    }
+    let (code, other) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "other",
+        "--generation",
+        "1",
+    ]);
+    assert_eq!(code, 16, "{other}");
+    assert_eq!(other["reason"], "unknown_command");
+    assert!(!vault.join("journal").join("other.json").exists());
+    assert_eq!(
+        fs::read(vault.join("journal").join("live.json")).unwrap(),
+        ready
+    );
+    let (code, cancelled) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "live",
+        "--generation",
+        "1",
+        "--kind",
+        "fragment",
+    ]);
+    assert_eq!(code, 0, "{cancelled}");
+    assert_eq!(cancelled["outcome"], "Cancelled");
+    assert_eq!(cancelled["cancel_applied"], true);
+    assert_eq!(cancelled["preservation"], "preserved");
+    assert_eq!(cancelled["candidates_published"], false);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "1");
+    assert_eq!(object_bytes(&vault, &old), old_object);
+    let (code, retried) = fragment(&vault, "live", &live_file);
+    assert_eq!(code, 0, "{retried}");
+    assert_eq!(retried["candidate_count"], 1);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "2");
+
+    let held_file = tmp.path().join("held.txt");
+    write_file(&held_file, b"Amount paid USD 3.00\n");
+    let checkpoint = tmp.path().join("held.json");
+    let mut child = spawn_fragment(&vault, "held", &held_file, "before_publish", &checkpoint);
+    wait_stopped(&mut child, &checkpoint);
+    let held_journal = fs::read(vault.join("journal").join("held.json")).unwrap();
+    let (code, blocked) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "held",
+        "--generation",
+        "1",
+    ]);
+    assert_eq!(code, 16, "{blocked}");
+    assert_eq!(blocked["reason"], "command_kind_conflict");
+    assert_eq!(blocked["cancel_applied"], false);
+    assert!(blocked.get("preservation").is_none(), "{blocked}");
+    assert_eq!(
+        fs::read(vault.join("journal").join("held.json")).unwrap(),
+        held_journal
+    );
+    assert!(!vault.join("control").join("held").exists());
+    resume(child.id());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let writer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(writer["outcome"], "Committed");
+    assert_eq!(writer["candidates_published"], true);
+    let (code, after) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "held",
+        "--generation",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{after}");
+    assert_eq!(after["outcome"], "AlreadyCommitted");
+    assert_eq!(after["preservation"], "preserved");
+    assert_eq!(after["cancel_applied"], false);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "3");
+    assert_eq!(object_bytes(&vault, &old), old_object);
+    let listed = candidates(&vault);
+    assert!(listed["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["candidate_id"] == old_candidate));
+
+    let source = tmp.path().join("import.txt");
+    write_file(&source, b"synthetic-import\n");
+    let checkpoint = tmp.path().join("import.json");
+    let mut child = spawn_import(&vault, "imp", &source, &checkpoint);
+    wait_stopped(&mut child, &checkpoint);
+    let import_journal = fs::read(vault.join("journal").join("imp.json")).unwrap();
+    let (code, wrong) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "imp",
+        "--generation",
+        "1",
+        "--kind",
+        "fragment",
+    ]);
+    assert_eq!(code, 16, "{wrong}");
+    assert_eq!(wrong["reason"], "command_kind_conflict");
+    assert_eq!(wrong["cancel_applied"], false);
+    assert_eq!(
+        fs::read(vault.join("journal").join("imp.json")).unwrap(),
+        import_journal
+    );
+    assert!(!vault.join("control").join("imp").exists());
+    let (code, pending) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "imp",
+        "--generation",
+        "1",
+        "--kind",
+        "preservation",
+    ]);
+    assert_eq!(code, 0, "{pending}");
+    assert_eq!(pending["outcome"], "CancelPending");
+    assert_eq!(
+        fs::read_to_string(vault.join("control").join("imp")).unwrap(),
+        "cancel\ngeneration=1\nkind=preservation\n"
+    );
+    resume(child.id());
+    let output = child.wait_with_output().unwrap();
+    let writer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{writer}");
+    assert_eq!(writer["outcome"], "Cancelled");
+    assert_eq!(writer["cancel_applied"], true);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "3");
+
+    let source = tmp.path().join("import-free.txt");
+    write_file(&source, b"synthetic-import-free\n");
+    let checkpoint = tmp.path().join("import-free.json");
+    let mut child = spawn_import(&vault, "impfree", &source, &checkpoint);
+    wait_stopped(&mut child, &checkpoint);
+    kill_child(&mut child);
+    let (code, freed) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "impfree",
+        "--generation",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{freed}");
+    assert_eq!(freed["outcome"], "Cancelled");
+    assert_eq!(freed["cancel_applied"], true);
+    let freed_journal: Value =
+        serde_json::from_slice(&fs::read(vault.join("journal").join("impfree.json")).unwrap())
+            .unwrap();
+    assert_eq!(freed_journal["state"], "aborted");
+    assert_eq!(freed_journal["kind"], "import");
+    let fresh = tmp.path().join("import-ok.txt");
+    write_file(&fresh, b"synthetic-import-ok\n");
+    let (code, imported) = run(&[
+        "import",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "impok",
+        "--media-type",
+        "text/plain",
+        "--source",
+        fresh.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{imported}");
+    assert_eq!(imported["preservation"], "preserved");
+    assert_eq!(object_bytes(&vault, &old), old_object);
+}
+
+fn journal_bytes_containing(vault: &Path, command: &str, state: &str) -> Vec<u8> {
+    let bytes = fs::read(vault.join("journal").join(format!("{command}.json"))).unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["state"], state);
+    bytes
+}
+
+fn spawn_fragment(
+    vault: &Path,
+    command: &str,
+    file: &Path,
+    stop: &str,
+    checkpoint: &Path,
+) -> std::process::Child {
+    Command::new(bin())
+        .args([
+            "fragment",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            command,
+            "--fragment",
+            file.to_str().unwrap(),
+            "--stop-at",
+            stop,
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn spawn_import(
+    vault: &Path,
+    command: &str,
+    file: &Path,
+    checkpoint: &Path,
+) -> std::process::Child {
+    Command::new(bin())
+        .args([
+            "import",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            command,
+            "--media-type",
+            "text/plain",
+            "--source",
+            file.to_str().unwrap(),
+            "--stop-at",
+            "during_copy",
+            "--checkpoint",
+            checkpoint.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn kill_child(child: &mut std::process::Child) {
+    assert!(stopped(child.id()), "SIGKILL is not a power-loss proof");
+    assert!(Command::new("kill")
+        .args(["-KILL", &child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    let _ = child.wait();
+}
+
 fn wait_stopped(child: &mut std::process::Child, checkpoint: &Path) {
     let start = Instant::now();
     loop {

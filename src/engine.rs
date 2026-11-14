@@ -1313,6 +1313,9 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
+    if journal.kind == "fragment" {
+        return Err(fragment_journal_conflict());
+    }
     if journal.generation != req.generation {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "generation_mismatch")
             .extra("cancel_applied", json!(false)));
@@ -1952,6 +1955,9 @@ fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
+    if journal.kind == "fragment" {
+        return Err(fragment_journal_conflict());
+    }
     if journal.generation != req.generation {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "generation_mismatch")
             .extra("cancel_applied", json!(false)));
@@ -1967,6 +1973,12 @@ fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
         code: EXIT_OK,
         body: Value::Object(body),
     })
+}
+
+fn fragment_journal_conflict() -> Fail {
+    Fail::new(EXIT_REJECTED, "Rejected", "command_kind_conflict")
+        .extra("cancel_applied", json!(false))
+        .extra("new_effect", json!(false))
 }
 
 fn read_committed(root: &Path, command_id: &str) -> Result<Option<CommandRow>, Fail> {

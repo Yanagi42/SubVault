@@ -65,7 +65,7 @@ python3 synthetic/generate_corpus.py --check
 
 `--stop-at` 把检查点写到指定文件后发送 `SIGSTOP`。检查点文件出现只说明文件已经写完。行为测试再读到 `/proc/<pid>/status` 的 `State: T` 才发送 `SIGCONT` 或 `SIGKILL`。等待的是这个状态。只在这台 Linux 上这样验证。`SIGKILL` 只结束进程。它不是断电，也不是硬件 fsync 已经完成的证明。`--inject enospc:POINT` 或 `--inject io_error:POINT` 把见证写到指定文件后返回未保全。注入回执里的 `injected` 是 true，并写明这不是磁盘真的满了。见证文件没有出现时，注入不算已经发生。`db_commit` 注入发生在真正的 `COMMIT` 之前，事务回滚，命令行不存在；它只证明确定的回滚，不是提交结果不确定。
 
-`cancel --kind extraction` 只返回 `extraction_cancel_not_available`。它不创建提取目录，也没有 PDF 提取实现。`cancel --kind fragment` 只取消一次正文提交。保全命令在提交前可以取消。写者已经提交、但仍持有锁时，取消用 `mode=ro` 读取 WAL 里的命令行，返回 `AlreadyCommitted`，`cancel_applied` 为 false，`preservation` 为 `preserved`，不写 control 文件。版本检查仍用 `immutable=1`，那条连接故意看不见尚未检查点的 WAL，不能拿来判断命令是否提交，也不能用 journal 上的状态文字代替数据库。0 字节库、坏文件头和更高的 `user_version` 走与打开相同的非破坏边界。
+`cancel --kind extraction` 只返回 `extraction_cancel_not_available`。它不创建提取目录，也没有 PDF 提取实现。`cancel --kind fragment` 只取消一次正文提交。不带 kind 或 `--kind preservation` 遇到 fragment journal 时返回 `command_kind_conflict`，不改 journal，也不写 control；锁闲、锁被占用和重复调用都一样。已经提交的命令仍是 `AlreadyCommitted`。未知 kind 在写之前返回用法错误。保全命令在提交前可以取消。写者已经提交、但仍持有锁时，取消用 `mode=ro` 读取 WAL 里的命令行，返回 `AlreadyCommitted`，`cancel_applied` 为 false，`preservation` 为 `preserved`，不写 control 文件。版本检查仍用 `immutable=1`，那条连接故意看不见尚未检查点的 WAL，不能拿来判断命令是否提交，也不能用 journal 上的状态文字代替数据库。0 字节库、坏文件头和更高的 `user_version` 走与打开相同的非破坏边界。
 
 SQLite 的 `COMMIT` 本身返回错误时，另开一条能看见 WAL 的连接：看得到命令行就是已提交，确定没有就是未保全。查询也失败才是退出码 21，reason 是 `commit_visibility_unknown`，`during` 是 `after_commit_error`。这条没有实跑。它和 `vault_unseen` 不是一路：`vault_unseen` 只说明还没看见历史，不说明 `COMMIT` 返回过错误。
 
