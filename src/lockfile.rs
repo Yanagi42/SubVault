@@ -1,6 +1,5 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 pub const LOCK_TEXT: &str =
@@ -26,32 +25,20 @@ impl VaultLock {
             file.write_all(LOCK_TEXT.as_bytes())?;
             file.sync_all()?;
         }
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
+        if crate::platform::try_lock_exclusive(&file)? {
             Ok(Some(Self { file }))
         } else {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EWOULDBLOCK)
-                || err.raw_os_error() == Some(libc::EAGAIN)
-            {
-                Ok(None)
-            } else {
-                Err(err)
-            }
+            Ok(None)
         }
     }
 }
 
 impl Drop for VaultLock {
     fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        crate::platform::unlock_exclusive(&self.file);
     }
 }
 
 pub fn sigstop() {
-    unsafe {
-        libc::raise(libc::SIGSTOP);
-    }
+    crate::platform::raise_sigstop();
 }

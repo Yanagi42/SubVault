@@ -8,6 +8,7 @@ mod inspect;
 mod journal;
 mod lockfile;
 mod model;
+mod platform;
 mod store;
 
 pub use model::EXIT_UNCERTAIN;

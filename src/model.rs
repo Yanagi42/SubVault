@@ -111,7 +111,7 @@ pub fn capabilities() -> Value {
 }
 
 pub(crate) fn io_fail(err: std::io::Error, during: &str) -> Fail {
-    let enospc = err.raw_os_error() == Some(libc::ENOSPC);
+    let enospc = crate::platform::is_enospc(&err);
     Fail::new(
         EXIT_NOT_PRESERVED,
         "NotPreserved",

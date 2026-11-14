@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -248,7 +247,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     // The directory entry is the same name with those slashes removed.
     // This does not canonicalize, so the final symlink is not replaced by
     // its target. Ancestor components are unchanged.
-    match fs::symlink_metadata(final_directory_entry(path)) {
+    match fs::symlink_metadata(crate::platform::final_directory_entry(path)) {
         Ok(_) => {
             return Err(Fail::new(EXIT_REJECTED, "Rejected", "vault_path_exists")
                 .extra("created_new_vault", json!(false)));
@@ -394,28 +393,6 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     }
     hooks.stop("after_publish", init_point(true, format))?;
     Ok(init_ready(&vault_id, format, magic))
-}
-
-/// Final directory entry for the init target. Trailing slashes are a
-/// spelling of that entry. Stripping them stops the kernel from requiring
-/// the final component to be a directory it can walk. The root path is
-/// only slashes, and it stays `/`.
-fn final_directory_entry(path: &Path) -> PathBuf {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    let bytes = path.as_os_str().as_bytes();
-    let end = bytes
-        .iter()
-        .rposition(|byte| *byte != b'/')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let trimmed = &bytes[..end];
-    if trimmed.is_empty() {
-        return PathBuf::from("/");
-    }
-    if trimmed.len() == bytes.len() {
-        return path.to_path_buf();
-    }
-    PathBuf::from(std::ffi::OsString::from_vec(trimmed.to_vec()))
 }
 
 fn init_ready(vault_id: &str, format: u8, magic: i64) -> Report {
@@ -1302,8 +1279,7 @@ fn resolved_directory(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn directory_id(path: &Path) -> io::Result<(u64, u64)> {
-    let meta = fs::metadata(path)?;
-    Ok((meta.dev(), meta.ino()))
+    crate::platform::directory_device_and_inode(path)
 }
 
 fn directory_is_vault_or_inside(vault_id: (u64, u64), dir: &Path) -> io::Result<bool> {
@@ -1354,22 +1330,17 @@ fn copy_exclusive(src: &Path, dst: &Path) -> Result<(), FreshCopy> {
             })
         }
     }
-    let mut writer = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dst)
-        .map_err(|err| {
-            if err.kind() == io::ErrorKind::AlreadyExists || refused_output(&err) {
-                FreshCopy::Exists
-            } else {
-                FreshCopy::Io {
-                    err,
-                    cleanup: "not_created",
-                    cleanup_error: None,
-                }
+    let mut writer = crate::platform::open_new_nofollow(dst).map_err(|err| {
+        if err.kind() == io::ErrorKind::AlreadyExists || refused_output(&err) {
+            FreshCopy::Exists
+        } else {
+            FreshCopy::Io {
+                err,
+                cleanup: "not_created",
+                cleanup_error: None,
             }
-        })?;
+        }
+    })?;
     let copied = (|| -> io::Result<()> {
         let mut reader = File::open(src)?;
         let permissions = reader.metadata()?.permissions();
@@ -1393,10 +1364,7 @@ fn copy_exclusive(src: &Path, dst: &Path) -> Result<(), FreshCopy> {
 }
 
 fn refused_output(err: &io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(code) if code == libc::EEXIST || code == libc::ELOOP
-    )
+    crate::platform::exclusive_create_refused(err)
 }
 
 pub struct CancelRequest {

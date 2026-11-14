@@ -11,25 +11,13 @@ const NFS_SUPER_MAGIC: i64 = 0x6969;
 const SMB_SUPER_MAGIC: i64 = 0xFF534D42;
 const SMB2_SUPER_MAGIC: i64 = 0xFE534D42;
 
-pub fn filesystem_magic(path: &Path) -> io::Result<i64> {
-    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statfs(c.as_ptr(), &mut buf) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(buf.f_type)
-}
+pub use crate::platform::filesystem_magic;
 
 pub fn network_filesystem(magic: i64) -> bool {
     matches!(magic, NFS_SUPER_MAGIC | SMB_SUPER_MAGIC | SMB2_SUPER_MAGIC)
 }
 
-pub fn fsync_dir(path: &Path) -> io::Result<()> {
-    let file = File::open(path)?;
-    file.sync_all()
-}
+pub use crate::platform::fsync_dir;
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));

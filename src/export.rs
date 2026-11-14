@@ -3,9 +3,8 @@
 //! copy of the live vault directory, a backup, or a protection choice.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
@@ -1292,11 +1291,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut file = crate::platform::open_new_nofollow(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -1408,7 +1403,7 @@ fn chain_fail(fact_id: &str) -> Fail {
 }
 
 fn copy_fail(err: io::Error, during: &str) -> Fail {
-    let enospc = err.raw_os_error() == Some(libc::ENOSPC);
+    let enospc = crate::platform::is_enospc(&err);
     unpublished(
         EXIT_INTEGRITY,
         "Incomplete",
