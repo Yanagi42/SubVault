@@ -8,9 +8,12 @@
 //!
 //! The call is `GetFileInformationByHandleEx` with `FileIdInfo` (`0x12`),
 //! which fills a `FILE_ID_INFO`: 8-byte volume serial and 16-byte
-//! `FILE_ID_128`. The handle is the caller's. This function does not open a
-//! path, does not lowercase a path, and does not decide whether a junction or
-//! an ancestor alias was followed. Two identities compare equal only when the
+//! `FILE_ID_128`. The safe entry takes `BorrowedHandle<'_>`: the handle must
+//! already be open, and only for the owner's borrow. A raw pointer can become
+//! that type only through `BorrowedHandle::borrow_raw`, which is unsafe and
+//! is not wrapped here. This function does not open a path, does not
+//! lowercase a path, and does not decide whether a junction or an ancestor
+//! alias was followed. Two identities compare equal only when the
 //! volume serial and all 16 identifier bytes match. That comparison is not a
 //! verified security-path, junction, or ancestor-alias result.
 //!
@@ -21,6 +24,7 @@
 
 use std::ffi::c_void;
 use std::io;
+use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 
 use crate::file_identity::{
     classify_file_id_query, file_identity, FileIdInfo, IdentityClass, IdentityReject,
@@ -44,14 +48,8 @@ pub enum IdentityOfHandle {
     Failure(io::Error),
 }
 
-pub fn identity_of_handle(handle: *mut c_void) -> IdentityOfHandle {
-    let invalid = (-1isize) as usize as *mut c_void;
-    if handle.is_null() || handle == invalid {
-        return IdentityOfHandle::Failure(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "file identity requires an open handle",
-        ));
-    }
+pub fn identity_of_handle(handle: BorrowedHandle<'_>) -> IdentityOfHandle {
+    let raw = handle.as_raw_handle();
     let mut info = FileIdInfo {
         volume_serial_number: 0,
         file_id: crate::file_identity::FileId128 {
@@ -59,12 +57,15 @@ pub fn identity_of_handle(handle: *mut c_void) -> IdentityOfHandle {
         },
     };
     let size = std::mem::size_of::<FileIdInfo>() as u32;
-    // SAFETY: `handle` is not null or `INVALID_HANDLE_VALUE`. `info` is a
-    // fully initialized `FILE_ID_INFO` and `size` is its byte length.
-    // `FileIdInfo` is the documented class `0x12`.
+    // SAFETY: `BorrowedHandle` keeps `raw` valid for this borrow. Std says
+    // the value may be passed to FFI as an argument and must not be captured
+    // or consumed. This call does not store or close `raw`. Null and -1 are
+    // not treated as invalid: in `BorrowedHandle` both bit patterns can be
+    // real handles. `info` is a full `FILE_ID_INFO`, `size` is its length,
+    // and the class is `FileIdInfo` (`0x12`).
     let ok = unsafe {
         GetFileInformationByHandleEx(
-            handle,
+            raw,
             FILE_ID_INFO_CLASS,
             &mut info as *mut FileIdInfo as *mut c_void,
             size,
