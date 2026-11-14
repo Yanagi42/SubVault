@@ -490,10 +490,11 @@ fn format_3_publishes_only_after_the_main_header_matches() {
         "--vault",
         tmp.path().join("nope").to_str().unwrap(),
         "--format",
-        "4",
+        "5",
     ]);
     assert_eq!(code, 2, "{body}");
     assert_eq!(body["reason"], "bad_format");
+    assert!(!tmp.path().join("nope").exists());
 }
 
 #[test]

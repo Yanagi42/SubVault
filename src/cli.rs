@@ -311,6 +311,7 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
                     "1" => 1,
                     "2" => 2,
                     "3" => 3,
+                    "4" => 4,
                     _ => return Err(Fail::new(EXIT_USAGE, "Usage", "bad_format")),
                 });
             }

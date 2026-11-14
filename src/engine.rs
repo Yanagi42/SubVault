@@ -226,7 +226,7 @@ pub fn help_report() -> Report {
         json!([
             "help",
             "version",
-            "init --vault PATH [--format 1|2|3]",
+            "init --vault PATH [--format 1|2|3|4]",
             "open --vault PATH",
             "verify --vault PATH",
             "import --vault PATH --command-id ID --media-type TYPE --source PATH [--batch-id ID] [--display-name NAME]",
@@ -264,7 +264,7 @@ pub fn version_report() -> Report {
     let mut body = honesty("Version");
     body.insert("git_sha".into(), json!(env!("SUBVAULT_GIT_SHA")));
     body.insert("vault_format".into(), json!(1));
-    body.insert("supported_vault_formats".into(), json!([1, 2, 3]));
+    body.insert("supported_vault_formats".into(), json!([1, 2, 3, 4]));
     body.insert("capabilities".into(), capabilities());
     body.insert("platform_limits".into(), platform_limits(None));
     Report {
@@ -325,7 +325,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
                     .extra("created_new_vault", json!(false)),
             );
         }
-    } else if format == 2 || format == 3 {
+    } else if format == 2 || format == 3 || format == 4 {
         validate_hook_names(
             hooks.stop_at.as_deref(),
             hooks.inject_point.as_deref(),
@@ -372,6 +372,17 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES ('body_schema', ?1)",
                     [store::BODY_SCHEMA],
+                )
+                .map_err(|err| db_fail(err, "init_schema"))?;
+                conn.execute_batch(store::FACT_DDL)
+                    .map_err(|err| db_fail(err, "init_schema"))?;
+            }
+            if format == 4 {
+                conn.execute_batch(store::HTML_DDL)
+                    .map_err(|err| db_fail(err, "init_schema"))?;
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('html_body_schema', ?1)",
+                    [store::HTML_BODY_SCHEMA],
                 )
                 .map_err(|err| db_fail(err, "init_schema"))?;
                 conn.execute_batch(store::FACT_DDL)
@@ -868,6 +879,7 @@ fn read_main_meta(conn: &Connection) -> Result<MainMeta, Fail> {
         "primary_input",
         "slice",
         "body_schema",
+        "html_body_schema",
     ] {
         let value = store::meta(conn, key).map_err(|_| verify_damaged("meta_unreadable"))?;
         values.push((key, value));
@@ -936,6 +948,30 @@ fn compare_main(format: u8, vault_id: &str, main: &MainMeta) -> Result<(), Fail>
             ))
             .extra("during", json!("init_verify"))
             .extra("meta_key", json!("body_schema"))
+            .extra("meta_seen", json!(seen)));
+        }
+    }
+    if format == 4 {
+        let plain = meta_value(&main.values, "body_schema");
+        if plain.is_some() {
+            return Err(unpublished(Fail::new(
+                EXIT_NOT_PRESERVED,
+                "NotPreserved",
+                "body_schema_mismatch",
+            ))
+            .extra("during", json!("init_verify"))
+            .extra("meta_key", json!("body_schema"))
+            .extra("meta_seen", json!(plain)));
+        }
+        let seen = meta_value(&main.values, "html_body_schema");
+        if seen != Some(store::HTML_BODY_SCHEMA) {
+            return Err(unpublished(Fail::new(
+                EXIT_NOT_PRESERVED,
+                "NotPreserved",
+                "html_body_schema_mismatch",
+            ))
+            .extra("during", json!("init_verify"))
+            .extra("meta_key", json!("html_body_schema"))
             .extra("meta_seen", json!(seen)));
         }
     }
@@ -1140,6 +1176,16 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
         if !is_command_id(batch) {
             return Err(Fail::new(EXIT_USAGE, "Usage", "bad_batch_id"));
         }
+    }
+    if let Ok(4) = accept_wal_format(&req.vault.join("vault.db")) {
+        return Err(Fail::new(
+            EXIT_VERSION,
+            "VersionUnsupported",
+            "format_4_refuses_import",
+        )
+        .extra("new_effect", json!(false))
+        .extra("vault_format", json!(4))
+        .extra("created_new_vault", json!(false)));
     }
     let session = open_session(&req.vault)?;
     let reconciled = journal::reconcile(&session.root, &session.conn)?;
@@ -2104,7 +2150,17 @@ fn vault_unreadable(err: &io::Error, reason: &'static str, during: &str) -> Fail
 }
 
 fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
-    let (version, format, schema) = visible_main_format(&path.join("vault.db"))?;
+    let (version, format, schema, html_schema) = visible_main_format(&path.join("vault.db"))?;
+    if version == 4 {
+        if consistent_format_4(format.as_deref(), schema.as_deref(), html_schema.as_deref()) {
+            return Ok(4);
+        }
+        return Err(
+            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
+                .extra("schema_version_found", json!(version))
+                .extra("created_new_vault", json!(false)),
+        );
+    }
     if version == 2 || version == 3 {
         let expected = if version == 2 { "2" } else { "3" };
         if format.as_deref() == Some(expected) && schema.as_deref() == Some("1") {
@@ -2118,7 +2174,7 @@ fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
         .extra("schema_version_found", json!(version))
         .extra("created_new_vault", json!(false)));
     }
-    if version > 3 {
+    if version > 4 {
         return Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(version))
@@ -2141,7 +2197,9 @@ fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
     Ok(1)
 }
 
-fn visible_main_format(db: &Path) -> Result<(i64, Option<String>, Option<String>), Fail> {
+fn visible_main_format(
+    db: &Path,
+) -> Result<(i64, Option<String>, Option<String>, Option<String>), Fail> {
     let uri = readonly_uri(db)?;
     let conn = Connection::open_with_flags(
         &uri,
@@ -2167,7 +2225,12 @@ fn visible_main_format(db: &Path) -> Result<(i64, Option<String>, Option<String>
             .extra("created_new_vault", json!(false))
             .extra("published", json!(false))
     })?;
-    Ok((version, format, schema))
+    let html_schema = store::meta(&conn, "html_body_schema").map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
+            .extra("created_new_vault", json!(false))
+            .extra("published", json!(false))
+    })?;
+    Ok((version, format, schema, html_schema))
 }
 
 fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
@@ -2205,8 +2268,14 @@ fn accept_wal_format(db: &Path) -> Result<i64, Fail> {
         .map(|meta| meta.is_file() && meta.len() > 0)
         .unwrap_or(false);
     if !frames {
-        let (header, format, schema) = visible_main_format(db)?;
-        return judge_format(header, header, format.as_deref(), schema.as_deref());
+        let (header, format, schema, html_schema) = visible_main_format(db)?;
+        return judge_format(
+            header,
+            header,
+            format.as_deref(),
+            schema.as_deref(),
+            html_schema.as_deref(),
+        );
     }
     let uri = wal_visible_uri(db)?;
     let conn = Connection::open_with_flags(
@@ -2222,12 +2291,20 @@ fn accept_wal_format(db: &Path) -> Result<i64, Fail> {
 
 fn accept_connection_format(db: &Path, conn: &Connection) -> Result<i64, Fail> {
     let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
-    let (header, _, _) = visible_main_format(db)?;
-    let (effective, format, schema) = effective_view(conn)?;
-    judge_format(header, effective, format.as_deref(), schema.as_deref())
+    let (header, _, _, _) = visible_main_format(db)?;
+    let (effective, format, schema, html_schema) = effective_view(conn)?;
+    judge_format(
+        header,
+        effective,
+        format.as_deref(),
+        schema.as_deref(),
+        html_schema.as_deref(),
+    )
 }
 
-fn effective_view(conn: &Connection) -> Result<(i64, Option<String>, Option<String>), Fail> {
+fn effective_view(
+    conn: &Connection,
+) -> Result<(i64, Option<String>, Option<String>, Option<String>), Fail> {
     let version = store::user_version(conn).map_err(|_| {
         Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "user_version_unreadable")
             .extra("created_new_vault", json!(false))
@@ -2240,7 +2317,19 @@ fn effective_view(conn: &Connection) -> Result<(i64, Option<String>, Option<Stri
         Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
             .extra("created_new_vault", json!(false))
     })?;
-    Ok((version, format, schema))
+    let html_schema = store::meta(conn, "html_body_schema").map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
+            .extra("created_new_vault", json!(false))
+    })?;
+    Ok((version, format, schema, html_schema))
+}
+
+fn consistent_format_4(
+    format: Option<&str>,
+    schema: Option<&str>,
+    html_schema: Option<&str>,
+) -> bool {
+    format == Some("4") && schema == Some("1") && html_schema == Some(store::HTML_BODY_SCHEMA)
 }
 
 fn judge_format(
@@ -2248,8 +2337,22 @@ fn judge_format(
     effective: i64,
     format: Option<&str>,
     schema: Option<&str>,
+    html_schema: Option<&str>,
 ) -> Result<i64, Fail> {
-    if effective > 3 {
+    // A user_version of 4 is format 4 only when the header and the format meta
+    // agree. A format 2 or 3 vault whose version was bumped to 4 stays
+    // newer_schema and is not migrated.
+    if effective == 4 {
+        if header == 4 && consistent_format_4(format, schema, html_schema) {
+            return Ok(4);
+        }
+        return Err(
+            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
+                .extra("schema_version_found", json!(effective))
+                .extra("created_new_vault", json!(false)),
+        );
+    }
+    if effective > 4 {
         return Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(effective))

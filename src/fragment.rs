@@ -73,6 +73,14 @@ fn require_body_format(vault: &Path) -> Result<(), Fail> {
     match super::accept_wal_format(&vault.join("vault.db"))? {
         1 => Err(needs_upgrade()),
         2 | 3 => Ok(()),
+        4 => Err(Fail::new(
+            EXIT_VERSION,
+            "VersionUnsupported",
+            "format_4_refuses_fragment",
+        )
+        .extra("schema_version_found", json!(4))
+        .extra("new_effect", json!(false))
+        .extra("vault_format", json!(4))),
         version => Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(version))
