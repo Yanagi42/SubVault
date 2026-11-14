@@ -31,7 +31,7 @@ python3 synthetic/generate_corpus.py --check
 - 某一个已提交源的托管对象这次读不出来时，打开、`verify` 和 `recover` 仍列出每一个来源、旧 `user_marker`、出现记录和命令行。读得出的源是 `preservation=preserved`、`object_intact=true`。读不出的那条保留来源、对象身份、已保存的哈希、长度和媒体类型；它的 `preservation` 和 `object_intact` 是 null，表示历史提交还在、这次完整性不可核。这不是 `not_preserved`，也不是完整。告警是 `object_unreadable`，带 `during=hash_object` 和真实的 `os_error`。没有悬空引用时退出码是 3，`new_effect` 为 false。换一个对象读失败，回执里的两个来源都还在。重复打开的回执相同，对象字节不变。单独 `read` 或重放那个读不出的对象仍是退出码 12，回执不写 `preservation`。对象目录列不出来是告警 `objects_unlisted`（`during=read_objects`）；目录进不去时，来源按这次读失败处理，不写成对象缺失。未引用对象哈希读失败是告警 `orphan_unreadable`（`during=hash_orphan`），并且不给那个文件填一个哈希。这两条都不把已提交源改成未保全，也不把一个对象的未知扩大成整个库未知。journal 标签写失败仍叠在同一份报告上。
 - `SYNTHETIC_ONLY` 读不出来时，打开、`verify`、`recover`、`read`、已提交命令的再次导入和 `cancel` 都是退出码 21，reason 是 `banner_unreadable`，`during` 是 `banner`，`new_effect` 为 null，回执里没有 `preservation`。对象还没被查看，所以既不写成已保全，也不写成未保全，也不列出一份假的来源清单。横幅文件不被创建或改写。横幅内容确实读到了但不匹配，仍是退出码 19，`NotSynthetic`，文件保持读到的内容。
 - 还没有本命令提交行的新导入、新标记和未提交取消，失败仍是退出码 15，`preservation=not_preserved`。这只说明这次命令没有提交。
-- 库已经存在，但这轮还没有读到来源行时，退出码是 21，reason 是 `vault_unseen`，`new_effect` 为 null，没有 `preservation`，也没有 `sources`。`during` 标明步骤：`lock`、`open`、`pragma`、`statfs`、`canonicalize`，或 `list_sources`、`list_objects`、`list_occurrences`、`list_commands`、`reconcile` 这种目录查询。这和横幅、`vault.db` 读失败是同一类未知，reason 不同，避免和文件头读失败混在一起。
+- 库已经存在，但这轮还没有读到来源行时，退出码是 21，reason 是 `vault_unseen`，`new_effect` 为 null，没有 `preservation`，也没有 `sources`。`during` 标明步骤：`lock`、`open`、`pragma`、`statfs`、`canonicalize`，或 `list_sources`、`list_objects`、`list_occurrences`、`list_commands`、`reconcile` 这种目录查询。这和横幅、`vault.db` 读失败是同一类未知：这次还没看见历史。它不表示 `COMMIT` 返回过错误。`COMMIT` 返回错误之后可见性查询也失败，才是另一条 21，reason 是 `commit_visibility_unknown`；那条没有实跑。
 - 来源已经按当前规则列入打开报告之后，旁边的扫描、清理或 checkpoint 失败只追加告警，不改各源的 `preservation` 和 `object_intact`，也不编造 `incomplete_commands`。journal 目录列不出是 `journal_unlisted`；staging 目录列不出是 `staging_unlisted`；临时文件删不掉是 `journal_tmp_not_removed` 或 `staging_not_removed`；checkpoint 失败是 `checkpoint_failed`。原来是就绪时，退出码变成 3，`new_effect` 为 false。已经是 12 的缺失或损坏保持 12。
 - `read` 在托管哈希已经相符之后，`--out` 写不出来是退出码 3，`preservation=preserved`，`object_intact=true`，`new_effect=false`，`during=read_copy`，`output_written=false`。副本不算成功，托管字节不改。
 
@@ -49,7 +49,7 @@ python3 synthetic/generate_corpus.py --check
 | 10 | 不是库。缺失路径不会被创建 |
 | 11 | 另一个进程持有写锁 |
 | 12 | 需要恢复：对象缺失或哈希不符、悬空引用、无法读取的 journal、成功回执不是 JSON 对象。单独 `read` 或重放某一个读不出的托管对象也是 12，`object_unreadable`，那条回执不写 `preservation` |
-| 13 | 数据库头损坏。打开和取消都不重建该文件 |
+| 13 | 只读损坏。打开和取消都不重建、不覆盖。`sqlite_header` 表示文件头字节已经读到，但不是 16 字节的 `SQLite format 3\0`；读到的长度不足 16 字节，包括 0 字节文件，也是这个 reason。文件打不开，或读操作本身失败，不是 13，那是 21 的 `vault_unreadable`。同一退出码还有版本检查的只读连接打不开（`sqlite_unreadable`）、`user_version` 读失败（`user_version_unreadable`）、读到的 `user_version` 不是 1 且不高于 1（`unexpected_user_version`）、`schema_version` 那一行读失败（`meta_unreadable`）。读到的 `schema_version` 不是 `1` 是退出码 12；高于 1 的 `user_version` 是退出码 14。行为测试跑过的是坏头和 0 字节文件的打开与取消。其余四个 reason 没有单独触发 |
 | 14 | `user_version` 高于 1。打开和取消都不迁移、不覆盖 |
 | 15 | 没有保全。只用于这次命令还没有提交成功，包括新导入、新标记、未提交取消、真实 IO 错误和测试注入。回执带 `preservation=not_preserved`。已经核对过的历史、还没看到来源行的打开，都不用 15 |
 | 16 | 拒绝。载荷冲突、代次不符，或提取取消 |
@@ -57,7 +57,7 @@ python3 synthetic/generate_corpus.py --check
 | 18 | 文件系统被识别为 NFS 或 SMB/CIFS |
 | 19 | 横幅内容已经读到，并且不是合成库横幅。不改写横幅文件 |
 | 20 | 请求的停止点没有到达 |
-| 21 | 提交结果无法确定，或这次还不能给历史下保全结论。读不到 `vault.db` 时 reason 是 `vault_unreadable`，`during` 是 `sqlite_header`。读不到横幅时 reason 是 `banner_unreadable`，`during` 是 `banner`。锁、数据库打开、pragma、statfs、canonicalize，以及来源目录查询失败时 reason 是 `vault_unseen`，`during` 是该步骤。这些都不写 `preservation`，`new_effect` 为 null，也不编来源清单。权限错误是真实的，不是注入，也不是 `COMMIT` 或 WAL `fsync` 失败。`COMMIT` 之后的查询失败仍没有实测。横幅内容已经读到但不匹配，仍是退出码 19，不是 21 |
+| 21 | 这次还不能下保全结论。两路都不写 `preservation`，`new_effect` 为 null。未见历史：读不到 `vault.db` 是 `vault_unreadable`，`during` 是 `sqlite_header`；读不到横幅是 `banner_unreadable`，`during` 是 `banner`；锁、数据库打开、pragma、statfs、canonicalize 和来源目录查询是 `vault_unseen`，`during` 是该步骤，不编来源清单。这些都不是 `COMMIT` 返回了错误。真正的 `COMMIT` 返回错误之后，可见性查询也失败，reason 才是 `commit_visibility_unknown`，`during` 是 `after_commit_error`。这条没有实跑。`db_commit` 注入在 `COMMIT` 之前返回，是确定回滚，不是这条。查询成功时，看得到命令行是已提交，确定没有行是退出码 15。写者仍持锁时，取消若打不开那条能看见 WAL 的连接，或命令查询失败，也是 `commit_visibility_unknown`，`during` 是 `wal_open` 或 `wal_query`；那不是 `COMMIT` 返回错误，也没有单独让它失败。横幅内容已经读到但不匹配，仍是退出码 19 |
 
 `--stop-at during_copy` 在对象发布前停下，包括 0 字节、1 字节、2 字节，以及把第一次 `read` 强制成 1 字节的情况。多字节读取会留下短于全文的前缀。这个强制短读只作用于路径名含 `SHORTREAD-` 的文件，不是 ext4 自然短读，也不是故障注入。一次复制只停一次，恢复后把剩余字节写完。
 
@@ -65,7 +65,7 @@ python3 synthetic/generate_corpus.py --check
 
 `cancel --kind extraction` 只返回 `extraction_cancel_not_available`。它不创建提取目录，也没有提取实现。保全命令在提交前可以取消。写者已经提交、但仍持有锁时，取消用 `mode=ro` 读取 WAL 里的命令行，返回 `AlreadyCommitted`，`cancel_applied` 为 false，`preservation` 为 `preserved`，不写 control 文件。版本检查仍用 `immutable=1`，那条连接故意看不见尚未检查点的 WAL，不能拿来判断命令是否提交，也不能用 journal 上的状态文字代替数据库。0 字节库、坏文件头和更高的 `user_version` 走与打开相同的非破坏边界。
 
-SQLite 的 `COMMIT` 本身返回错误时，另开一条能看见 WAL 的连接：看得到命令行就是已提交，确定没有就是未保全，查询失败就是退出码 21。查询失败这条路径没有实测。
+SQLite 的 `COMMIT` 本身返回错误时，另开一条能看见 WAL 的连接：看得到命令行就是已提交，确定没有就是未保全。查询也失败才是退出码 21，reason 是 `commit_visibility_unknown`，`during` 是 `after_commit_error`。这条没有实跑。它和 `vault_unseen` 不是一路：`vault_unseen` 只说明还没看见历史，不说明 `COMMIT` 返回过错误。
 
 ## 磁盘布局
 
