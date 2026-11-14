@@ -1763,3 +1763,52 @@ fn resume(pid: u32) {
         .unwrap()
         .success());
 }
+
+#[test]
+fn fragment_input_bounds_keep_exact_bytes_and_reject_the_neighbors() {
+    let tmp = Tmp::new("bounds");
+    let vault = init(&tmp);
+    let mut exact = Vec::with_capacity(65_536);
+    for _ in 0..64 {
+        exact.extend(std::iter::repeat(b'a').take(1023));
+        exact.push(b'\n');
+    }
+    assert_eq!(exact.len(), 65_536);
+    let exact_path = tmp.path().join("exact.txt");
+    write_file(&exact_path, &exact);
+    let (code, body) = fragment(&vault, "exact", &exact_path);
+    assert_eq!(code, 0, "{body}");
+    assert_eq!(body["candidate_count"], 0);
+    assert_eq!(body["candidates_published"], true);
+    assert_eq!(body["preservation"], "preserved");
+    assert_eq!(object_bytes(&vault, &body), exact);
+    assert_eq!(fs::read(&exact_path).unwrap(), exact);
+    let listed = candidates(&vault);
+    assert_eq!(listed["candidates"].as_array().unwrap().len(), 0);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "0");
+
+    let mut over = exact.clone();
+    over.push(b'b');
+    assert_eq!(over.len(), 65_537);
+    let over_path = tmp.path().join("over.bin");
+    write_file(&over_path, &over);
+    let (code, body) = fragment(&vault, "over", &over_path);
+    assert_eq!(code, 16, "{body}");
+    assert_eq!(body["reason"], "over_input_budget");
+    assert_eq!(body["bytes_read"], 0);
+    assert_eq!(body["stat_size"], 65_537);
+    assert_eq!(body["limit"], 65_536);
+    assert_eq!(fs::read(&over_path).unwrap(), over);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "0");
+
+    let bad_path = tmp.path().join("bad.bin");
+    let bad = [0xff, 0xfe];
+    write_file(&bad_path, &bad);
+    let (code, body) = fragment(&vault, "bad", &bad_path);
+    assert_eq!(code, 16, "{body}");
+    assert_eq!(body["reason"], "invalid_utf8");
+    assert_eq!(body["bytes_read"], 2);
+    assert_eq!(fs::read(&bad_path).unwrap(), bad);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM candidates;"), "0");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM objects;"), "1");
+}
