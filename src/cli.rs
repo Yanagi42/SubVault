@@ -74,6 +74,9 @@ pub fn execute(args: Vec<String>) -> Report {
         Ok(parsed) => parsed,
         Err(fail) => return fail.into_report(),
     };
+    if command == "review" && (flags.stop_at.is_some() || flags.inject.is_some()) {
+        return usage("review_has_no_hook");
+    }
     let hooks = match hooks_from(&flags) {
         Ok(hooks) => hooks,
         Err(fail) => return fail.into_report(),
@@ -196,6 +199,12 @@ pub fn execute(args: Vec<String>) -> Report {
                 return usage("vault_required");
             };
             engine::query_facts(&vault, flags.source_id, flags.fact_id)
+        }
+        "review" => {
+            let (Some(vault), Some(out)) = (flags.vault, flags.out) else {
+                return usage("review_required_flags");
+            };
+            engine::review_sheet(&vault, &out)
         }
         "export" => {
             let (Some(vault), Some(out)) = (flags.vault, flags.out) else {

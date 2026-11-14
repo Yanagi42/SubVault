@@ -153,6 +153,10 @@ scripts/run-t1-evidence.sh
 
 `facts` 在格式 4 上的 `slice` 是 `T4-html`。事实值仍是来源声明：`payment_verified` 为 false，`observed_at` 为 null，`current_status` 和 `time_status` 为 unknown。`correct` 和 `undo` 沿用 `t3-payload-1`，只改写明的 USD 金额文本。导出包里的 HTML 原件可能含有外部引用；`field_notes.html_original` 写明这些引用不会被自动加载。格式 1、2、3 的导出注释不增加这一条。
 
+## 只读审阅单
+
+`review --vault PATH --out PATH` 把格式 3 或格式 4 里已经在库的来源、事实、决定，以及没有成为事实的候选，写成一份 UTF-8 纯文本。它复用 `facts` 和 `candidates` 的只读结果。候选 JSON 没有 `media_type`，所以审阅单再读已有的 `sources.media_type` 和 `source_versions.role`。它不重抽，不迁移，不改事实、原件或决定，也不改导出包。已有目标拒绝覆盖。控制字符、换行和双向控制写成 `\u{XXXX}`。原文 HTML 只按文字抄出，不渲染，不取远程资源。格式 4 仍然不收纯文本片段。这不是 Windows 界面。
+
 ## 这轮没有做
 
 整理、全文搜索、订阅规则、购买、权益、PDF 提取、OCR、加密、真实数据导入、桌面壳和遥测都没有实现。离线退出包不是备份，也不是保护方案。正文候选本身不是事实。格式 3 另有事实表，只承接写明的已付金额和服务期。格式 4 的 HTML 只做上面列出的静态文本，不是浏览器，也不表示普通 HTML 都能提取。T0/T1 通过不等于产品完成。Linux 上的结果不代表 Windows。
