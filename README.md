@@ -61,7 +61,7 @@ python3 synthetic/generate_corpus.py --check
 
 `--stop-at during_copy` 在对象发布前停下，包括 0 字节、1 字节、2 字节，以及把第一次 `read` 强制成 1 字节的情况。多字节读取会留下短于全文的前缀。这个强制短读只作用于路径名含 `SHORTREAD-` 的文件，不是 ext4 自然短读，也不是故障注入。一次复制只停一次，恢复后把剩余字节写完。
 
-`--stop-at` 把检查点写到指定文件后发送 `SIGSTOP`。`--inject enospc:POINT` 或 `--inject io_error:POINT` 把见证写到指定文件后返回未保全。注入回执里的 `injected` 是 true，并写明这不是磁盘真的满了。见证文件没有出现时，注入不算已经发生。`db_commit` 注入发生在真正的 `COMMIT` 之前，事务回滚，命令行不存在；它只证明确定的回滚，不是提交结果不确定。
+`--stop-at` 把检查点写到指定文件后发送 `SIGSTOP`。检查点文件出现只说明文件已经写完。行为测试再读到 `/proc/<pid>/status` 的 `State: T` 才发送 `SIGCONT`。等待的是这个状态。只在这台 Linux 上这样验证。`--inject enospc:POINT` 或 `--inject io_error:POINT` 把见证写到指定文件后返回未保全。注入回执里的 `injected` 是 true，并写明这不是磁盘真的满了。见证文件没有出现时，注入不算已经发生。`db_commit` 注入发生在真正的 `COMMIT` 之前，事务回滚，命令行不存在；它只证明确定的回滚，不是提交结果不确定。
 
 `cancel --kind extraction` 只返回 `extraction_cancel_not_available`。它不创建提取目录，也没有提取实现。保全命令在提交前可以取消。写者已经提交、但仍持有锁时，取消用 `mode=ro` 读取 WAL 里的命令行，返回 `AlreadyCommitted`，`cancel_applied` 为 false，`preservation` 为 `preserved`，不写 control 文件。版本检查仍用 `immutable=1`，那条连接故意看不见尚未检查点的 WAL，不能拿来判断命令是否提交，也不能用 journal 上的状态文字代替数据库。0 字节库、坏文件头和更高的 `user_version` 走与打开相同的非破坏边界。
 

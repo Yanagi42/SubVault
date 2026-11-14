@@ -290,9 +290,9 @@ fn spawn(args: &[&str]) -> std::process::Child {
 
 fn wait_checkpoint(child: &mut std::process::Child, path: &Path) -> Value {
     let start = Instant::now();
-    loop {
+    let value = loop {
         if path.is_file() {
-            return serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            break serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap();
         }
         if let Some(status) = child.try_wait().unwrap() {
             let mut stdout = String::new();
@@ -308,6 +308,58 @@ fn wait_checkpoint(child: &mut std::process::Child, path: &Path) -> Value {
         if start.elapsed() > Duration::from_secs(10) {
             let _ = child.kill();
             panic!("checkpoint timeout {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // The checkpoint file is visible before SIGSTOP is delivered. Wait until
+    // /proc shows State T. A SIGCONT sent in that gap is discarded and the
+    // process stays stopped.
+    observe_stopped(child, Instant::now());
+    value
+}
+
+fn observe_stopped(child: &mut std::process::Child, start: Instant) {
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("child exited before SIGSTOP was observed: {status}");
+        }
+        if process_is_stopped(child.id()) {
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            panic!(
+                "checkpoint exists but pid {} was not observed stopped",
+                child.id()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn process_is_stopped(pid: u32) -> bool {
+    let Ok(text) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        parts.next() == Some("State:") && parts.next() == Some("T")
+    })
+}
+
+fn resume_stopped(pid: u32) {
+    let start = Instant::now();
+    loop {
+        if process_is_stopped(pid) {
+            assert!(Command::new("kill")
+                .args(["-CONT", &pid.to_string()])
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("refusing SIGCONT: pid {pid} was not observed stopped");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1076,11 +1128,7 @@ fn cancel_during_copy_and_after_commit() {
     );
     assert_eq!(pending.code, Some(0), "{}", pending.stdout);
     assert_eq!(parse(&pending)["outcome"], "CancelPending");
-    assert!(Command::new("kill")
-        .args(["-CONT", &child.id().to_string()])
-        .status()
-        .unwrap()
-        .success());
+    resume_stopped(child.id());
     let writer = from_output(child.wait_with_output().unwrap(), Duration::ZERO);
     record("cancel-writer", &[], &writer);
     assert_eq!(writer.code, Some(0), "{}", writer.stdout);
@@ -1907,11 +1955,7 @@ fn spawn_env(args: &[&str], env: &[(&str, &str)]) -> std::process::Child {
 }
 
 fn continue_child(child: std::process::Child, scenario: &str) -> Out {
-    assert!(Command::new("kill")
-        .args(["-CONT", &child.id().to_string()])
-        .status()
-        .unwrap()
-        .success());
+    resume_stopped(child.id());
     let out = from_output(child.wait_with_output().unwrap(), Duration::ZERO);
     record(scenario, &[], &out);
     out
