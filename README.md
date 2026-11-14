@@ -28,6 +28,7 @@ python3 synthetic/generate_corpus.py --check
 - 命令以调用者给出的 CommandId 记入 SQLite。同一 CommandId 再次执行时，先核对托管对象的当前字节。对象缺失或字节被改过时返回恢复所需，`new_effect` 为 false，不复制、不覆盖、不补回旧对象。托管字节仍完整时：外部路径已经不存在，就用已经核对过的托管哈希加上这次请求的媒体类型计算指纹。媒体类型相同则返回当时的 `AlreadyCommitted`，`source_check` 为 `absent`，`new_effect` 为 false。媒体类型不同则退出码 16，`payload_conflict`，`new_effect` 为 false，不新增出现记录；已保存的媒体类型和显示名不变，托管对象仍是 `preserved`。路径还在但读不出来，或路径不是普通文件，退出码 3，outcome 是 `ExternalUnverified`，reason 分别是 `source_unreadable` 和 `source_not_a_file`。`payload_verified` 为 false，`payload_matches` 为 null，`new_effect` 为 false。这条回执的 `preservation` 是刚才核对过的那个托管对象的 `preserved`，`object_intact` 为 true。读不到字节时不比较媒体类型，也不把这次失败当成载荷冲突。路径可读且内容或媒体类型不同，返回 `payload_conflict`，`payload_matches` 为 false，`new_effect` 为 false；这是本次请求被拒绝，已经核对过的托管对象仍是 `preserved`。显示名不在指纹里，只改显示名仍是 `AlreadyCommitted`，并保留第一次的显示名。
 - 回执里的 `preservation` 只有在 SQLite 提交成功并且这次调用核对过托管字节之后，才对那个源写成 `preserved`。提交成功后的 journal、检查点或回执写入失败仍返回 `Committed`，并带 `post_commit_io`；这不能再写成确定的 `NotPreserved`。`arrangement` 固定为 `not_arranged`，`searchability` 固定为 `not_searchable`。数据库约束也拒绝其他值。
 - 打开、`verify` 和 `recover` 共用一条路径。命令行已经存在而 journal 标签写不回去时，不把这次失败写成整个库 `NotPreserved`。各源仍按自己的行报告 `preservation=preserved` 和 `object_intact`。标签没写成是这次调用的另一件事：退出码 3，`IntegrityAlert`，`journal_label_update` 为 `failed`，`new_effect` 为 false。重复打开的回执相同，不改对象字节，journal 文件保持原文字。同一条已提交命令再次导入仍是 `AlreadyCommitted`，回执同时带上标签没能更新；这不是 `NotPreserved`。还没有命令行的 journal 不会被改写成已提交，那条未完成命令仍是 `not_preserved`，已经提交的源仍是 `preserved`。`vault.db` 这个文件读不出来时退出码 21，reason 是 `vault_unreadable`，`new_effect` 为 null，回执里没有 `preservation`。那是这次打不开数据库文件，不是 `COMMIT` 失败，也不是断电或坏盘。
+- 某一个已提交源的托管对象这次读不出来时，打开、`verify` 和 `recover` 仍列出每一个来源、旧 `user_marker`、出现记录和命令行。读得出的源是 `preservation=preserved`、`object_intact=true`。读不出的那条保留来源、对象身份、已保存的哈希、长度和媒体类型；它的 `preservation` 和 `object_intact` 是 null，表示历史提交还在、这次完整性不可核。这不是 `not_preserved`，也不是完整。告警是 `object_unreadable`，带 `during=hash_object` 和真实的 `os_error`。没有悬空引用时退出码是 3，`new_effect` 为 false。换一个对象读失败，回执里的两个来源都还在。重复打开的回执相同，对象字节不变。单独 `read` 或重放那个读不出的对象仍是退出码 12，回执不写 `preservation`。对象目录列不出来是告警 `objects_unlisted`（`during=read_objects`）；目录进不去时，来源按这次读失败处理，不写成对象缺失。未引用对象哈希读失败是告警 `orphan_unreadable`（`during=hash_orphan`），并且不给那个文件填一个哈希。这两条都不把已提交源改成未保全，也不把一个对象的未知扩大成整个库未知。journal 标签写失败仍叠在同一份报告上。
 
 `user_marker` 是一条已提交的观察用文本，用来确认后来的导入、失败和重试没有改掉旧值。它不是订阅事实。导入不会改写它。
 
@@ -39,13 +40,13 @@ python3 synthetic/generate_corpus.py --check
 | --- | --- |
 | 0 | 完成、已提交过、已取消、取消已挂起，或打开后就绪 |
 | 2 | 用法错误 |
-| 3 | 有告警且引用没有悬空。对象路径被拒绝但规范路径上的字节仍完整，或 journal 标签没能改写但托管字节仍完整，都走这里。已提交命令的外部路径读不出或不是文件时，导入也用 3，outcome 是 `ExternalUnverified` |
+| 3 | 有告警且引用没有悬空。对象路径被拒绝但规范路径上的字节仍完整，或 journal 标签没能改写但托管字节仍完整，都走这里。某一个托管对象、对象目录或未引用对象这次读不出，也走这里：读得出的源仍是 `preserved`，读不出的源不写保全结论。已提交命令的外部路径读不出或不是文件时，导入也用 3，outcome 是 `ExternalUnverified` |
 | 10 | 不是库。缺失路径不会被创建 |
 | 11 | 另一个进程持有写锁 |
-| 12 | 需要恢复：对象缺失或哈希不符、悬空引用、无法读取的 journal、成功回执不是 JSON 对象 |
+| 12 | 需要恢复：对象缺失或哈希不符、悬空引用、无法读取的 journal、成功回执不是 JSON 对象。单独 `read` 或重放某一个读不出的托管对象也是 12，`object_unreadable`，那条回执不写 `preservation` |
 | 13 | 数据库头损坏。打开和取消都不重建该文件 |
 | 14 | `user_version` 高于 1。打开和取消都不迁移、不覆盖 |
-| 15 | 没有保全。用于这次命令还没有提交成功，包括真实 IO 错误和测试注入。已经核对过托管字节的历史命令，不用这个结果否定那次保全 |
+| 15 | 没有保全。用于这次命令还没有提交成功，包括真实 IO 错误和测试注入。已经核对过托管字节的历史命令，不用这个结果否定那次保全。打开时某一个对象、对象目录或孤儿文件读失败，也不用 15 把其余已提交源说成没保全 |
 | 16 | 拒绝。载荷冲突、代次不符，或提取取消 |
 | 17 | 请求的故障点在这次命令上不可能到达。命令不会假装成功 |
 | 18 | 文件系统被识别为 NFS 或 SMB/CIFS |
@@ -77,7 +78,7 @@ control/<command-id>
 
 SQLite 使用捆绑的 3.46.0，WAL，`synchronous=FULL`，`foreign_keys=ON`，`busy_timeout=0`，`user_version=1`。表是 `meta`、`objects`、`sources`、`occurrences`、`commands`。打开和取消在 `Connection::open` 之前先检查 `SQLite format 3` 文件头，避免 0 字节或坏文件被 SQLite 初始化成空库。
 
-打开、`verify` 和 `recover` 走同一条内部路径：删除 `staging/` 里的临时文件以及 journal 的临时名，不删除 `objects/` 里的文件。journal 只有在对应命令行已经存在时才尝试标成 committed。标签写失败留在 `journal_label_update=failed`，不中断这份报告，也不把已提交的源改成未保全。恢复不会根据对象文件名插入源或购买。未引用对象保持未引用，直到同一个 CommandId 带着匹配字节重试。恢复可以重复执行。
+打开、`verify` 和 `recover` 走同一条内部路径：删除 `staging/` 里的临时文件以及 journal 的临时名，不删除 `objects/` 里的文件。journal 只有在对应命令行已经存在时才尝试标成 committed。标签写失败留在 `journal_label_update=failed`，不中断这份报告，也不把已提交的源改成未保全。某一个对象读失败、对象目录列不出来或未引用对象哈希读失败，同样不中断其余来源；读不出的来源不写 `preserved` 或 `not_preserved`。恢复不会根据对象文件名插入源或购买。未引用对象保持未引用，直到同一个 CommandId 带着匹配字节重试。恢复可以重复执行。
 
 journal 是一份字段表生成的 JSON。未知键被忽略。可选字段缺失和 JSON null 相同。进行中的 journal 可以还没有 `payload_fingerprint`；这表示哈希还没记下，不是已提交结果被二次套用。手改删掉指纹属于损坏，不按普通的双应用缺陷处理。成功回执若不是 JSON 对象，重放返回退出码 12，不另建一套回执模式。
 

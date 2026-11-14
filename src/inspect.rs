@@ -9,8 +9,8 @@ use crate::fsutil::sha256_file;
 use crate::ids::is_prefixed_id;
 use crate::journal;
 use crate::model::{
-    capabilities, db_fail, honesty, io_fail, platform_limits, Fail, Report, EXIT_INTEGRITY,
-    EXIT_OK, EXIT_RECOVERY, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE, PRESERVED,
+    capabilities, db_fail, honesty, platform_limits, Fail, Report, EXIT_INTEGRITY, EXIT_OK,
+    EXIT_RECOVERY, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE, PRESERVED,
 };
 use crate::store;
 
@@ -36,27 +36,65 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
     let mut unreferenced = Vec::new();
     let object_dir = root.join("objects");
     if object_dir.is_dir() {
-        let mut names = Vec::new();
-        for entry in fs::read_dir(&object_dir).map_err(|err| io_fail(err, "read_objects"))? {
-            let entry = entry.map_err(|err| io_fail(err, "read_objects"))?;
-            names.push(entry.file_name().to_string_lossy().to_string());
-        }
-        names.sort();
-        for name in names {
-            if !is_prefixed_id(&name, "obj_") {
-                alerts.push(json!({"code": "unexpected_object_name", "name": name}));
-                continue;
-            }
-            if !db_object_ids.contains(name.as_str()) {
-                let path = object_dir.join(&name);
-                let (hash, len) = sha256_file(&path).map_err(|err| io_fail(err, "hash_orphan"))?;
-                unreferenced.push(json!({
-                    "object_id": name,
-                    "content_sha256": hash,
-                    "hash_alg": "sha256",
-                    "byte_length": len,
-                    "object_relpath": format!("objects/{name}")
+        // A listing or orphan-hash failure is about files this call could not
+        // read. It does not decide whether committed sources were preserved.
+        match fs::read_dir(&object_dir) {
+            Err(err) => {
+                alerts.push(json!({
+                    "code": "objects_unlisted",
+                    "during": "read_objects",
+                    "os_error": err.to_string(),
                 }));
+            }
+            Ok(entries) => {
+                let mut names = Vec::new();
+                let mut list_error = None;
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => names.push(entry.file_name().to_string_lossy().to_string()),
+                        Err(err) => {
+                            list_error = Some(err.to_string());
+                            break;
+                        }
+                    }
+                }
+                if let Some(message) = list_error {
+                    alerts.push(json!({
+                        "code": "objects_unlisted",
+                        "during": "read_objects",
+                        "os_error": message,
+                    }));
+                } else {
+                    names.sort();
+                    for name in names {
+                        if !is_prefixed_id(&name, "obj_") {
+                            alerts.push(json!({"code": "unexpected_object_name", "name": name}));
+                            continue;
+                        }
+                        if !db_object_ids.contains(name.as_str()) {
+                            let path = object_dir.join(&name);
+                            match sha256_file(&path) {
+                                Ok((hash, len)) => {
+                                    unreferenced.push(json!({
+                                        "object_id": name,
+                                        "content_sha256": hash,
+                                        "hash_alg": "sha256",
+                                        "byte_length": len,
+                                        "object_relpath": format!("objects/{name}")
+                                    }));
+                                }
+                                Err(err) => {
+                                    alerts.push(json!({
+                                        "code": "orphan_unreadable",
+                                        "name": name,
+                                        "during": "hash_orphan",
+                                        "os_error": err.to_string(),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -72,38 +110,50 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
             &source.content_sha256,
             source.byte_length,
         );
-        if let Some(message) = &facts.io_error {
-            return Err(
-                Fail::new(crate::model::EXIT_NOT_PRESERVED, "NotPreserved", "io_error")
-                    .extra("injected", json!(false))
-                    .extra("during", json!("hash_object"))
-                    .extra("os_error", json!(message))
-                    .extra("preservation", json!(NOT_PRESERVED))
-                    .extra("new_effect", json!(false)),
-            );
-        }
         let relpath = facts.canonical_relpath.clone().unwrap_or_default();
-        let mut intact = false;
-        if facts.id_rejected {
-            alerts.push(json!({"code": "object_id_rejected", "source_id": source.source_id, "object_id": source.object_id}));
-            dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "object_id_rejected"}));
-        } else if facts.relpath_differs {
-            alerts.push(json!({"code": "object_path_rejected", "source_id": source.source_id, "object_id": source.object_id}));
-        }
-        if !facts.id_rejected && facts.missing {
-            alerts.push(json!({"code": "object_missing", "source_id": source.source_id, "object_id": source.object_id}));
-            dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "object_missing"}));
-        } else if !facts.id_rejected && (!facts.hash_matches || !facts.length_matches) {
+        // preservation stays the stored verdict only when this call hashed the
+        // file. A read error leaves both fields null: the row is still the
+        // historical commit, and this open did not prove the bytes.
+        let preservation;
+        let intact;
+        if let Some(message) = &facts.io_error {
+            if facts.relpath_differs {
+                alerts.push(json!({"code": "object_path_rejected", "source_id": source.source_id, "object_id": source.object_id}));
+            }
             alerts.push(json!({
-                "code": "hash_mismatch",
+                "code": "object_unreadable",
                 "source_id": source.source_id,
                 "object_id": source.object_id,
-                "expected_sha256": source.content_sha256,
-                "actual_sha256": facts.actual_hash
+                "during": "hash_object",
+                "os_error": message,
             }));
-            dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "hash_mismatch"}));
-        } else if !facts.id_rejected {
-            intact = true;
+            preservation = Value::Null;
+            intact = Value::Null;
+        } else {
+            let mut intact_bool = false;
+            if facts.id_rejected {
+                alerts.push(json!({"code": "object_id_rejected", "source_id": source.source_id, "object_id": source.object_id}));
+                dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "object_id_rejected"}));
+            } else if facts.relpath_differs {
+                alerts.push(json!({"code": "object_path_rejected", "source_id": source.source_id, "object_id": source.object_id}));
+            }
+            if !facts.id_rejected && facts.missing {
+                alerts.push(json!({"code": "object_missing", "source_id": source.source_id, "object_id": source.object_id}));
+                dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "object_missing"}));
+            } else if !facts.id_rejected && (!facts.hash_matches || !facts.length_matches) {
+                alerts.push(json!({
+                    "code": "hash_mismatch",
+                    "source_id": source.source_id,
+                    "object_id": source.object_id,
+                    "expected_sha256": source.content_sha256,
+                    "actual_sha256": facts.actual_hash
+                }));
+                dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "hash_mismatch"}));
+            } else if !facts.id_rejected {
+                intact_bool = true;
+            }
+            preservation = json!(PRESERVED);
+            intact = json!(intact_bool);
         }
         source_json.push(json!({
             "source_id": source.source_id,
@@ -113,7 +163,7 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
             "byte_length": source.byte_length,
             "media_type": source.media_type,
             "user_marker": source.user_marker,
-            "preservation": PRESERVED,
+            "preservation": preservation,
             "arrangement": NOT_ARRANGED,
             "searchability": NOT_SEARCHABLE,
             "purchase_id": null,
@@ -194,7 +244,16 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
     body.insert("incomplete_commands".into(), Value::Array(incomplete));
     body.insert("unreferenced_objects".into(), Value::Array(unreferenced));
     body.insert("dangling_references".into(), Value::Array(dangling));
+    let read_unknown = alerts.iter().any(|alert| {
+        matches!(
+            alert.get("code").and_then(|value| value.as_str()),
+            Some("object_unreadable" | "objects_unlisted" | "orphan_unreadable")
+        )
+    });
     body.insert("alerts".into(), Value::Array(alerts));
+    if read_unknown {
+        body.insert("new_effect".into(), json!(false));
+    }
     body.insert(
         "temporary_file_count".into(),
         json!(journal::count_staging(root)),

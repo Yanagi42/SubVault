@@ -1,3 +1,5 @@
+use std::fs;
+use std::io;
 use std::path::Path;
 
 use crate::fsutil::sha256_file;
@@ -39,18 +41,49 @@ pub(crate) fn object_facts(
     };
     let relpath_differs = stored_relpath.is_some_and(|stored| stored != relpath);
     let path = root.join(&relpath);
-    if !path.is_file() {
-        return ObjectFacts {
-            canonical_relpath: Some(relpath),
-            id_rejected: false,
-            relpath_differs,
-            missing: true,
-            hash_matches: false,
-            length_matches: false,
-            actual_hash: None,
-            actual_len: None,
-            io_error: None,
-        };
+    // is_file() hides EACCES behind false. A parent directory we cannot search
+    // is not the same fact as a file that is not there.
+    match fs::metadata(&path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return ObjectFacts {
+                canonical_relpath: Some(relpath),
+                id_rejected: false,
+                relpath_differs,
+                missing: true,
+                hash_matches: false,
+                length_matches: false,
+                actual_hash: None,
+                actual_len: None,
+                io_error: None,
+            };
+        }
+        Err(err) => {
+            return ObjectFacts {
+                canonical_relpath: Some(relpath),
+                id_rejected: false,
+                relpath_differs,
+                missing: false,
+                hash_matches: false,
+                length_matches: false,
+                actual_hash: None,
+                actual_len: None,
+                io_error: Some(err.to_string()),
+            };
+        }
+        Ok(meta) if !meta.is_file() => {
+            return ObjectFacts {
+                canonical_relpath: Some(relpath),
+                id_rejected: false,
+                relpath_differs,
+                missing: true,
+                hash_matches: false,
+                length_matches: false,
+                actual_hash: None,
+                actual_len: None,
+                io_error: None,
+            };
+        }
+        Ok(_) => {}
     }
     match sha256_file(&path) {
         Ok((hash, len)) => ObjectFacts {

@@ -3411,6 +3411,521 @@ fn unreadable_vault_db_does_not_invent_a_preservation_verdict() {
     assert_eq!(fs::read(&object).unwrap(), bytes);
 }
 
+fn has_alert(status: &Value, code: &str) -> bool {
+    status["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|alert| alert["code"] == code)
+}
+
+fn assert_unknown_hosted(source: &Value) {
+    assert!(source["preservation"].is_null(), "{source}");
+    assert!(source["object_intact"].is_null(), "{source}");
+    assert_eq!(source["arrangement"], "not_arranged", "{source}");
+    assert_eq!(source["searchability"], "not_searchable", "{source}");
+    assert!(source["purchase_id"].is_null(), "{source}");
+    assert!(source["entitlement_id"].is_null(), "{source}");
+    assert!(!source["content_sha256"].as_str().unwrap().is_empty());
+    assert!(!source["source_id"].as_str().unwrap().is_empty());
+    assert!(!source["object_id"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn one_unreadable_hosted_object_does_not_swallow_the_other() {
+    let tmp = Tmp::new("one-object");
+    vault_init(&tmp);
+    let pdf = import(
+        &tmp,
+        "old",
+        "application/pdf",
+        &corpus().join("originals/v-2026-09-receipt.pdf"),
+    );
+    mark_old(&tmp, pdf["source_id"].as_str().unwrap());
+    let csv = import(
+        &tmp,
+        "csv",
+        "text/csv",
+        &corpus().join("originals/store-export-work.csv"),
+    );
+    let pdf_path = vault(&tmp)
+        .join("objects")
+        .join(pdf["object_id"].as_str().unwrap());
+    let csv_path = vault(&tmp)
+        .join("objects")
+        .join(csv["object_id"].as_str().unwrap());
+    let pdf_bytes = fs::read(&pdf_path).unwrap();
+    let csv_bytes = fs::read(&csv_path).unwrap();
+    let pdf_source = corpus().join("originals/v-2026-09-receipt.pdf");
+    let csv_source = corpus().join("originals/store-export-work.csv");
+    let cases = [
+        (
+            "csv-unreadable",
+            csv_path.clone(),
+            fs::metadata(&csv_path).unwrap().mode(),
+            "csv",
+            "text/csv",
+            "old",
+            "application/pdf",
+        ),
+        (
+            "pdf-unreadable",
+            pdf_path.clone(),
+            fs::metadata(&pdf_path).unwrap().mode(),
+            "old",
+            "application/pdf",
+            "csv",
+            "text/csv",
+        ),
+    ];
+    for (label, path, mode, bad_cmd, bad_media, good_cmd, good_media) in cases {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+        let _restore = RestoreMode {
+            path: path.clone(),
+            mode,
+        };
+        let expected_len = if bad_cmd == "old" {
+            pdf_bytes.len()
+        } else {
+            csv_bytes.len()
+        };
+        assert_eq!(fs::metadata(&path).unwrap().len() as usize, expected_len);
+        let open = run(
+            &format!("{label}-open"),
+            &["open", "--vault", vault(&tmp).to_str().unwrap()],
+        );
+        let verify = run(
+            &format!("{label}-verify"),
+            &["verify", "--vault", vault(&tmp).to_str().unwrap()],
+        );
+        let recover = run(
+            &format!("{label}-recover"),
+            &["recover", "--vault", vault(&tmp).to_str().unwrap()],
+        );
+        assert_eq!(open.code, Some(3), "{}", open.stdout);
+        assert_eq!(verify.stdout, open.stdout);
+        assert_eq!(recover.stdout, open.stdout);
+        let again = run(
+            &format!("{label}-open-again"),
+            &["open", "--vault", vault(&tmp).to_str().unwrap()],
+        );
+        assert_eq!(again.stdout, open.stdout);
+        let body = parse(&open);
+        assert_eq!(body["outcome"], "IntegrityAlert");
+        assert_eq!(body["new_effect"], false);
+        assert!(body.get("preservation").is_none(), "{body}");
+        assert!(body["dangling_references"].as_array().unwrap().is_empty());
+        assert_eq!(body["sources"].as_array().unwrap().len(), 2);
+        assert_hosted(&body, good_cmd, good_media, "");
+        let bad = command_source(&body, bad_cmd);
+        assert_unknown_hosted(bad);
+        assert_eq!(bad["media_type"], bad_media);
+        if bad_cmd == "old" {
+            assert_eq!(bad["user_marker"], "human-edit-v1");
+        } else {
+            assert_eq!(command_source(&body, "old")["user_marker"], "human-edit-v1");
+        }
+        let unread = body["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|alert| alert["code"] == "object_unreadable")
+            .unwrap();
+        assert_eq!(unread["source_id"], bad["source_id"]);
+        assert_eq!(unread["object_id"], bad["object_id"]);
+        assert_eq!(unread["during"], "hash_object");
+        assert_denied(unread["os_error"].as_str().unwrap());
+        assert_eq!(
+            body["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["outcome"] == "Committed")
+                .count(),
+            3
+        );
+        let good_out = tmp.path().join(format!("{label}-good"));
+        let read_good = run(
+            &format!("{label}-read-good"),
+            &[
+                "read",
+                "--vault",
+                vault(&tmp).to_str().unwrap(),
+                "--source-id",
+                command_source(&body, good_cmd)["source_id"]
+                    .as_str()
+                    .unwrap(),
+                "--out",
+                good_out.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(read_good.code, Some(0), "{}", read_good.stdout);
+        let read_good_body = parse(&read_good);
+        assert_eq!(read_good_body["preservation"], "preserved");
+        assert_eq!(read_good_body["new_effect"], false);
+        let expected_good = if good_cmd == "old" {
+            pdf_bytes.as_slice()
+        } else {
+            csv_bytes.as_slice()
+        };
+        assert_eq!(fs::read(&good_out).unwrap(), expected_good);
+        let bad_out = tmp.path().join(format!("{label}-bad"));
+        let read_bad = run(
+            &format!("{label}-read-bad"),
+            &[
+                "read",
+                "--vault",
+                vault(&tmp).to_str().unwrap(),
+                "--source-id",
+                bad["source_id"].as_str().unwrap(),
+                "--out",
+                bad_out.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(read_bad.code, Some(12), "{}", read_bad.stdout);
+        let read_bad_body = parse(&read_bad);
+        assert_eq!(read_bad_body["reason"], "object_unreadable");
+        assert_eq!(read_bad_body["new_effect"], false);
+        assert!(
+            read_bad_body.get("preservation").is_none(),
+            "{read_bad_body}"
+        );
+        assert!(!bad_out.exists());
+        let replay_good = run(
+            &format!("{label}-replay-good"),
+            &[
+                "import",
+                "--vault",
+                vault(&tmp).to_str().unwrap(),
+                "--command-id",
+                good_cmd,
+                "--media-type",
+                good_media,
+                "--source",
+                if good_cmd == "old" {
+                    pdf_source.to_str().unwrap()
+                } else {
+                    csv_source.to_str().unwrap()
+                },
+            ],
+        );
+        assert_eq!(replay_good.code, Some(0), "{}", replay_good.stdout);
+        let replay_good_body = parse(&replay_good);
+        assert_eq!(replay_good_body["outcome"], "AlreadyCommitted");
+        assert_eq!(replay_good_body["preservation"], "preserved");
+        assert_eq!(replay_good_body["new_effect"], false);
+        let replay_bad = run(
+            &format!("{label}-replay-bad"),
+            &[
+                "import",
+                "--vault",
+                vault(&tmp).to_str().unwrap(),
+                "--command-id",
+                bad_cmd,
+                "--media-type",
+                bad_media,
+                "--source",
+                if bad_cmd == "old" {
+                    pdf_source.to_str().unwrap()
+                } else {
+                    csv_source.to_str().unwrap()
+                },
+            ],
+        );
+        assert_eq!(replay_bad.code, Some(12), "{}", replay_bad.stdout);
+        let replay_bad_body = parse(&replay_bad);
+        assert_eq!(replay_bad_body["reason"], "object_unreadable");
+        assert_eq!(replay_bad_body["new_effect"], false);
+        assert!(
+            replay_bad_body.get("preservation").is_none(),
+            "{replay_bad_body}"
+        );
+        let cancel = run(
+            &format!("{label}-cancel-good"),
+            &[
+                "cancel",
+                "--vault",
+                vault(&tmp).to_str().unwrap(),
+                "--command-id",
+                good_cmd,
+                "--generation",
+                "1",
+            ],
+        );
+        assert_eq!(cancel.code, Some(0), "{}", cancel.stdout);
+        let cancel_body = parse(&cancel);
+        assert_eq!(cancel_body["outcome"], "AlreadyCommitted");
+        assert_eq!(cancel_body["cancel_applied"], false);
+        assert!(!vault(&tmp).join("control").join(good_cmd).exists());
+        assert_eq!(
+            fs::metadata(&path).unwrap().len() as usize,
+            if bad_cmd == "old" {
+                pdf_bytes.len()
+            } else {
+                csv_bytes.len()
+            }
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let (code, ready) = open_vault(&tmp);
+    assert_eq!(code, 0, "{ready}");
+    assert_eq!(ready["outcome"], "Ready");
+    assert_hosted(&ready, "old", "application/pdf", "human-edit-v1");
+    assert_hosted(&ready, "csv", "text/csv", "");
+    assert_eq!(fs::read(&pdf_path).unwrap(), pdf_bytes);
+    assert_eq!(fs::read(&csv_path).unwrap(), csv_bytes);
+}
+
+#[test]
+fn object_directory_and_orphan_read_failures_keep_committed_sources() {
+    let tmp = Tmp::new("object-dir");
+    vault_init(&tmp);
+    let pdf = import(
+        &tmp,
+        "old",
+        "application/pdf",
+        &corpus().join("originals/v-2026-09-receipt.pdf"),
+    );
+    mark_old(&tmp, pdf["source_id"].as_str().unwrap());
+    let csv = import(
+        &tmp,
+        "csv",
+        "text/csv",
+        &corpus().join("originals/store-export-work.csv"),
+    );
+    let pdf_path = vault(&tmp)
+        .join("objects")
+        .join(pdf["object_id"].as_str().unwrap());
+    let csv_path = vault(&tmp)
+        .join("objects")
+        .join(csv["object_id"].as_str().unwrap());
+    let pdf_bytes = fs::read(&pdf_path).unwrap();
+    let csv_bytes = fs::read(&csv_path).unwrap();
+    let orphan = vault(&tmp)
+        .join("objects")
+        .join("obj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    fs::write(&orphan, b"orphan-bytes").unwrap();
+    let orphan_mode = fs::metadata(&orphan).unwrap().mode();
+    fs::set_permissions(&orphan, fs::Permissions::from_mode(0o0)).unwrap();
+    let _restore_orphan = RestoreMode {
+        path: orphan.clone(),
+        mode: orphan_mode,
+    };
+    let (orphan_code, orphan_status) = open_vault(&tmp);
+    assert_eq!(orphan_code, 3, "{orphan_status}");
+    assert_eq!(orphan_status["outcome"], "IntegrityAlert");
+    assert_eq!(orphan_status["new_effect"], false);
+    assert!(orphan_status.get("preservation").is_none());
+    assert_hosted(&orphan_status, "old", "application/pdf", "human-edit-v1");
+    assert_hosted(&orphan_status, "csv", "text/csv", "");
+    let orphan_alert = orphan_status["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|alert| alert["code"] == "orphan_unreadable")
+        .unwrap();
+    assert_eq!(orphan_alert["name"], "obj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    assert_eq!(orphan_alert["during"], "hash_orphan");
+    assert_denied(orphan_alert["os_error"].as_str().unwrap());
+    assert!(orphan_status["unreferenced_objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["object_id"] != "obj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert_eq!(fs::read(&pdf_path).unwrap(), pdf_bytes);
+    assert_eq!(fs::read(&csv_path).unwrap(), csv_bytes);
+    fs::set_permissions(&orphan, fs::Permissions::from_mode(orphan_mode)).unwrap();
+    fs::remove_file(&orphan).unwrap();
+
+    let object_dir = vault(&tmp).join("objects");
+    let dir_mode = fs::metadata(&object_dir).unwrap().mode();
+    fs::set_permissions(&object_dir, fs::Permissions::from_mode(0o0)).unwrap();
+    let _restore_dir = RestoreMode {
+        path: object_dir.clone(),
+        mode: dir_mode,
+    };
+    let open = run(
+        "objects-dir-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    let verify = run(
+        "objects-dir-verify",
+        &["verify", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    let recover = run(
+        "objects-dir-recover",
+        &["recover", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(open.code, Some(3), "{}", open.stdout);
+    assert_eq!(verify.stdout, open.stdout);
+    assert_eq!(recover.stdout, open.stdout);
+    let body = parse(&open);
+    assert_eq!(body["outcome"], "IntegrityAlert");
+    assert_eq!(body["new_effect"], false);
+    assert!(body.get("preservation").is_none(), "{body}");
+    assert_eq!(body["sources"].as_array().unwrap().len(), 2);
+    assert_unknown_hosted(command_source(&body, "old"));
+    assert_unknown_hosted(command_source(&body, "csv"));
+    assert_eq!(command_source(&body, "old")["user_marker"], "human-edit-v1");
+    assert_eq!(
+        command_source(&body, "old")["content_sha256"],
+        pdf["content_sha256"]
+    );
+    assert_eq!(
+        command_source(&body, "csv")["content_sha256"],
+        csv["content_sha256"]
+    );
+    let listed = body["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|alert| alert["code"] == "objects_unlisted")
+        .unwrap();
+    assert_eq!(listed["during"], "read_objects");
+    assert_denied(listed["os_error"].as_str().unwrap());
+    assert!(body["unreferenced_objects"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["command_id"] == "old" || row["command_id"] == "csv")
+            .filter(|row| row["outcome"] == "Committed")
+            .count(),
+        2
+    );
+    let blocked = tmp.path().join("dir-blocked");
+    let read_blocked = run(
+        "objects-dir-read",
+        &[
+            "read",
+            "--vault",
+            vault(&tmp).to_str().unwrap(),
+            "--source-id",
+            pdf["source_id"].as_str().unwrap(),
+            "--out",
+            blocked.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(read_blocked.code, Some(12), "{}", read_blocked.stdout);
+    let read_blocked_body = parse(&read_blocked);
+    assert_eq!(read_blocked_body["reason"], "object_unreadable");
+    assert!(
+        read_blocked_body.get("preservation").is_none(),
+        "{read_blocked_body}"
+    );
+    assert!(!blocked.exists());
+    fs::set_permissions(&object_dir, fs::Permissions::from_mode(dir_mode)).unwrap();
+    let (code, ready) = open_vault(&tmp);
+    assert_eq!(code, 0, "{ready}");
+    assert_eq!(ready["outcome"], "Ready");
+    assert_hosted(&ready, "old", "application/pdf", "human-edit-v1");
+    assert_hosted(&ready, "csv", "text/csv", "");
+    assert_eq!(fs::read(&pdf_path).unwrap(), pdf_bytes);
+    assert_eq!(fs::read(&csv_path).unwrap(), csv_bytes);
+}
+
+#[test]
+fn journal_label_miss_survives_one_unreadable_object() {
+    let tmp = Tmp::new("label-object");
+    vault_init(&tmp);
+    let old = import(
+        &tmp,
+        "old",
+        "application/pdf",
+        &corpus().join("originals/v-2026-09-receipt.pdf"),
+    );
+    mark_old(&tmp, old["source_id"].as_str().unwrap());
+    let old_path = vault(&tmp)
+        .join("objects")
+        .join(old["object_id"].as_str().unwrap());
+    let old_bytes = fs::read(&old_path).unwrap();
+    let checkpoint = tmp.path().join("stop.json");
+    let mut child = spawn(&[
+        "import",
+        "--vault",
+        vault(&tmp).to_str().unwrap(),
+        "--command-id",
+        "later",
+        "--media-type",
+        "text/csv",
+        "--source",
+        corpus()
+            .join("originals/store-export-work.csv")
+            .to_str()
+            .unwrap(),
+        "--stop-at",
+        "after_db_commit",
+        "--checkpoint",
+        checkpoint.to_str().unwrap(),
+    ]);
+    let witness = wait_checkpoint(&mut child, &checkpoint);
+    assert_eq!(witness["point"], "after_db_commit");
+    let journal_dir = vault(&tmp).join("journal");
+    let journal_mode = fs::metadata(&journal_dir).unwrap().mode();
+    let before = fs::read(journal_dir.join("later.json")).unwrap();
+    fs::set_permissions(&journal_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore_journal = RestoreMode {
+        path: journal_dir.clone(),
+        mode: journal_mode,
+    };
+    let finished = continue_child(child, "later-label-miss");
+    assert_eq!(finished.code, Some(0), "{}", finished.stdout);
+    let receipt = parse(&finished);
+    assert_eq!(receipt["outcome"], "Committed");
+    assert_eq!(receipt["preservation"], "preserved");
+    assert_eq!(receipt["new_effect"], true);
+    assert_eq!(receipt["post_commit_io"], true);
+    assert_eq!(receipt["during"], "journal_write");
+    assert_denied(receipt["os_error"].as_str().unwrap());
+    let later_path = vault(&tmp)
+        .join("objects")
+        .join(receipt["object_id"].as_str().unwrap());
+    let later_bytes = fs::read(&later_path).unwrap();
+    let later_mode = fs::metadata(&later_path).unwrap().mode();
+    fs::set_permissions(&later_path, fs::Permissions::from_mode(0o0)).unwrap();
+    let _restore_object = RestoreMode {
+        path: later_path.clone(),
+        mode: later_mode,
+    };
+    let open = run(
+        "label-object-open",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(open.code, Some(3), "{}", open.stdout);
+    let again = run(
+        "label-object-open-again",
+        &["open", "--vault", vault(&tmp).to_str().unwrap()],
+    );
+    assert_eq!(again.stdout, open.stdout);
+    let body = parse(&open);
+    assert_eq!(body["outcome"], "IntegrityAlert");
+    assert_eq!(body["journal_label_update"], "failed");
+    assert_eq!(body["new_effect"], false);
+    assert!(has_alert(&body, "journal_label_not_updated"));
+    assert!(has_alert(&body, "object_unreadable"));
+    assert_hosted(&body, "old", "application/pdf", "human-edit-v1");
+    assert_unknown_hosted(command_source(&body, "later"));
+    assert_eq!(
+        command_source(&body, "later")["content_sha256"],
+        receipt["content_sha256"]
+    );
+    assert_eq!(fs::read(journal_dir.join("later.json")).unwrap(), before);
+    assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
+    fs::set_permissions(&later_path, fs::Permissions::from_mode(later_mode)).unwrap();
+    fs::set_permissions(&journal_dir, fs::Permissions::from_mode(journal_mode)).unwrap();
+    let (code, ready) = open_vault(&tmp);
+    assert_eq!(code, 0, "{ready}");
+    assert_eq!(ready["outcome"], "Ready");
+    assert_hosted(&ready, "old", "application/pdf", "human-edit-v1");
+    assert_hosted(&ready, "later", "text/csv", "");
+    assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
+    assert_eq!(fs::read(&later_path).unwrap(), later_bytes);
+    let journal: Value =
+        serde_json::from_slice(&fs::read(journal_dir.join("later.json")).unwrap()).unwrap();
+    assert_eq!(journal["state"], "committed");
+}
+
 fn journal_snapshot(dir: &Path) -> std::collections::BTreeMap<String, String> {
     let mut files = std::collections::BTreeMap::new();
     for entry in fs::read_dir(dir).unwrap() {
