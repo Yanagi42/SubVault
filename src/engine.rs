@@ -447,10 +447,15 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             },
         ));
     }
-    // The directory is already renamed. This error stays on that published path;
-    // it is not the pre-publish receipt and is not reclassified here.
-    hooks.stop("after_publish", init_point(true, format))?;
-    Ok(init_ready(&vault_id, format, magic))
+    // Rename and the parent fsync call have both returned Ok. A checkpoint
+    // write error here stays on the published directory: exit 3, Initialized,
+    // and not note_uncommitted. directory_durable=false means the final
+    // directory's durability is unconfirmed. It does not rewrite the Ok from
+    // that fsync. The rename fd and the later path-reopened fd are untouched.
+    match hooks.stop("after_publish", init_point(true, format)) {
+        Ok(()) => Ok(init_ready(&vault_id, format, magic)),
+        Err(fail) => Ok(report_after_publish(fail, &vault_id, format, magic, path)),
+    }
 }
 
 fn publish_init_dir(scratch: &Path, path: &Path) -> Result<(), Fail> {
@@ -567,6 +572,46 @@ fn init_durability_alert(
     if let Some(message) = os_error {
         body.insert("os_error".into(), json!(message));
     }
+    Report {
+        code: EXIT_INTEGRITY,
+        body: Value::Object(body),
+    }
+}
+
+/// Published-directory receipt for a stop that failed after rename.
+///
+/// Extra fields from the failure are copied first. The published facts are
+/// written after that, so a failure's `new_effect=false` cannot cover them.
+/// `directory_durable=false` is this receipt's statement that final directory
+/// durability is unconfirmed. `parent_fsync_returned_ok` records the earlier
+/// parent sync call's `Ok`. Neither field existed on the old receipt, and
+/// neither one identifies the rename fd with the path-reopened fd.
+/// `output` repeats the requested path. It is not a fresh identity check.
+fn report_after_publish(
+    fail: Fail,
+    vault_id: &str,
+    format: u8,
+    magic: i64,
+    output: &Path,
+) -> Report {
+    let mut body = init_body(vault_id, format, magic);
+    for (key, value) in fail.extra {
+        if matches!(
+            key.as_str(),
+            "preservation" | "staging_cleanup" | "staging_cleanup_reason" | "staging_path"
+        ) {
+            continue;
+        }
+        body.insert(key, value);
+    }
+    body.insert("outcome".into(), json!("Initialized"));
+    body.insert("reason".into(), json!(fail.reason));
+    body.insert("published".into(), json!(true));
+    body.insert("created_new_vault".into(), json!(true));
+    body.insert("new_effect".into(), json!(true));
+    body.insert("directory_durable".into(), json!(false));
+    body.insert("parent_fsync_returned_ok".into(), json!(true));
+    body.insert("output".into(), json!(output.display().to_string()));
     Report {
         code: EXIT_INTEGRITY,
         body: Value::Object(body),
