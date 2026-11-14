@@ -99,7 +99,7 @@ journal 是一份字段表生成的 JSON。未知键被忽略。可选字段缺�
 
 这轮只在这台 Linux 云端虚拟机上验证。文件系统是 ext4（`findmnt` 的类型是 ext4，magic 是 `0xef53`；`stat -f` 的类型名可能显示成 ext2/ext3，以 magic 为准）。
 
-写锁是 Linux 上的 `flock`。编译门是 `target_os = "linux"`。不是 Linux 的目标，包括 Android 和其它 Unix，停在 `compile_error`，不进入这份实现，也没有另一套后端。一次命令持锁到返回，不是应用单实例。导出写包仍在锁外。没有测过 Windows 原生锁，也没有测过 Windows 的真实路径、大小写折叠和 junction。没有测过断电和坏盘。NFS magic `0x6969` 与 SMB/CIFS magic `0xFF534D42`、`0xFE534D42` 会拒绝，但本轮没有挂载这些文件系统。同步盘没有探测，也不支持。回执里的 `platform_limits` 使用这些原句，不能读成跨平台或同步盘已经通过。
+写锁是 Linux 上的 `flock`。一次命令持锁到返回，不是应用单实例。导出只在读取已提交内容时持锁，写包仍在锁外。编译门是 `target_os = "linux"`。不是 Linux 的目标，包括 Android 和其它 Unix，停在 `compile_error`，正式库操作不进入这份实现，也不把未接入的锁说成 Ready。`src/windows_lock.rs` 只在 `cfg(windows)` 编译：`CreateFileW` 的 `bInheritHandle` 为 FALSE，且不带 `FILE_FLAG_OVERLAPPED`；`LockFileEx` 对偏移 0、长度 1 做非阻塞独占。`VaultLock` 不调用它。`ERROR_LOCK_VIOLATION`（33）才是 Busy；`ERROR_SHARING_VIOLATION`（32）和 `ERROR_IO_PENDING`（997）仍是 Failure。`Drop` 先 `UnlockFileEx` 再 `CloseHandle`，两个返回值都不当成解锁成功。`LockFileEx` 说明进程退出或关闭仍持锁的句柄后，系统解开区域锁的时间取决于可用资源，所以不承诺立刻再次取得。这次没有做 Windows 编译、两个进程真实占用、进程终止后释放、句柄不继承。Linux 上的分类测试只核对返回值和错误码表，没有执行 `LockFileEx`。没有测过 Windows 的真实路径、大小写折叠和 junction。没有测过断电和坏盘。NFS magic `0x6969` 与 SMB/CIFS magic `0xFF534D42`、`0xFE534D42` 会拒绝，但本轮没有挂载这些文件系统。同步盘没有探测，也不支持。回执里的 `platform_limits` 使用这些原句，不能读成跨平台或同步盘已经通过。
 
 ## 复现
 

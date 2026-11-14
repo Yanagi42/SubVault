@@ -5,7 +5,8 @@
 //! inode. Exclusive create and directory fsync still return their errors.
 //! Nothing here chooses a Windows lock, a file id, a cross-volume rename, or
 //! a UI session. The compile gate is `target_os = "linux"`. Android and other
-//! Unix targets stop here, before these calls. There is no second backend.
+//! Unix targets stop here, before these calls. `windows_lock` is a separate
+//! `cfg(windows)` lock and is not called from this module.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!(
@@ -20,19 +21,24 @@ mod linux {
     use std::os::unix::io::AsRawFd;
     use std::path::{Path, PathBuf};
 
-    /// `LOCK_EX|LOCK_NB`. `Ok(true)` is the lock. `Ok(false)` is a busy lock.
-    /// Any other errno is returned.
-    pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    /// `LOCK_EX|LOCK_NB`. Acquired, busy (`EWOULDBLOCK` or `EAGAIN`), and any
+    /// other errno stay three results. Success does not read `errno`.
+    pub fn try_lock_exclusive(file: &File) -> crate::lock_contract::LockAcquire {
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
-            return Ok(true);
+            return crate::lock_contract::LockAcquire::Acquired;
         }
         let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) || err.raw_os_error() == Some(libc::EAGAIN)
-        {
-            Ok(false)
-        } else {
-            Err(err)
+        match crate::lock_contract::classify_flock(
+            rc,
+            err.raw_os_error(),
+            &[libc::EWOULDBLOCK, libc::EAGAIN],
+        ) {
+            crate::lock_contract::LockClass::Busy => crate::lock_contract::LockAcquire::Busy,
+            crate::lock_contract::LockClass::Acquired
+            | crate::lock_contract::LockClass::Failure => {
+                crate::lock_contract::LockAcquire::Failure(err)
+            }
         }
     }
 
