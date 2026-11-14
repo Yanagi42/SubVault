@@ -61,7 +61,7 @@ const INIT_STOPS: &[&str] = &[
     "before_publish",
     "after_publish",
 ];
-const INIT_INJECTS: &[&str] = &["version_checkpoint", "version_verify"];
+const INIT_INJECTS: &[&str] = &["version_checkpoint", "version_verify", "publish_dir_fsync"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum InjectAction {
@@ -109,9 +109,12 @@ impl HookRun {
         Ok(())
     }
 
-    fn inject(&mut self, point: &str, details: Map<String, Value>) -> Result<(), Fail> {
+    /// Writes the witness when this point was requested. Does not decide the
+    /// outcome: callers before publish still report NotPreserved, and the
+    /// publish-directory fsync caller reports the directory as already renamed.
+    fn note_inject(&mut self, point: &str, details: Map<String, Value>) -> Result<bool, Fail> {
         if self.hooks.inject_point.as_deref() != Some(point) {
-            return Ok(());
+            return Ok(false);
         }
         let action = self
             .hooks
@@ -123,17 +126,22 @@ impl HookRun {
         let mut body = details;
         body.insert("reached".into(), Value::Bool(true));
         body.insert("point".into(), json!(point));
-        body.insert(
-            "action".into(),
-            json!(match action {
-                InjectAction::Enospc => "enospc",
-                InjectAction::IoError => "io_error",
-            }),
-        );
+        body.insert("action".into(), json!(action_name(action)));
         let bytes = serde_json::to_vec_pretty(&Value::Object(body))
             .map_err(|_| Fail::new(EXIT_USAGE, "Usage", "witness_encode"))?;
         atomic_write(&path, &bytes).map_err(|err| io_fail(err, "witness"))?;
         self.inject_reached = true;
+        Ok(true)
+    }
+
+    fn inject(&mut self, point: &str, details: Map<String, Value>) -> Result<(), Fail> {
+        if !self.note_inject(point, details)? {
+            return Ok(());
+        }
+        let action = self
+            .hooks
+            .inject_action
+            .ok_or_else(|| Fail::new(EXIT_USAGE, "Usage", "inject_action_required"))?;
         let reason = match action {
             InjectAction::Enospc => "injected_enospc",
             InjectAction::IoError => "injected_io_error",
@@ -142,18 +150,19 @@ impl HookRun {
             .keep_staging()
             .extra("injected", Value::Bool(true))
             .extra("inject_point", json!(point))
-            .extra(
-                "inject_action",
-                json!(match action {
-                    InjectAction::Enospc => "enospc",
-                    InjectAction::IoError => "io_error",
-                }),
-            )
+            .extra("inject_action", json!(action_name(action)))
             .extra(
                 "note",
                 json!("injected fault, not a full device and not a failed disk"),
             )
             .extra("preservation", json!(NOT_PRESERVED)))
+    }
+}
+
+fn action_name(action: InjectAction) -> &'static str {
+    match action {
+        InjectAction::Enospc => "enospc",
+        InjectAction::IoError => "io_error",
     }
 }
 
@@ -251,7 +260,8 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
         return Err(unsupported_fs(magic));
     }
     if format == 1 {
-        if hooks.stop_at.is_some() || hooks.inject_point.is_some() {
+        let point = hooks.inject_point.as_deref();
+        if hooks.stop_at.is_some() || matches!(point, Some(name) if name != "publish_dir_fsync") {
             return Err(
                 Fail::new(EXIT_USAGE, "Usage", "format_1_has_no_version_hook")
                     .extra("created_new_vault", json!(false)),
@@ -345,8 +355,46 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
         let _ = fs::remove_dir_all(&scratch);
         return Err(io_fail(err, "init_rename").extra("created_new_vault", json!(false)));
     }
-    let _ = fsutil::fsync_dir(parent);
+    let sync_error = fsutil::fsync_dir(parent).err().map(|err| err.to_string());
+    let injected = match hooks.note_inject("publish_dir_fsync", init_point(true, format)) {
+        Ok(value) => value,
+        Err(fail) => {
+            return Ok(init_durability_alert(
+                &vault_id,
+                format,
+                magic,
+                false,
+                Some(sync_error.unwrap_or(fail.reason)),
+                None,
+            ));
+        }
+    };
+    if injected || sync_error.is_some() {
+        return Ok(init_durability_alert(
+            &vault_id,
+            format,
+            magic,
+            injected,
+            sync_error,
+            if injected {
+                hooks.hooks.inject_action
+            } else {
+                None
+            },
+        ));
+    }
     hooks.stop("after_publish", init_point(true, format))?;
+    Ok(init_ready(&vault_id, format, magic))
+}
+
+fn init_ready(vault_id: &str, format: u8, magic: i64) -> Report {
+    Report {
+        code: EXIT_OK,
+        body: Value::Object(init_body(vault_id, format, magic)),
+    }
+}
+
+fn init_body(vault_id: &str, format: u8, magic: i64) -> Map<String, Value> {
     let mut body = honesty("Initialized");
     body.insert("vault_id".into(), json!(vault_id));
     body.insert("vault_format".into(), json!(format));
@@ -356,10 +404,40 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     body.insert("capabilities".into(), capabilities());
     body.insert("platform_limits".into(), platform_limits(Some(magic)));
     body.insert("new_effect".into(), json!(true));
-    Ok(Report {
-        code: EXIT_OK,
+    body
+}
+
+/// The rename has already published the directory. A parent-directory fsync
+/// failure does not unpublish it and is not NotPreserved.
+fn init_durability_alert(
+    vault_id: &str,
+    format: u8,
+    magic: i64,
+    injected: bool,
+    os_error: Option<String>,
+    action: Option<InjectAction>,
+) -> Report {
+    let mut body = init_body(vault_id, format, magic);
+    body.insert("published".into(), json!(true));
+    body.insert("directory_durable".into(), json!(false));
+    body.insert("reason".into(), json!("directory_durability_unknown"));
+    body.insert("during".into(), json!("publish_dir_fsync"));
+    body.insert("injected".into(), json!(injected));
+    if let Some(action) = action {
+        body.insert("inject_point".into(), json!("publish_dir_fsync"));
+        body.insert("inject_action".into(), json!(action_name(action)));
+        body.insert(
+            "note".into(),
+            json!("injected fault, not a full device and not a failed disk"),
+        );
+    }
+    if let Some(message) = os_error {
+        body.insert("os_error".into(), json!(message));
+    }
+    Report {
+        code: EXIT_INTEGRITY,
         body: Value::Object(body),
-    })
+    }
 }
 
 fn init_point(published: bool, format: u8) -> Map<String, Value> {
