@@ -115,7 +115,7 @@ scripts/run-t1-evidence.sh
 
 ## 正文片段
 
-`fragment` 只接受调用者给出的一个文件。它不读标准输入、邮箱或剪贴板。文件必须是 UTF-8。空文件、超过 65536 字节、单行超过 1024 字节、以及超过 64 条候选，都拒绝发布候选。超长文件在读入正文之前拒绝，回执里的 `bytes_read` 是 0。接受下来的原始字节原样放进 `objects/`，不改外部文件，也不做 Unicode 规范化。
+`fragment` 和 `candidates` 的回执，包括拒绝，`slice` 都是 `T2a-body`。这不改 T1 命令的 `slice`。`fragment` 只接受调用者给出的一个文件。它不读标准输入、邮箱或剪贴板。文件必须是 UTF-8。空文件、超过 65536 字节、单行超过 1024 字节、以及超过 64 条候选，都拒绝发布候选。超长文件在读入正文之前拒绝，回执里的 `bytes_read` 是 0。接受下来的原始字节原样放进 `objects/`，不改外部文件，也不做 Unicode 规范化。
 
 媒体类型固定为 `text/plain;charset=utf-8`，`role` 是 `user_provided_fragment`。这不是完整邮件，`eml` 是 null。定位是这段版本化字符串上的 Unicode 标量区间，外加对应的 UTF-8 字节区间。规范化名是 `identity-utf8-scalars-1`，拼接名是 `single-fragment-1`，规则名是 `stated-lines-1`，行尾名是 `lf-or-crlf-1`。这些和提取器 `subvault-body` 1 一起进入 logical key。LF 和紧挨在 LF 前的 CR 都是行尾，不进入摘录，也不改原件字节。行中间的 CR 不是行尾。
 

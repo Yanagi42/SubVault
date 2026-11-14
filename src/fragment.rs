@@ -45,22 +45,29 @@ pub struct FragmentRequest {
 
 pub fn submit_fragment(req: FragmentRequest) -> Report {
     match submit_inner(req) {
-        Ok(body) => Report {
+        Ok(body) => as_body_slice(Report {
             code: EXIT_OK,
             body,
-        },
-        Err(fail) => super::note_uncommitted(fail).into_report(),
+        }),
+        Err(fail) => as_body_slice(super::note_uncommitted(fail).into_report()),
     }
 }
 
 pub fn query_candidates(vault: &Path, source_id: Option<String>) -> Report {
     match query_inner(vault, source_id.as_deref()) {
-        Ok(body) => Report {
+        Ok(body) => as_body_slice(Report {
             code: body.0,
             body: body.1,
-        },
-        Err(fail) => super::note_uncommitted(fail).into_report(),
+        }),
+        Err(fail) => as_body_slice(super::note_uncommitted(fail).into_report()),
     }
+}
+
+fn as_body_slice(mut report: Report) -> Report {
+    if let Some(map) = report.body.as_object_mut() {
+        map.insert("slice".into(), json!("T2a-body"));
+    }
+    report
 }
 
 pub fn cancel_fragment(req: CancelRequest) -> Result<Report, Fail> {

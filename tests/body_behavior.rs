@@ -1234,6 +1234,62 @@ fn a_crlf_line_ending_is_not_part_of_the_sentence() {
     assert_eq!(object_bytes(&vault, &mixed_body), mixed_bytes);
 }
 
+#[test]
+fn fragment_rejections_use_the_body_slice() {
+    let tmp = Tmp::new("slice");
+    let vault = init(&tmp);
+    let empty = tmp.path().join("empty.txt");
+    write_file(&empty, b"");
+    let (code, body) = fragment(&vault, "empty", &empty);
+    assert_eq!(code, 16, "{body}");
+    assert_eq!(body["slice"], "T2a-body");
+    assert_eq!(body["reason"], "empty_fragment");
+
+    let big = tmp.path().join("big.txt");
+    write_file(&big, &vec![b'a'; 65537]);
+    let (code, body) = fragment(&vault, "big", &big);
+    assert_eq!(code, 16, "{body}");
+    assert_eq!(body["slice"], "T2a-body");
+    assert_eq!(body["reason"], "over_input_budget");
+    assert_eq!(body["bytes_read"], 0);
+
+    let bad = tmp.path().join("bad.bin");
+    write_file(&bad, &[0xff, 0xfe]);
+    let (code, body) = fragment(&vault, "bad", &bad);
+    assert_eq!(code, 16, "{body}");
+    assert_eq!(body["slice"], "T2a-body");
+    assert_eq!(body["reason"], "invalid_utf8");
+
+    let wide = tmp.path().join("wide.txt");
+    write_file(&wide, &vec![b'a'; 1025]);
+    let (code, body) = fragment(&vault, "wide", &wide);
+    assert_eq!(code, 16, "{body}");
+    assert_eq!(body["slice"], "T2a-body");
+    assert_eq!(body["reason"], "over_line");
+    assert_eq!(body["preservation"], "preserved");
+
+    let note = tmp.path().join("note.txt");
+    write_file(&note, b"Amount paid USD 4.00\n");
+    assert_eq!(fragment(&vault, "ok", &note).0, 0);
+    sql(&vault, "UPDATE meta SET value='9' WHERE key='body_schema';");
+    let again = tmp.path().join("again.txt");
+    write_file(&again, b"Amount paid USD 5.00\n");
+    let (code, body) = fragment(&vault, "again", &again);
+    assert_eq!(code, 16, "{body}");
+    assert_eq!(body["slice"], "T2a-body");
+    assert_eq!(body["reason"], "body_schema_unsupported");
+
+    sql(&vault, "UPDATE meta SET value='1' WHERE key='body_schema';");
+    sql(&vault, "DROP TABLE candidates;");
+    let (code, body) = run(&["candidates", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 12, "{body}");
+    assert_eq!(body["slice"], "T2a-body");
+    assert_eq!(body["reason"], "body_schema_mismatch");
+    let opened = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(opened.0, 0, "{}", opened.1);
+    assert_eq!(opened.1["slice"], "T1");
+}
+
 fn wait_stopped(child: &mut std::process::Child, checkpoint: &Path) {
     let start = Instant::now();
     loop {
