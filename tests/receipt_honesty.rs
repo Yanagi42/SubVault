@@ -105,8 +105,18 @@ fn dev_full() -> Stdio {
 
 #[test]
 fn stdout_write_failure_is_unknown_and_the_same_command_is_not_redone() {
+    let (help_ok, help_body) = run(&["help"]);
+    assert_eq!(help_ok, 0, "{help_body}");
+    let help_bytes = serde_json::to_string_pretty(&help_body).unwrap().len() + 1;
+    assert!(
+        help_bytes < 8192,
+        "help is the short receipt, {help_bytes} bytes"
+    );
     let (help_code, _, help_err) = run_fd(&["help"], dev_full());
-    assert_eq!(help_code, 21, "flush to /dev/full must not exit 0");
+    assert_eq!(
+        help_code, 21,
+        "short receipt flush to /dev/full must not exit 0"
+    );
     assert_ne!(help_code, 0);
     assert_ne!(help_code, 15);
     assert_ne!(help_code, 101);
@@ -208,6 +218,52 @@ fn stdout_write_failure_is_unknown_and_the_same_command_is_not_redone() {
         ),
         "13.00"
     );
+}
+
+#[test]
+fn a_long_receipt_fails_in_the_write_and_does_not_panic() {
+    let tmp = Tmp::new("wide");
+    let vault = tmp.path().join("vault");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "1"]);
+    assert_eq!(code, 0, "{body}");
+    for index in 0..12 {
+        let source = tmp.path().join(format!("f{index}.txt"));
+        fs::write(&source, format!("synthetic-{index}\n")).unwrap();
+        let (code, imported) = run(&[
+            "import",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            &format!("c{index}"),
+            "--media-type",
+            "text/plain",
+            "--source",
+            source.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{imported}");
+    }
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    let open_bytes = serde_json::to_string_pretty(&opened).unwrap().len() + 1;
+    assert!(
+        open_bytes > 8192,
+        "open receipt must cross the stdout buffer, {open_bytes} bytes"
+    );
+    let sources = sql(&vault, "SELECT count(*) FROM sources;");
+    assert_eq!(sources, "12");
+    let (failed, _, err) = run_fd(&["open", "--vault", vault.to_str().unwrap()], dev_full());
+    assert_eq!(
+        failed, 21,
+        "long receipt write to /dev/full must not exit 0"
+    );
+    assert_ne!(failed, 0);
+    assert_ne!(failed, 15);
+    assert_ne!(failed, 101);
+    assert_unknown_stderr(&err);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM sources;"), "12");
+    let (again, seen) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(again, 0, "{seen}");
+    assert_eq!(seen["outcome"], "Ready");
 }
 
 #[test]
