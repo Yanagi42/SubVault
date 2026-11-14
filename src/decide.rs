@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde_json::{json, Map, Value};
 
 use crate::body;
@@ -441,7 +441,16 @@ fn refuse_without_facts(version: i64) -> Result<(), Fail> {
 }
 
 const DECISION_STOPS: &[&str] = &["before_decision_commit"];
-const DECISION_INJECTS: &[&str] = &["receipt_read", "decision_tx", "db_commit"];
+const DECISION_INJECTS: &[&str] = &[
+    "receipt_read",
+    "decision_tx",
+    "db_commit",
+    "commit_error_visible",
+    "commit_error_absent",
+    "commit_error_unseen",
+    "commit_error_unreadable",
+];
+pub(super) const SIMULATED_COMMIT_ERROR: &str = "simulated commit() error";
 
 pub struct CorrectRequest {
     pub vault: PathBuf,
@@ -593,10 +602,16 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
             super::checkpoint_map(&req.command_id, 0, None, None, false, false),
         )
         .map_err(decision_inject)?;
-    tx.commit().map_err(|err| db_fail(err, "db_commit"))?;
-    journal.state = "committed".into();
-    journal.reason = None;
-    finish_decision(&session.root, &journal, result)
+    conclude_commit(
+        &session.root,
+        &session.root.join("vault.db"),
+        &mut journal,
+        &req.command_id,
+        &canonical,
+        result,
+        tx,
+        &hooks,
+    )
 }
 
 fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
@@ -725,10 +740,16 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
             super::checkpoint_map(&req.command_id, 0, None, None, false, false),
         )
         .map_err(decision_inject)?;
-    tx.commit().map_err(|err| db_fail(err, "db_commit"))?;
-    journal.state = "committed".into();
-    journal.reason = None;
-    finish_decision(&session.root, &journal, result)
+    conclude_commit(
+        &session.root,
+        &session.root.join("vault.db"),
+        &mut journal,
+        &req.command_id,
+        &canonical,
+        result,
+        tx,
+        &hooks,
+    )
 }
 
 fn correct_canonical(fact_id: &str, revision: &str, amount: &str, actor_id: &str) -> String {
@@ -820,7 +841,7 @@ fn injected_receipt_read(hooks: &super::HookRun) -> Result<(), Fail> {
     )
 }
 
-enum ReceiptRead {
+pub(super) enum ReceiptRead {
     Absent,
     Ready {
         canonical: String,
@@ -1173,6 +1194,296 @@ fn decision_body(
     body
 }
 
+enum CommitProbe {
+    None,
+    Visible,
+    Absent,
+    Unseen,
+    Unreadable,
+}
+
+/// `correct` and `undo`. Fragment publish settles the same T3 receipt and does not read `commands`.
+fn conclude_commit(
+    root: &Path,
+    db: &Path,
+    journal: &mut Journal,
+    command_id: &str,
+    canonical: &str,
+    result: Value,
+    tx: Transaction<'_>,
+    hooks: &super::HookRun,
+) -> Result<Value, Fail> {
+    match commit_probe(hooks)? {
+        CommitProbe::None => match tx.commit() {
+            Ok(()) => {
+                journal.state = "committed".into();
+                journal.reason = None;
+                finish_decision(root, journal, result)
+            }
+            Err(err) => settle_commit_error(
+                root,
+                db,
+                journal,
+                command_id,
+                canonical,
+                &err.to_string(),
+                false,
+            ),
+        },
+        CommitProbe::Absent => {
+            drop(tx);
+            settle_commit_error(
+                root,
+                db,
+                journal,
+                command_id,
+                canonical,
+                SIMULATED_COMMIT_ERROR,
+                true,
+            )
+        }
+        CommitProbe::Visible => match tx.commit() {
+            Ok(()) => settle_commit_error(
+                root,
+                db,
+                journal,
+                command_id,
+                canonical,
+                SIMULATED_COMMIT_ERROR,
+                true,
+            ),
+            Err(err) => settle_commit_error(
+                root,
+                db,
+                journal,
+                command_id,
+                canonical,
+                &err.to_string(),
+                false,
+            ),
+        },
+        CommitProbe::Unreadable => match tx.commit() {
+            Ok(()) => {
+                corrupt_receipt_result(db, command_id)?;
+                settle_commit_error(
+                    root,
+                    db,
+                    journal,
+                    command_id,
+                    canonical,
+                    SIMULATED_COMMIT_ERROR,
+                    true,
+                )
+            }
+            Err(err) => settle_commit_error(
+                root,
+                db,
+                journal,
+                command_id,
+                canonical,
+                &err.to_string(),
+                false,
+            ),
+        },
+        CommitProbe::Unseen => match tx.commit() {
+            Ok(()) => settle_commit_error(
+                root,
+                &root.join("not-a-vault.db"),
+                journal,
+                command_id,
+                canonical,
+                SIMULATED_COMMIT_ERROR,
+                true,
+            ),
+            Err(err) => settle_commit_error(
+                root,
+                db,
+                journal,
+                command_id,
+                canonical,
+                &err.to_string(),
+                false,
+            ),
+        },
+    }
+}
+
+fn commit_probe(hooks: &super::HookRun) -> Result<CommitProbe, Fail> {
+    let Some(point) = hooks.hooks.inject_point.as_deref() else {
+        return Ok(CommitProbe::None);
+    };
+    let probe = match point {
+        "commit_error_visible" => CommitProbe::Visible,
+        "commit_error_absent" => CommitProbe::Absent,
+        "commit_error_unseen" => CommitProbe::Unseen,
+        "commit_error_unreadable" => CommitProbe::Unreadable,
+        _ => return Ok(CommitProbe::None),
+    };
+    let path = hooks.hooks.witness.clone().ok_or_else(|| {
+        Fail::new(EXIT_USAGE, "Usage", "witness_required").extra("point", json!(point))
+    })?;
+    let action = match hooks.hooks.inject_action {
+        Some(super::InjectAction::Enospc) => "enospc",
+        Some(super::InjectAction::IoError) => "io_error",
+        None => "simulated_commit_error",
+    };
+    let body = json!({
+        "reached": true,
+        "point": point,
+        "action": action,
+        "note": "simulated commit() error, not a disk COMMIT fault"
+    });
+    let bytes =
+        serde_json::to_vec(&body).map_err(|_| Fail::new(EXIT_USAGE, "Usage", "witness_encode"))?;
+    atomic_write(&path, &bytes).map_err(|err| crate::model::io_fail(err, "witness"))?;
+    Ok(probe)
+}
+
+fn settle_commit_error(
+    root: &Path,
+    db: &Path,
+    journal: &mut Journal,
+    command_id: &str,
+    canonical: &str,
+    commit_error: &str,
+    injected: bool,
+) -> Result<Value, Fail> {
+    let read = match read_t3_receipt_wal(db, command_id) {
+        Ok(read) => read,
+        Err(_) => return Err(receipt_unseen(commit_error, injected)),
+    };
+    match read {
+        ReceiptRead::Absent => Err(receipt_absent(commit_error, injected)),
+        ReceiptRead::Unreadable => Err(receipt_unseen(commit_error, injected)),
+        ReceiptRead::Ready {
+            canonical: stored,
+            result_json,
+        } => {
+            let Some(mut value) =
+                accepted_stored_result(command_id, canonical, &stored, &result_json)
+            else {
+                return Err(receipt_unseen(commit_error, injected));
+            };
+            if let Some(map) = value.as_object_mut() {
+                map.insert("visible_despite_commit_error".into(), json!(true));
+                map.insert("commit_error".into(), json!(commit_error));
+                map.insert("injected".into(), json!(injected));
+                map.insert("note".into(), json!(visible_note(injected)));
+            }
+            journal.state = "committed".into();
+            journal.reason = None;
+            finish_decision(root, journal, value)
+        }
+    }
+}
+
+/// Independent mode=ro connection. It can see a committed WAL frame and reads `t3_receipts` only.
+pub(super) fn read_t3_receipt_wal(db: &Path, command_id: &str) -> Result<ReceiptRead, Fail> {
+    if !super::sqlite_header_ok(db).unwrap_or(false) {
+        return Err(Fail::new(
+            EXIT_RECOVERY,
+            "RecoveryRequired",
+            "t3_receipt_unseen",
+        ));
+    }
+    let uri = super::wal_visible_uri(db)
+        .map_err(|_| Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unseen"))?;
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|_| Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unseen"))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
+    read_receipt(&conn, command_id)
+}
+
+fn accepted_stored_result(
+    command_id: &str,
+    canonical: &str,
+    stored: &str,
+    result_json: &str,
+) -> Option<Value> {
+    if stored != canonical {
+        return None;
+    }
+    let Value::Object(map) = serde_json::from_str(result_json).ok()? else {
+        return None;
+    };
+    if map.get("outcome").and_then(Value::as_str) != Some("Committed") {
+        return None;
+    }
+    if map.get("command_id").and_then(Value::as_str) != Some(command_id) {
+        return None;
+    }
+    let decision = map.get("decision_id").and_then(Value::as_str)?;
+    if decision.is_empty() {
+        return None;
+    }
+    if map.get("revision").and_then(Value::as_i64)? < 1 {
+        return None;
+    }
+    Some(Value::Object(map))
+}
+
+pub(super) fn corrupt_receipt_result(db: &Path, command_id: &str) -> Result<(), Fail> {
+    let conn = Connection::open(db).map_err(|_| receipt_unseen(SIMULATED_COMMIT_ERROR, true))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+    let changed = conn
+        .execute(
+            "UPDATE t3_receipts SET result_json = '{' WHERE command_id = ?1",
+            [command_id],
+        )
+        .map_err(|_| receipt_unseen(SIMULATED_COMMIT_ERROR, true))?;
+    if changed != 1 {
+        return Err(receipt_unseen(SIMULATED_COMMIT_ERROR, true));
+    }
+    Ok(())
+}
+
+fn receipt_absent(commit_error: &str, injected: bool) -> Fail {
+    Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "db_error")
+        .extra("injected", json!(injected))
+        .extra("during", json!("db_commit"))
+        .extra("os_error", json!(commit_error))
+        .extra("new_effect", json!(false))
+        .extra("decision_committed", json!(false))
+        .extra("facts_changed", json!(false))
+        .extra(
+            "note",
+            json!(if injected {
+                "simulated commit() error; independent read found no t3 receipt. Not a disk COMMIT fault."
+            } else {
+                "commit() returned an error; independent read found no t3 receipt."
+            }),
+        )
+}
+
+fn receipt_unseen(commit_error: &str, injected: bool) -> Fail {
+    Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unseen")
+        .extra("injected", json!(injected))
+        .extra("during", json!("t3_receipt"))
+        .extra("commit_error", json!(commit_error))
+        .extra("new_effect", Value::Null)
+        .extra("decision_committed", Value::Null)
+        .extra("facts_changed", Value::Null)
+        .extra(
+            "note",
+            json!(if injected {
+                "simulated commit() error; the independent t3 receipt read is unusable. Not a disk COMMIT fault. The journal stays started."
+            } else {
+                "commit() returned an error and the t3 receipt could not be read. The journal stays started."
+            }),
+        )
+}
+
+fn visible_note(injected: bool) -> &'static str {
+    if injected {
+        "simulated commit() error; the t3 receipt is visible, so the stored result stands. Not a disk COMMIT fault."
+    } else {
+        "commit() returned an error; the t3 receipt is visible, so the stored result stands."
+    }
+}
+
 fn finish_decision(root: &Path, journal: &Journal, mut result: Value) -> Result<Value, Fail> {
     match super::write_journal(root, journal) {
         Ok(()) => Ok(result),
@@ -1250,6 +1561,68 @@ pub(super) fn reconcile_decision_journals(
                 journal.reason = Some("uncommitted".into());
             }
         }
+        if let Err(fail) = super::write_journal(root, &journal) {
+            misses.push(LabelMiss {
+                command_id: journal.command_id,
+                during: fail
+                    .extra
+                    .get("during")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("journal_write")
+                    .to_string(),
+                os_error: fail
+                    .extra
+                    .get("os_error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(fail.reason.as_str())
+                    .to_string(),
+            });
+        }
+    }
+    Ok(misses)
+}
+
+/// Format 3 fragment journals follow the T3 receipt. A commands row is not that commit.
+pub(super) fn reconcile_fragment_journals(
+    root: &Path,
+    conn: &Connection,
+) -> Result<Vec<LabelMiss>, Fail> {
+    if !store::table_exists(conn, "t3_receipts").map_err(|err| unseen_db(err, "t3_receipt"))? {
+        return Ok(Vec::new());
+    }
+    let found = journal::scan(root);
+    if found.unlisted.is_some() {
+        return Ok(Vec::new());
+    }
+    for journal in &found.valid {
+        if journal.kind != "fragment" {
+            continue;
+        }
+        if matches!(
+            read_receipt(conn, &journal.command_id)?,
+            ReceiptRead::Unreadable
+        ) {
+            return Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unreadable")
+                    .extra("command_id", json!(journal.command_id))
+                    .extra("new_effect", json!(false)),
+            );
+        }
+    }
+    let mut misses = Vec::new();
+    for journal in found.valid {
+        if journal.kind != "fragment" || journal.state == "committed" {
+            continue;
+        }
+        if !matches!(
+            read_receipt(conn, &journal.command_id)?,
+            ReceiptRead::Ready { .. }
+        ) {
+            continue;
+        }
+        let mut journal = journal;
+        journal.state = "committed".into();
+        journal.reason = None;
         if let Err(fail) = super::write_journal(root, &journal) {
             misses.push(LabelMiss {
                 command_id: journal.command_id,

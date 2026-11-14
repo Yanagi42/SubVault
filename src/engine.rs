@@ -408,6 +408,7 @@ fn reopen_inner(path: &Path) -> Result<Report, Fail> {
     let notices = journal::clean_temps(&session.root);
     let reconciled = journal::reconcile(&session.root, &session.conn)?;
     let decision_misses = decide::reconcile_decision_journals(&session.root, &session.conn)?;
+    let fragment_misses = decide::reconcile_fragment_journals(&session.root, &session.conn)?;
     let mut inspection = crate::inspect::report(&session.root, &session.conn, session.magic)?;
     for notice in notices {
         attach_notice(
@@ -419,6 +420,7 @@ fn reopen_inner(path: &Path) -> Result<Report, Fail> {
     }
     let mut label_misses = reconciled.misses;
     label_misses.extend(decision_misses);
+    label_misses.extend(fragment_misses);
     apply_label_misses(&mut inspection, &label_misses);
     if let Err(err) = store::checkpoint(&session.conn) {
         attach_notice(

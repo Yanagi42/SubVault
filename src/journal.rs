@@ -285,9 +285,14 @@ pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<Reconcile, Fai
             journal_unlisted: found.unlisted,
         });
     }
+    // A format 3 fragment journal is labeled from its T3 receipt, not from commands.
+    let t3 = store::table_exists(conn, "t3_receipts").map_err(|err| unseen_db(err, "reconcile"))?;
     let mut missed = Vec::new();
     for journal in found.valid {
         if journal.state == "committed" || journal.kind == "decision" {
+            continue;
+        }
+        if t3 && journal.kind == "fragment" {
             continue;
         }
         if store::command(conn, &journal.command_id)

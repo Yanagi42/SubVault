@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -169,12 +169,29 @@ pub fn cancel_fragment(req: CancelRequest) -> Result<Report, Fail> {
     })
 }
 
+fn is_v3_commit_probe(point: Option<&str>) -> bool {
+    matches!(
+        point,
+        Some(
+            "commit_error_visible"
+                | "commit_error_absent"
+                | "commit_error_unseen"
+                | "commit_error_unreadable"
+        )
+    )
+}
+
 fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
+    let v3_probe = is_v3_commit_probe(req.hooks.inject_point.as_deref());
     let mut recognized: Vec<&str> = RECOGNIZED_INJECTS.to_vec();
     recognized.extend_from_slice(INJECTS);
     validate_hook_names(
         req.hooks.stop_at.as_deref(),
-        req.hooks.inject_point.as_deref(),
+        if v3_probe {
+            None
+        } else {
+            req.hooks.inject_point.as_deref()
+        },
         STOPS,
         &recognized,
         INJECTS,
@@ -189,6 +206,14 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
     }
     let stat_len = stat_fragment(&req.fragment)?;
     require_body_format(&req.vault)?;
+    if v3_probe && super::accept_wal_format(&req.vault.join("vault.db"))? != 3 {
+        return Err(
+            Fail::new(EXIT_USAGE, "Usage", "unknown_inject_point").extra(
+                "point",
+                json!(req.hooks.inject_point.as_deref().unwrap_or("")),
+            ),
+        );
+    }
     let session = open_session(&req.vault)?;
     let mut hooks = HookRun::new(req.hooks.clone());
     if let Some(existing) = store::command(&session.conn, &req.command_id)
@@ -316,13 +341,22 @@ fn continue_after_source(
     if opened.already_succeeded {
         match req.hooks.inject_point.as_deref() {
             Some("replay_tx") | Some("result_encode") => {}
+            Some(point) if is_v3_commit_probe(Some(point)) => {}
             Some(_) => return Err(missed("run_already_succeeded")),
             None => {}
         }
         if req.hooks.stop_at.is_some() {
             return Err(missed("run_already_succeeded"));
         }
-        let receipt = publish_replay(&session.conn, req, journal, opened, hash, hooks)?;
+        let receipt = publish_replay(
+            &session.root,
+            &session.conn,
+            req,
+            journal,
+            opened,
+            hash,
+            hooks,
+        )?;
         hook_reached(hooks)?;
         return finish_journal(&session.root, journal, receipt);
     }
@@ -436,6 +470,11 @@ fn note_status_writes(
     opened: &Opened,
     mut fail: Fail,
 ) -> Fail {
+    // The T3 receipt could not be classified. Leave the attempt and the
+    // object_ready journal alone instead of recording a failed publish.
+    if fail.reason == "t3_receipt_unseen" {
+        return fail;
+    }
     let attempt = set_attempt(
         &session.conn,
         &opened.attempt_id,
@@ -708,18 +747,17 @@ fn publish(
         now_ms(),
     )
     .map_err(|err| db_fail(err, "insert_command"))?;
-    if format == 3 {
+    let t3_canonical = if format == 3 {
         let key = journal.payload_fingerprint.clone().ok_or_else(|| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "logical_key_missing")
                 .extra("new_effect", json!(false))
         })?;
-        super::decide::insert_receipt(
-            &tx,
-            &req.command_id,
-            &super::decide::fragment_canonical(hash, &key, "created"),
-            &encoded,
-        )?;
-    }
+        let canonical = super::decide::fragment_canonical(hash, &key, "created");
+        super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+        Some(canonical)
+    } else {
+        None
+    };
     if let Err(fail) = hooks.inject(
         "db_commit",
         checkpoint_map(
@@ -733,6 +771,20 @@ fn publish(
     ) {
         return Err(not_published(fail, &opened.source_id, hash));
     }
+    if let Some(canonical) = t3_canonical {
+        return settle_v3_commit(
+            &session.root,
+            &req.command_id,
+            &canonical,
+            hash,
+            &opened.source_id,
+            "Committed",
+            V3Absent::Publish,
+            receipt,
+            tx,
+            hooks,
+        );
+    }
     match tx.commit() {
         Ok(()) => Ok(receipt),
         Err(err) => Err(not_published(
@@ -744,6 +796,7 @@ fn publish(
 }
 
 fn publish_replay(
+    root: &Path,
     conn: &Connection,
     req: &FragmentRequest,
     journal: &Journal,
@@ -801,20 +854,365 @@ fn publish_replay(
         now_ms(),
     )
     .map_err(|err| db_fail(err, "insert_command"))?;
-    if format == 3 {
+    let t3_canonical = if format == 3 {
         let key = journal.payload_fingerprint.clone().ok_or_else(|| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "logical_key_missing")
                 .extra("new_effect", json!(false))
         })?;
-        super::decide::insert_receipt(
-            &tx,
+        let canonical = super::decide::fragment_canonical(hash, &key, "already");
+        super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+        Some(canonical)
+    } else {
+        None
+    };
+    if let Some(canonical) = t3_canonical {
+        return settle_v3_commit(
+            root,
             &req.command_id,
-            &super::decide::fragment_canonical(hash, &key, "already"),
-            &encoded,
-        )?;
+            &canonical,
+            hash,
+            &opened.source_id,
+            "AlreadyPublished",
+            V3Absent::Replay,
+            replay,
+            tx,
+            hooks,
+        );
     }
     tx.commit().map_err(|err| db_fail(err, "replay_commit"))?;
     Ok(replay)
+}
+
+enum V3Probe {
+    None,
+    Visible,
+    Absent,
+    Unseen,
+    Unreadable,
+}
+
+enum V3Absent {
+    Publish,
+    Replay,
+}
+
+/// Format 3 only. The receipt read uses `t3_receipts`, not `commands`.
+fn settle_v3_commit(
+    root: &Path,
+    command_id: &str,
+    canonical: &str,
+    hash: &str,
+    source_id: &str,
+    expected_outcome: &str,
+    absent: V3Absent,
+    receipt: Value,
+    tx: Transaction<'_>,
+    hooks: &mut HookRun,
+) -> Result<Value, Fail> {
+    let db = root.join("vault.db");
+    match take_v3_commit_probe(hooks)? {
+        V3Probe::None => match tx.commit() {
+            Ok(()) => Ok(receipt),
+            Err(err) => classify_v3_commit(
+                &db,
+                command_id,
+                canonical,
+                hash,
+                source_id,
+                expected_outcome,
+                absent,
+                &err.to_string(),
+                false,
+            ),
+        },
+        V3Probe::Absent => {
+            drop(tx);
+            classify_v3_commit(
+                &db,
+                command_id,
+                canonical,
+                hash,
+                source_id,
+                expected_outcome,
+                absent,
+                super::decide::SIMULATED_COMMIT_ERROR,
+                true,
+            )
+        }
+        V3Probe::Visible => match tx.commit() {
+            Ok(()) => classify_v3_commit(
+                &db,
+                command_id,
+                canonical,
+                hash,
+                source_id,
+                expected_outcome,
+                absent,
+                super::decide::SIMULATED_COMMIT_ERROR,
+                true,
+            ),
+            Err(err) => classify_v3_commit(
+                &db,
+                command_id,
+                canonical,
+                hash,
+                source_id,
+                expected_outcome,
+                absent,
+                &err.to_string(),
+                false,
+            ),
+        },
+        V3Probe::Unreadable => match tx.commit() {
+            Ok(()) => {
+                super::decide::corrupt_receipt_result(&db, command_id)?;
+                classify_v3_commit(
+                    &db,
+                    command_id,
+                    canonical,
+                    hash,
+                    source_id,
+                    expected_outcome,
+                    absent,
+                    super::decide::SIMULATED_COMMIT_ERROR,
+                    true,
+                )
+            }
+            Err(err) => classify_v3_commit(
+                &db,
+                command_id,
+                canonical,
+                hash,
+                source_id,
+                expected_outcome,
+                absent,
+                &err.to_string(),
+                false,
+            ),
+        },
+        V3Probe::Unseen => match tx.commit() {
+            Ok(()) => classify_v3_commit(
+                &root.join("not-a-vault.db"),
+                command_id,
+                canonical,
+                hash,
+                source_id,
+                expected_outcome,
+                absent,
+                super::decide::SIMULATED_COMMIT_ERROR,
+                true,
+            ),
+            Err(err) => classify_v3_commit(
+                &db,
+                command_id,
+                canonical,
+                hash,
+                source_id,
+                expected_outcome,
+                absent,
+                &err.to_string(),
+                false,
+            ),
+        },
+    }
+}
+
+fn take_v3_commit_probe(hooks: &mut HookRun) -> Result<V3Probe, Fail> {
+    let Some(point) = hooks.hooks.inject_point.as_deref() else {
+        return Ok(V3Probe::None);
+    };
+    let probe = match point {
+        "commit_error_visible" => V3Probe::Visible,
+        "commit_error_absent" => V3Probe::Absent,
+        "commit_error_unseen" => V3Probe::Unseen,
+        "commit_error_unreadable" => V3Probe::Unreadable,
+        _ => return Ok(V3Probe::None),
+    };
+    let path = hooks.hooks.witness.clone().ok_or_else(|| {
+        Fail::new(EXIT_USAGE, "Usage", "witness_required").extra("point", json!(point))
+    })?;
+    let action = match hooks.hooks.inject_action {
+        Some(super::InjectAction::Enospc) => "enospc",
+        Some(super::InjectAction::IoError) => "io_error",
+        None => "simulated_commit_error",
+    };
+    let body = json!({
+        "reached": true,
+        "point": point,
+        "action": action,
+        "note": "simulated commit() error, not a disk COMMIT fault"
+    });
+    let bytes =
+        serde_json::to_vec(&body).map_err(|_| Fail::new(EXIT_USAGE, "Usage", "witness_encode"))?;
+    crate::fsutil::atomic_write(&path, &bytes).map_err(|err| io_fail(err, "witness"))?;
+    hooks.inject_reached = true;
+    Ok(probe)
+}
+
+fn classify_v3_commit(
+    db: &Path,
+    command_id: &str,
+    canonical: &str,
+    hash: &str,
+    source_id: &str,
+    expected_outcome: &str,
+    absent: V3Absent,
+    commit_error: &str,
+    injected: bool,
+) -> Result<Value, Fail> {
+    let read = match super::decide::read_t3_receipt_wal(db, command_id) {
+        Ok(read) => read,
+        Err(_) => {
+            return Err(fragment_receipt_unseen(
+                commit_error,
+                injected,
+                source_id,
+                hash,
+            ))
+        }
+    };
+    match read {
+        super::decide::ReceiptRead::Absent => Err(fragment_receipt_absent(
+            absent,
+            commit_error,
+            injected,
+            source_id,
+            hash,
+        )),
+        super::decide::ReceiptRead::Unreadable => Err(fragment_receipt_unseen(
+            commit_error,
+            injected,
+            source_id,
+            hash,
+        )),
+        super::decide::ReceiptRead::Ready {
+            canonical: stored,
+            result_json,
+        } => {
+            let Some(mut value) = accepted_fragment_result(
+                command_id,
+                canonical,
+                hash,
+                expected_outcome,
+                &stored,
+                &result_json,
+            ) else {
+                return Err(fragment_receipt_unseen(
+                    commit_error,
+                    injected,
+                    source_id,
+                    hash,
+                ));
+            };
+            if let Some(map) = value.as_object_mut() {
+                map.insert("visible_despite_commit_error".into(), json!(true));
+                map.insert("commit_error".into(), json!(commit_error));
+                map.insert("injected".into(), json!(injected));
+                map.insert(
+                    "note".into(),
+                    json!(if injected {
+                        "simulated commit() error; the t3 receipt is visible, so the stored result stands. Not a disk COMMIT fault."
+                    } else {
+                        "commit() returned an error; the t3 receipt is visible, so the stored result stands."
+                    }),
+                );
+            }
+            Ok(value)
+        }
+    }
+}
+
+fn accepted_fragment_result(
+    command_id: &str,
+    canonical: &str,
+    hash: &str,
+    expected_outcome: &str,
+    stored: &str,
+    result_json: &str,
+) -> Option<Value> {
+    if stored != canonical {
+        return None;
+    }
+    let Value::Object(map) = serde_json::from_str(result_json).ok()? else {
+        return None;
+    };
+    if map.get("command_id").and_then(Value::as_str) != Some(command_id) {
+        return None;
+    }
+    if map.get("content_sha256").and_then(Value::as_str) != Some(hash) {
+        return None;
+    }
+    if map.get("outcome").and_then(Value::as_str) != Some(expected_outcome) {
+        return None;
+    }
+    if map.get("candidates_published") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    if map.get("slice").and_then(Value::as_str) != Some("T3-facts") {
+        return None;
+    }
+    let facts_published = map.get("facts_published").and_then(Value::as_bool)?;
+    let expected_facts = expected_outcome == "Committed";
+    if facts_published != expected_facts {
+        return None;
+    }
+    Some(Value::Object(map))
+}
+
+fn fragment_receipt_absent(
+    kind: V3Absent,
+    commit_error: &str,
+    injected: bool,
+    source_id: &str,
+    hash: &str,
+) -> Fail {
+    let during = match kind {
+        V3Absent::Publish => "db_commit",
+        V3Absent::Replay => "replay_commit",
+    };
+    let fail = Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "db_error")
+        .extra("injected", json!(injected))
+        .extra("during", json!(during))
+        .extra("os_error", json!(commit_error))
+        .extra("new_effect", json!(false))
+        .extra(
+            "note",
+            json!(if injected {
+                "simulated commit() error; independent read found no t3 receipt. Not a disk COMMIT fault."
+            } else {
+                "commit() returned an error; independent read found no t3 receipt."
+            }),
+        );
+    match kind {
+        V3Absent::Publish => not_published(fail, source_id, hash),
+        V3Absent::Replay => fail,
+    }
+}
+
+fn fragment_receipt_unseen(
+    commit_error: &str,
+    injected: bool,
+    source_id: &str,
+    hash: &str,
+) -> Fail {
+    Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unseen")
+        .extra("injected", json!(injected))
+        .extra("during", json!("t3_receipt"))
+        .extra("commit_error", json!(commit_error))
+        .extra("new_effect", Value::Null)
+        .extra("candidates_published", Value::Null)
+        .extra("facts_published", Value::Null)
+        .extra("source_id", json!(source_id))
+        .extra("content_sha256", json!(hash))
+        .extra("slice", json!("T3-facts"))
+        .extra(
+            "note",
+            json!(if injected {
+                "simulated commit() error; the independent t3 receipt read is unusable. Not a disk COMMIT fault. The journal stays object_ready."
+            } else {
+                "commit() returned an error and the t3 receipt could not be read. The journal stays object_ready."
+            }),
+        )
 }
 
 fn success_receipt(

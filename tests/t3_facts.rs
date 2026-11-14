@@ -1045,7 +1045,8 @@ const ACTOR: &str = "act_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const ACTOR_B: &str = "act_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 // Public CLI only. SIGKILL is not a power cut or an fsync proof.
-// `--inject` returns before COMMIT, so it is not a COMMIT-visibility failure.
+// `decision_tx` and `db_commit` return before COMMIT, so they are not COMMIT-visibility failures.
+// `commit_error_*` probes simulate commit() returning an error. They are not disk COMMIT faults.
 // Power loss, a real full disk, a real SQLite COMMIT error, Windows, and PDF are not covered.
 
 fn correct_amount(
@@ -1071,6 +1072,89 @@ fn correct_amount(
         "--actor-id",
         actor,
     ])
+}
+
+fn paid_id(vault: &Path, source_id: &str) -> String {
+    paid_for(&facts(vault), source_id)["fact_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn correct_probe(
+    vault: &Path,
+    command: &str,
+    fact_id: &str,
+    revision: &str,
+    amount: &str,
+    action: &str,
+    point: &str,
+    witness: &Path,
+) -> (i32, Value) {
+    run(&[
+        "correct",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        command,
+        "--fact-id",
+        fact_id,
+        "--expected-revision",
+        revision,
+        "--amount-text",
+        amount,
+        "--actor-id",
+        ACTOR,
+        "--inject",
+        &format!("{action}:{point}"),
+        "--witness",
+        witness.to_str().unwrap(),
+    ])
+}
+
+fn undo_probe(
+    vault: &Path,
+    command: &str,
+    decision_id: &str,
+    revision: &str,
+    action: &str,
+    point: &str,
+    witness: &Path,
+) -> (i32, Value) {
+    run(&[
+        "undo",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        command,
+        "--decision-id",
+        decision_id,
+        "--expected-revision",
+        revision,
+        "--actor-id",
+        ACTOR,
+        "--inject",
+        &format!("{action}:{point}"),
+        "--witness",
+        witness.to_str().unwrap(),
+    ])
+}
+
+fn assert_not_disk(body: &Value) {
+    let note = body["note"].as_str().unwrap();
+    assert!(note.contains("simulated commit() error"), "{note}");
+    assert!(note.contains("Not a disk COMMIT fault"), "{note}");
+}
+
+fn assert_no_command_row(vault: &Path, command: &str) {
+    assert_eq!(
+        sql(
+            vault,
+            &format!("SELECT count(*) FROM commands WHERE command_id='{command}';")
+        ),
+        "0",
+        "{command} must not be settled through the commands table"
+    );
 }
 
 fn undo_at(
@@ -1927,6 +2011,727 @@ fn the_previous_binary_has_no_correct_command_and_does_not_write_a_format_3_vaul
     assert_eq!(flagged["reason"], "unknown_flag");
     assert_eq!(fs::read(vault.join("vault.db")).unwrap(), before);
     assert!(!journal_file(&vault, "b").exists());
+}
+
+#[test]
+fn commit_error_with_a_visible_t3_receipt_returns_the_stored_result() {
+    // The probe commits, then uses the same settlement as a commit() error.
+    // It is not a disk COMMIT fault. `db_commit` remains the before-COMMIT case.
+    let tmp = Tmp::new("commit-visible");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_id(&vault, published["source_id"].as_str().unwrap());
+    let witness = tmp.path().join("visible.json");
+    let (code, corrected) = correct_probe(
+        &vault,
+        "vis",
+        &fact_id,
+        "1",
+        "10.00",
+        "io_error",
+        "commit_error_visible",
+        &witness,
+    );
+    assert_eq!(code, 0, "{corrected}");
+    assert_eq!(corrected["outcome"], "Committed");
+    assert_eq!(corrected["revision"], 2);
+    assert_eq!(corrected["amount_text"], "10.00");
+    assert_eq!(corrected["new_effect"], true);
+    assert_eq!(corrected["visible_despite_commit_error"], true);
+    assert_eq!(corrected["injected"], true);
+    assert_eq!(corrected["commit_error"], "simulated commit() error");
+    assert_not_disk(&corrected);
+    assert_eq!(journal_value(&vault, "vis")["state"], "committed");
+    assert!(journal_value(&vault, "vis")["reason"].is_null());
+    assert_no_command_row(&vault, "vis");
+    let stored: Value = serde_json::from_str(&sql(
+        &vault,
+        "SELECT result_json FROM t3_receipts WHERE command_id='vis';",
+    ))
+    .unwrap();
+    assert_eq!(stored["decision_id"], corrected["decision_id"]);
+    assert_eq!(stored["outcome"], "Committed");
+    assert_eq!(stored["new_effect"], true);
+    assert!(stored.get("visible_despite_commit_error").is_none());
+    assert!(sql(
+        &vault,
+        "SELECT canonical_payload FROM t3_receipts WHERE command_id='vis';"
+    )
+    .contains("amount_text=10.00"));
+    let (code, again) = correct_amount(&vault, "vis", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again["outcome"], "AlreadyCommitted");
+    assert_eq!(again["new_effect"], false);
+    assert_eq!(again["decision_id"], corrected["decision_id"]);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE command_id='vis';"
+        ),
+        "1"
+    );
+
+    let target = corrected["decision_id"].as_str().unwrap();
+    let witness = tmp.path().join("undo-visible.json");
+    let (code, undone) = undo_probe(
+        &vault,
+        "uvis",
+        target,
+        "2",
+        "io_error",
+        "commit_error_visible",
+        &witness,
+    );
+    assert_eq!(code, 0, "{undone}");
+    assert_eq!(undone["outcome"], "Committed");
+    assert_eq!(undone["revision"], 3);
+    assert_eq!(undone["amount_text"], "15.99");
+    assert_eq!(undone["target_decision_id"], target);
+    assert_eq!(undone["new_effect"], true);
+    assert_eq!(undone["visible_despite_commit_error"], true);
+    assert_eq!(undone["injected"], true);
+    assert_not_disk(&undone);
+    assert_eq!(journal_value(&vault, "uvis")["state"], "committed");
+    assert_no_command_row(&vault, "uvis");
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "15.99"
+    );
+    let (code, replay) = undo_at(&vault, "uvis", target, "2", ACTOR);
+    assert_eq!(code, 0, "{replay}");
+    assert_eq!(replay["outcome"], "AlreadyCommitted");
+    assert_eq!(replay["new_effect"], false);
+    assert_eq!(replay["decision_id"], undone["decision_id"]);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE command_id='uvis';"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn commit_error_with_no_t3_receipt_is_not_preserved() {
+    let tmp = Tmp::new("commit-absent");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_id(&vault, published["source_id"].as_str().unwrap());
+    for (command, action) in [("disk", "enospc"), ("abs", "io_error")] {
+        let witness = tmp.path().join(format!("{command}.json"));
+        let (code, failed) = correct_probe(
+            &vault,
+            command,
+            &fact_id,
+            "1",
+            "10.00",
+            action,
+            "commit_error_absent",
+            &witness,
+        );
+        assert_eq!(code, 15, "{action} {failed}");
+        assert_eq!(failed["outcome"], "NotPreserved");
+        assert_eq!(failed["reason"], "db_error");
+        assert_ne!(failed["reason"], "enospc");
+        assert_eq!(failed["injected"], true);
+        assert_eq!(failed["decision_committed"], false);
+        assert_eq!(failed["facts_changed"], false);
+        assert_eq!(failed["new_effect"], false);
+        assert_not_disk(&failed);
+        assert!(failed["note"].as_str().unwrap().contains("no t3 receipt"));
+        let journal = journal_value(&vault, command);
+        assert_eq!(journal["state"], "started");
+        assert!(journal["reason"].is_null());
+        assert_eq!(
+            sql(
+                &vault,
+                &format!("SELECT count(*) FROM t3_receipts WHERE command_id='{command}';")
+            ),
+            "0"
+        );
+        assert_no_command_row(&vault, command);
+    }
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT revision FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "1"
+    );
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    for command in ["disk", "abs"] {
+        let journal = journal_value(&vault, command);
+        assert_eq!(journal["state"], "aborted");
+        assert_eq!(journal["reason"], "uncommitted");
+    }
+    let (code, retried) = correct_amount(&vault, "abs", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{retried}");
+    assert_eq!(retried["revision"], 2);
+    let target = retried["decision_id"].as_str().unwrap().to_string();
+    let witness = tmp.path().join("undo-absent.json");
+    let (code, failed) = undo_probe(
+        &vault,
+        "uabs",
+        &target,
+        "2",
+        "io_error",
+        "commit_error_absent",
+        &witness,
+    );
+    assert_eq!(code, 15, "{failed}");
+    assert_eq!(failed["outcome"], "NotPreserved");
+    assert_eq!(failed["reason"], "db_error");
+    assert_eq!(failed["decision_committed"], false);
+    assert_eq!(failed["facts_changed"], false);
+    assert_not_disk(&failed);
+    assert_eq!(journal_value(&vault, "uabs")["state"], "started");
+    assert_eq!(journal_value(&vault, "abs")["state"], "committed");
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT revision FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "2"
+    );
+    assert_eq!(
+        sql(&vault, "SELECT count(*) FROM decisions WHERE kind='undo';"),
+        "0"
+    );
+    assert_no_command_row(&vault, "uabs");
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    assert_eq!(journal_value(&vault, "uabs")["state"], "aborted");
+    assert_eq!(journal_value(&vault, "uabs")["reason"], "uncommitted");
+    let (code, undone) = undo_at(&vault, "uabs", &target, "2", ACTOR);
+    assert_eq!(code, 0, "{undone}");
+    assert_eq!(undone["revision"], 3);
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE command_id='uabs';"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn commit_error_with_an_unreadable_t3_receipt_stays_started() {
+    let tmp = Tmp::new("commit-unreadable");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_id(&vault, published["source_id"].as_str().unwrap());
+    let witness = tmp.path().join("bad.json");
+    let (code, failed) = correct_probe(
+        &vault,
+        "bad",
+        &fact_id,
+        "1",
+        "10.00",
+        "io_error",
+        "commit_error_unreadable",
+        &witness,
+    );
+    assert_eq!(code, 12, "{failed}");
+    assert_eq!(failed["outcome"], "RecoveryRequired");
+    assert_eq!(failed["reason"], "t3_receipt_unseen");
+    assert_eq!(failed["injected"], true);
+    assert!(failed["new_effect"].is_null());
+    assert!(failed["decision_committed"].is_null());
+    assert!(failed["facts_changed"].is_null());
+    assert_not_disk(&failed);
+    assert!(failed["note"].as_str().unwrap().contains("stays started"));
+    assert_eq!(journal_value(&vault, "bad")["state"], "started");
+    assert!(journal_value(&vault, "bad")["reason"].is_null());
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT result_json FROM t3_receipts WHERE command_id='bad';"
+        ),
+        "{"
+    );
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "10.00"
+    );
+    assert_no_command_row(&vault, "bad");
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 12, "{opened}");
+    assert_eq!(opened["reason"], "t3_receipt_unreadable");
+    assert_eq!(journal_value(&vault, "bad")["state"], "started");
+
+    let undo_vault = tmp.path().join("undo");
+    let (code, body) = run(&[
+        "init",
+        "--vault",
+        undo_vault.to_str().unwrap(),
+        "--format",
+        "3",
+    ]);
+    assert_eq!(code, 0, "{body}");
+    let (code, published) = fragment(&undo_vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_id(&undo_vault, published["source_id"].as_str().unwrap());
+    let (code, corrected) = correct_amount(&undo_vault, "b", &fact_id, "1", "10.00", ACTOR);
+    assert_eq!(code, 0, "{corrected}");
+    let target = corrected["decision_id"].as_str().unwrap();
+    let witness = tmp.path().join("undo-bad.json");
+    let (code, failed) = undo_probe(
+        &undo_vault,
+        "ubad",
+        target,
+        "2",
+        "io_error",
+        "commit_error_unreadable",
+        &witness,
+    );
+    assert_eq!(code, 12, "{failed}");
+    assert_eq!(failed["reason"], "t3_receipt_unseen");
+    assert!(failed["new_effect"].is_null());
+    assert!(failed["decision_committed"].is_null());
+    assert_not_disk(&failed);
+    assert_eq!(journal_value(&undo_vault, "ubad")["state"], "started");
+    assert_eq!(journal_value(&undo_vault, "b")["state"], "committed");
+    assert_eq!(
+        sql(
+            &undo_vault,
+            "SELECT result_json FROM t3_receipts WHERE command_id='ubad';"
+        ),
+        "{"
+    );
+    assert_eq!(
+        sql(
+            &undo_vault,
+            &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "15.99"
+    );
+    let (code, opened) = run(&["open", "--vault", undo_vault.to_str().unwrap()]);
+    assert_eq!(code, 12, "{opened}");
+    assert_eq!(opened["reason"], "t3_receipt_unreadable");
+    assert_eq!(journal_value(&undo_vault, "ubad")["state"], "started");
+    assert_eq!(journal_value(&undo_vault, "b")["state"], "committed");
+}
+
+#[test]
+fn commit_error_with_a_failed_receipt_read_stays_started() {
+    // The probe asks the independent reader to open not-a-vault.db, which is not the database.
+    let tmp = Tmp::new("commit-unseen");
+    let (vault, file) = stated_file(&tmp);
+    let (code, published) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{published}");
+    let fact_id = paid_id(&vault, published["source_id"].as_str().unwrap());
+    let witness = tmp.path().join("miss.json");
+    let (code, failed) = correct_probe(
+        &vault,
+        "miss",
+        &fact_id,
+        "1",
+        "10.00",
+        "io_error",
+        "commit_error_unseen",
+        &witness,
+    );
+    assert_eq!(code, 12, "{failed}");
+    assert_eq!(failed["outcome"], "RecoveryRequired");
+    assert_eq!(failed["reason"], "t3_receipt_unseen");
+    assert_ne!(failed["outcome"], "NotPreserved");
+    assert_eq!(failed["injected"], true);
+    assert!(failed["new_effect"].is_null());
+    assert!(failed["decision_committed"].is_null());
+    assert!(failed["facts_changed"].is_null());
+    assert_not_disk(&failed);
+    assert!(!vault.join("not-a-vault.db").exists());
+    assert_eq!(journal_value(&vault, "miss")["state"], "started");
+    assert!(journal_value(&vault, "miss")["reason"].is_null());
+    let stored: Value = serde_json::from_str(&sql(
+        &vault,
+        "SELECT result_json FROM t3_receipts WHERE command_id='miss';",
+    ))
+    .unwrap();
+    assert_eq!(stored["outcome"], "Committed");
+    assert_eq!(stored["amount_text"], "10.00");
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "10.00"
+    );
+    assert_no_command_row(&vault, "miss");
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    assert_eq!(journal_value(&vault, "miss")["state"], "committed");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE command_id='miss';"
+        ),
+        "1"
+    );
+
+    let target = stored["decision_id"].as_str().unwrap();
+    let witness = tmp.path().join("undo-miss.json");
+    let (code, failed) = undo_probe(
+        &vault,
+        "umiss",
+        target,
+        "2",
+        "io_error",
+        "commit_error_unseen",
+        &witness,
+    );
+    assert_eq!(code, 12, "{failed}");
+    assert_eq!(failed["reason"], "t3_receipt_unseen");
+    assert_ne!(failed["outcome"], "NotPreserved");
+    assert!(failed["new_effect"].is_null());
+    assert!(failed["decision_committed"].is_null());
+    assert_not_disk(&failed);
+    assert_eq!(journal_value(&vault, "umiss")["state"], "started");
+    assert_eq!(journal_value(&vault, "miss")["state"], "committed");
+    let undone: Value = serde_json::from_str(&sql(
+        &vault,
+        "SELECT result_json FROM t3_receipts WHERE command_id='umiss';",
+    ))
+    .unwrap();
+    assert_eq!(undone["outcome"], "Committed");
+    assert_eq!(undone["amount_text"], "15.99");
+    assert_eq!(
+        sql(
+            &vault,
+            &format!("SELECT json_extract(value_json, '$.amount_text') FROM facts WHERE fact_id='{fact_id}';")
+        ),
+        "15.99"
+    );
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    assert_eq!(journal_value(&vault, "umiss")["state"], "committed");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM decisions WHERE command_id='umiss';"
+        ),
+        "1"
+    );
+}
+
+fn fragment_probe(
+    vault: &Path,
+    command: &str,
+    file: &Path,
+    action: &str,
+    point: &str,
+    witness: &Path,
+) -> (i32, Value) {
+    run(&[
+        "fragment",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        command,
+        "--fragment",
+        file.to_str().unwrap(),
+        "--inject",
+        &format!("{action}:{point}"),
+        "--witness",
+        witness.to_str().unwrap(),
+    ])
+}
+
+fn other_note(tmp: &Tmp, name: &str, amount: &str) -> PathBuf {
+    write_note(
+        tmp,
+        name,
+        &format!("Amount paid USD {amount}\nService period: 2026-10-01 through 2026-10-31\n"),
+    )
+}
+
+#[test]
+fn format_3_publish_commit_error_uses_the_t3_receipt() {
+    // db_commit still returns before COMMIT. These probes are not disk COMMIT faults.
+    // A commands row is not the T3 witness: the unseen case has that row and still
+    // refuses to call the publish committed or absent.
+    let tmp = Tmp::new("fragment-commit");
+    let (vault, file) = stated_file(&tmp);
+    let absent_file = other_note(&tmp, "absent.txt", "4.00");
+    let witness = tmp.path().join("absent.json");
+    let (code, failed) = fragment_probe(
+        &vault,
+        "abs",
+        &absent_file,
+        "enospc",
+        "commit_error_absent",
+        &witness,
+    );
+    assert_eq!(code, 3, "{failed}");
+    assert_eq!(failed["outcome"], "NotPublished");
+    assert_eq!(failed["reason"], "db_error");
+    assert_ne!(failed["reason"], "enospc");
+    assert_eq!(failed["candidates_published"], false);
+    assert_eq!(failed["new_effect"], false);
+    assert_eq!(failed["injected"], true);
+    assert_eq!(failed["preservation"], "preserved");
+    assert_not_disk(&failed);
+    assert!(failed["note"].as_str().unwrap().contains("no t3 receipt"));
+    assert_eq!(journal_value(&vault, "abs")["state"], "aborted");
+    assert_eq!(journal_value(&vault, "abs")["reason"], "db_error");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM t3_receipts WHERE command_id='abs';"
+        ),
+        "0"
+    );
+    assert_no_command_row(&vault, "abs");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "0");
+
+    let witness = tmp.path().join("visible.json");
+    let (code, published) = fragment_probe(
+        &vault,
+        "vis",
+        &file,
+        "io_error",
+        "commit_error_visible",
+        &witness,
+    );
+    assert_eq!(code, 0, "{published}");
+    assert_eq!(published["outcome"], "Committed");
+    assert_eq!(published["facts_published"], true);
+    assert_eq!(published["candidates_published"], true);
+    assert_eq!(published["new_effect"], true);
+    assert_eq!(published["visible_despite_commit_error"], true);
+    assert_eq!(published["injected"], true);
+    assert_eq!(published["commit_error"], "simulated commit() error");
+    assert_not_disk(&published);
+    assert_eq!(journal_value(&vault, "vis")["state"], "committed");
+    let stored: Value = serde_json::from_str(&sql(
+        &vault,
+        "SELECT result_json FROM t3_receipts WHERE command_id='vis';",
+    ))
+    .unwrap();
+    assert_eq!(stored["outcome"], "Committed");
+    assert_eq!(stored["fact_ids"], published["fact_ids"]);
+    assert!(stored.get("visible_despite_commit_error").is_none());
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "2");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM commands WHERE command_id='vis';"
+        ),
+        "1"
+    );
+    let (code, again) = fragment(&vault, "vis", &file);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again["new_effect"], false);
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "2");
+
+    let miss_file = other_note(&tmp, "miss.txt", "6.00");
+    let witness = tmp.path().join("miss.json");
+    let (code, missed) = fragment_probe(
+        &vault,
+        "miss",
+        &miss_file,
+        "io_error",
+        "commit_error_unseen",
+        &witness,
+    );
+    assert_eq!(code, 12, "{missed}");
+    assert_eq!(missed["outcome"], "RecoveryRequired");
+    assert_eq!(missed["reason"], "t3_receipt_unseen");
+    assert_ne!(missed["outcome"], "NotPublished");
+    assert_eq!(missed["injected"], true);
+    assert!(missed["new_effect"].is_null());
+    assert!(missed["candidates_published"].is_null());
+    assert!(missed["facts_published"].is_null());
+    assert_not_disk(&missed);
+    assert!(!vault.join("not-a-vault.db").exists());
+    assert_eq!(journal_value(&vault, "miss")["state"], "object_ready");
+    assert!(journal_value(&vault, "miss")["reason"].is_null());
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM commands WHERE command_id='miss';"
+        ),
+        "1"
+    );
+    let missed_stored: Value = serde_json::from_str(&sql(
+        &vault,
+        "SELECT result_json FROM t3_receipts WHERE command_id='miss';",
+    ))
+    .unwrap();
+    assert_eq!(missed_stored["outcome"], "Committed");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "4");
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    assert_eq!(journal_value(&vault, "miss")["state"], "committed");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "4");
+
+    let bad_vault = tmp.path().join("bad");
+    let (code, body) = run(&[
+        "init",
+        "--vault",
+        bad_vault.to_str().unwrap(),
+        "--format",
+        "3",
+    ]);
+    assert_eq!(code, 0, "{body}");
+    let witness = tmp.path().join("bad.json");
+    let (code, broken) = fragment_probe(
+        &bad_vault,
+        "bad",
+        &file,
+        "io_error",
+        "commit_error_unreadable",
+        &witness,
+    );
+    assert_eq!(code, 12, "{broken}");
+    assert_eq!(broken["reason"], "t3_receipt_unseen");
+    assert_ne!(broken["outcome"], "NotPublished");
+    assert!(broken["candidates_published"].is_null());
+    assert_not_disk(&broken);
+    assert_eq!(journal_value(&bad_vault, "bad")["state"], "object_ready");
+    assert_eq!(
+        sql(
+            &bad_vault,
+            "SELECT result_json FROM t3_receipts WHERE command_id='bad';"
+        ),
+        "{"
+    );
+    assert_eq!(sql(&bad_vault, "SELECT count(*) FROM facts;"), "2");
+    let (code, opened) = run(&["open", "--vault", bad_vault.to_str().unwrap()]);
+    assert_eq!(code, 12, "{opened}");
+    assert_eq!(opened["reason"], "t3_receipt_unreadable");
+    assert_eq!(journal_value(&bad_vault, "bad")["state"], "object_ready");
+}
+
+#[test]
+fn format_3_replay_commit_error_uses_the_t3_receipt() {
+    let tmp = Tmp::new("fragment-replay");
+    let (vault, file) = stated_file(&tmp);
+    let (code, first) = fragment(&vault, "a", &file);
+    assert_eq!(code, 0, "{first}");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "2");
+    let witness = tmp.path().join("visible.json");
+    let (code, replayed) = fragment_probe(
+        &vault,
+        "b",
+        &file,
+        "io_error",
+        "commit_error_visible",
+        &witness,
+    );
+    assert_eq!(code, 0, "{replayed}");
+    assert_eq!(replayed["outcome"], "AlreadyPublished");
+    assert_eq!(replayed["facts_published"], false);
+    assert_eq!(replayed["new_effect"], false);
+    assert_eq!(replayed["candidates_published"], true);
+    assert_eq!(replayed["visible_despite_commit_error"], true);
+    assert_eq!(replayed["injected"], true);
+    assert_not_disk(&replayed);
+    assert_eq!(journal_value(&vault, "b")["state"], "committed");
+    assert_eq!(journal_value(&vault, "a")["state"], "committed");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "2");
+    let stored: Value = serde_json::from_str(&sql(
+        &vault,
+        "SELECT result_json FROM t3_receipts WHERE command_id='b';",
+    ))
+    .unwrap();
+    assert_eq!(stored["outcome"], "AlreadyPublished");
+    assert!(stored.get("visible_despite_commit_error").is_none());
+
+    let witness = tmp.path().join("absent.json");
+    let (code, failed) = fragment_probe(
+        &vault,
+        "c",
+        &file,
+        "io_error",
+        "commit_error_absent",
+        &witness,
+    );
+    assert_eq!(code, 15, "{failed}");
+    assert_eq!(failed["outcome"], "NotPublished");
+    assert_eq!(failed["reason"], "db_error");
+    assert_eq!(failed["candidates_published"], false);
+    assert_eq!(failed["new_effect"], false);
+    assert_eq!(failed["preservation"], "preserved");
+    assert_not_disk(&failed);
+    assert!(failed["note"].as_str().unwrap().contains("no t3 receipt"));
+    assert_eq!(journal_value(&vault, "c")["state"], "object_ready");
+    assert!(journal_value(&vault, "c")["reason"].is_null());
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT count(*) FROM t3_receipts WHERE command_id='c';"
+        ),
+        "0"
+    );
+    assert_no_command_row(&vault, "c");
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "2");
+
+    let witness = tmp.path().join("bad.json");
+    let (code, broken) = fragment_probe(
+        &vault,
+        "d",
+        &file,
+        "io_error",
+        "commit_error_unreadable",
+        &witness,
+    );
+    assert_eq!(code, 12, "{broken}");
+    assert_eq!(broken["reason"], "t3_receipt_unseen");
+    assert_ne!(broken["outcome"], "NotPublished");
+    assert!(broken["new_effect"].is_null());
+    assert!(broken["candidates_published"].is_null());
+    assert_not_disk(&broken);
+    assert_eq!(journal_value(&vault, "d")["state"], "object_ready");
+    assert_eq!(journal_value(&vault, "b")["state"], "committed");
+    assert_eq!(
+        sql(
+            &vault,
+            "SELECT result_json FROM t3_receipts WHERE command_id='d';"
+        ),
+        "{"
+    );
+    assert_eq!(sql(&vault, "SELECT count(*) FROM facts;"), "2");
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 12, "{opened}");
+    assert_eq!(opened["reason"], "t3_receipt_unreadable");
+    assert_eq!(journal_value(&vault, "d")["state"], "object_ready");
+    assert_eq!(journal_value(&vault, "a")["state"], "committed");
+    assert_eq!(journal_value(&vault, "b")["state"], "committed");
+}
+
+#[test]
+fn format_2_does_not_gain_the_v3_commit_error_probe() {
+    let tmp = Tmp::new("fragment-v2-probe");
+    let vault = tmp.path().join("vault");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "2"]);
+    assert_eq!(code, 0, "{body}");
+    let file = write_note(&tmp, "note.txt", "Amount paid USD 15.99\n");
+    let witness = tmp.path().join("witness.json");
+    let before = fs::read(vault.join("vault.db")).unwrap();
+    let (code, failed) = fragment_probe(
+        &vault,
+        "v2",
+        &file,
+        "io_error",
+        "commit_error_visible",
+        &witness,
+    );
+    assert_eq!(code, 2, "{failed}");
+    assert_eq!(failed["reason"], "unknown_inject_point");
+    assert_eq!(failed["point"], "commit_error_visible");
+    assert!(!journal_file(&vault, "v2").exists());
+    assert_eq!(fs::read(vault.join("vault.db")).unwrap(), before);
 }
 
 #[test]
