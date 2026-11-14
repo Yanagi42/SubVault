@@ -887,7 +887,10 @@ time.sleep(30)
         fragment.to_str().unwrap(),
     ]);
     assert_eq!(code, 14, "{refused}");
-    assert_eq!(refused["outcome"], "NeedsUpgrade");
+    assert_eq!(refused["outcome"], "VersionUnsupported");
+    assert_eq!(refused["reason"], "format_inconsistent");
+    assert_eq!(refused["header_user_version"], 1);
+    assert_eq!(refused["schema_version_found"], 2);
     assert_eq!(tree(&vault.join("journal")), journals);
     assert_eq!(header_user_version(&vault.join("vault.db")), 1);
     let _ = holder.kill();
@@ -1074,4 +1077,584 @@ fn format_2_body_succeeds_cancels_rolls_back_and_reopens() {
     assert_eq!(code, 0, "{opened}");
     assert_eq!(opened["vault_format"], 2);
     assert_eq!(header_user_version(&vault.join("vault.db")), 2);
+}
+
+#[test]
+fn a_real_wal_stays_usable_and_a_split_header_is_not_checkpointed() {
+    let tmp = Tmp::new("gate");
+    let vault = tmp.path().join("v1");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{body}");
+    let source = note(&tmp, "v1.txt", b"synthetic-v1\n");
+    let (code, imported) = run(&[
+        "import",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "keep",
+        "--media-type",
+        "text/plain",
+        "--source",
+        source.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{imported}");
+    leave_wal_frames(&vault.join("vault.db"), "PRAGMA user_version=1;");
+    assert!(vault.join("vault.db-wal").metadata().unwrap().len() > 32);
+    assert_eq!(header_user_version(&vault.join("vault.db")), 1);
+    assert_eq!(ro(&vault, "PRAGMA user_version;"), "1");
+    assert_eq!(
+        ro(&vault, "SELECT value FROM meta WHERE key='schema_version';"),
+        "1"
+    );
+    assert_eq!(
+        ro(
+            &vault,
+            "SELECT count(*) FROM meta WHERE key='vault_format';"
+        ),
+        "0"
+    );
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    assert_eq!(opened["outcome"], "Ready");
+    assert_eq!(opened["vault_format"], 1);
+    assert_eq!(opened["slice"], "T1");
+    let again = note(&tmp, "v1-again.txt", b"synthetic-v1-again\n");
+    let (code, imported) = run(&[
+        "import",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "keep-again",
+        "--media-type",
+        "text/plain",
+        "--source",
+        again.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{imported}");
+    let source_id = imported["source_id"].as_str().unwrap();
+    let out = tmp.path().join("v1-out.bin");
+    let (code, read) = run(&[
+        "read",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--source-id",
+        source_id,
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{read}");
+    assert_eq!(fs::read(&out).unwrap(), b"synthetic-v1-again\n");
+    let (code, marked) = run(&[
+        "marker",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "mark",
+        "--source-id",
+        source_id,
+        "--value",
+        "synthetic-note",
+    ]);
+    assert_eq!(code, 0, "{marked}");
+    let (code, listed) = run(&["candidates", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["candidates"].as_array().unwrap().len(), 0);
+    assert_eq!(header_user_version(&vault.join("vault.db")), 1);
+
+    let checkpoint = tmp.path().join("v1-copy.json");
+    let copying = note(&tmp, "v1-copy.txt", b"synthetic-v1-copy\n");
+    let mut child = Stopped::spawn(&[
+        "import",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "copying",
+        "--media-type",
+        "text/plain",
+        "--source",
+        copying.to_str().unwrap(),
+        "--stop-at",
+        "during_copy",
+        "--checkpoint",
+        checkpoint.to_str().unwrap(),
+    ]);
+    wait_stopped(child.child(), &checkpoint);
+    let (code, queried) = run(&["candidates", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{queried}");
+    assert_ne!(queried["outcome"], "Locked");
+    let (code, pending) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "copying",
+        "--generation",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{pending}");
+    assert_eq!(pending["outcome"], "CancelPending");
+    assert_eq!(
+        fs::read_to_string(vault.join("control").join("copying")).unwrap(),
+        "cancel\ngeneration=1\nkind=preservation\n"
+    );
+    kill_stopped(child.child());
+    child.reap();
+
+    let vault = tmp.path().join("v2");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "2"]);
+    assert_eq!(code, 0, "{body}");
+    leave_wal_frames(&vault.join("vault.db"), "PRAGMA user_version=2;");
+    assert!(vault.join("vault.db-wal").metadata().unwrap().len() > 32);
+    assert_eq!(header_user_version(&vault.join("vault.db")), 2);
+    assert_eq!(ro(&vault, "PRAGMA user_version;"), "2");
+    assert_eq!(
+        ro(&vault, "SELECT value FROM meta WHERE key='vault_format';"),
+        "2"
+    );
+    assert_eq!(
+        ro(&vault, "SELECT value FROM meta WHERE key='schema_version';"),
+        "1"
+    );
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    assert_eq!(opened["outcome"], "Ready");
+    assert_eq!(opened["vault_format"], 2);
+    let fragment = note(&tmp, "paid.txt", b"Amount paid USD 2.00\n");
+    let (code, published) = run(&[
+        "fragment",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "paid",
+        "--fragment",
+        fragment.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{published}");
+    assert_eq!(published["candidate_count"], 1);
+    assert_eq!(published["preservation"], "preserved");
+    let (code, listed) = run(&["candidates", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["candidates"].as_array().unwrap().len(), 1);
+    let (code, late) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "paid",
+        "--generation",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{late}");
+    assert_eq!(late["outcome"], "AlreadyCommitted");
+    assert_eq!(late["preservation"], "preserved");
+    let (code, fragment_late) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "paid",
+        "--generation",
+        "1",
+        "--kind",
+        "fragment",
+    ]);
+    assert_eq!(code, 0, "{fragment_late}");
+    assert_eq!(fragment_late["outcome"], "AlreadyCommitted");
+    assert_eq!(fragment_late["cancel_applied"], false);
+    assert_eq!(header_user_version(&vault.join("vault.db")), 2);
+    assert_eq!(
+        ro(&vault, "SELECT value FROM meta WHERE key='schema_version';"),
+        "1"
+    );
+
+    let checkpoint = tmp.path().join("v2-late.json");
+    let late_file = note(&tmp, "late.txt", b"Amount paid USD 3.00\n");
+    let mut child = Stopped::spawn(&[
+        "fragment",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "late",
+        "--fragment",
+        late_file.to_str().unwrap(),
+        "--stop-at",
+        "before_publish",
+        "--checkpoint",
+        checkpoint.to_str().unwrap(),
+    ]);
+    wait_stopped(child.child(), &checkpoint);
+    let (code, queried) = run(&["candidates", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{queried}");
+    assert_eq!(queried["candidates"].as_array().unwrap().len(), 1);
+    let (code, wrong) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "late",
+        "--generation",
+        "1",
+    ]);
+    assert_eq!(code, 16, "{wrong}");
+    assert_eq!(wrong["reason"], "command_kind_conflict");
+    assert!(!vault.join("control").join("late").exists());
+    let (code, pending) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "late",
+        "--generation",
+        "1",
+        "--kind",
+        "fragment",
+    ]);
+    assert_eq!(code, 0, "{pending}");
+    assert_eq!(pending["outcome"], "CancelPending");
+    assert_eq!(
+        fs::read_to_string(vault.join("control").join("late")).unwrap(),
+        "cancel\ngeneration=1\nkind=fragment\n"
+    );
+    kill_stopped(child.child());
+    child.reap();
+
+    let vault = tmp.path().join("split");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{body}");
+    let source = note(&tmp, "split.txt", b"synthetic-split\n");
+    let (code, imported) = run(&[
+        "import",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "keep",
+        "--media-type",
+        "text/plain",
+        "--source",
+        source.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{imported}");
+    let (code, opened) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{opened}");
+    fs::write(vault.join("staging").join("keep.bin"), b"stage").unwrap();
+    fs::write(vault.join("journal").join(".keep.json.tmp"), b"tmp").unwrap();
+    leave_wal_frames(&vault.join("vault.db"), "PRAGMA user_version=2;");
+    assert_eq!(header_user_version(&vault.join("vault.db")), 1);
+    assert_eq!(ro(&vault, "PRAGMA user_version;"), "2");
+    assert_eq!(
+        ro(
+            &vault,
+            "SELECT count(*) FROM meta WHERE key='vault_format';"
+        ),
+        "0"
+    );
+    let sealed = vault_files(&vault);
+    let lock_bytes = fs::read(vault.join("writer.lock")).unwrap();
+    let sources = ro(&vault, "SELECT count(*) FROM sources;");
+    for command in ["open", "verify", "recover"] {
+        let (code, body) = run(&[command, "--vault", vault.to_str().unwrap()]);
+        assert_eq!(code, 14, "{command} {body}");
+        assert_eq!(body["reason"], "format_inconsistent");
+        assert_eq!(body["outcome"], "VersionUnsupported");
+        assert_eq!(body["schema_version_found"], 2);
+        assert_eq!(body["header_user_version"], 1);
+        assert!(body["vault_format_seen"].is_null(), "{body}");
+        assert_eq!(body["new_effect"], false);
+    }
+    for args in [
+        vec![
+            "cancel",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            "keep",
+            "--generation",
+            "1",
+        ],
+        vec![
+            "cancel",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--command-id",
+            "keep",
+            "--generation",
+            "1",
+            "--kind",
+            "fragment",
+        ],
+    ] {
+        let (code, body) = run(&args);
+        assert_eq!(code, 14, "{} {body}", args[5]);
+        assert_eq!(body["reason"], "format_inconsistent");
+        assert_ne!(body["outcome"], "AlreadyCommitted");
+        assert!(!vault.join("control").join("keep").exists());
+    }
+    assert_eq!(vault_files(&vault), sealed);
+    assert_eq!(fs::read(vault.join("writer.lock")).unwrap(), lock_bytes);
+    assert_eq!(header_user_version(&vault.join("vault.db")), 1);
+    assert_eq!(ro(&vault, "PRAGMA user_version;"), "2");
+    assert_eq!(ro(&vault, "SELECT count(*) FROM sources;"), sources);
+    assert_eq!(
+        fs::read(vault.join("staging").join("keep.bin")).unwrap(),
+        b"stage"
+    );
+    assert_eq!(
+        fs::read(vault.join("journal").join(".keep.json.tmp")).unwrap(),
+        b"tmp"
+    );
+    let _shm_is_not_a_domain_write = vault.join("vault.db-shm").exists();
+
+    let _held = hold_flock(&vault.join("writer.lock"));
+    let (code, queried) = run(&["candidates", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 14, "{queried}");
+    assert_eq!(queried["reason"], "format_inconsistent");
+    assert_ne!(code, 11);
+    let (code, blocked) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "keep",
+        "--generation",
+        "1",
+    ]);
+    assert_eq!(code, 14, "{blocked}");
+    assert_eq!(blocked["reason"], "format_inconsistent");
+    assert_ne!(blocked["outcome"], "AlreadyCommitted");
+    let (code, blocked) = run(&[
+        "cancel",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "keep",
+        "--generation",
+        "1",
+        "--kind",
+        "fragment",
+    ]);
+    assert_eq!(code, 14, "{blocked}");
+    assert_eq!(blocked["reason"], "format_inconsistent");
+    assert_eq!(blocked["slice"], "T1");
+    assert!(!vault.join("control").join("keep").exists());
+    assert_eq!(vault_files(&vault), sealed);
+    assert_eq!(fs::read(vault.join("writer.lock")).unwrap(), lock_bytes);
+    drop(_held);
+
+    let vault = tmp.path().join("unknown");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "2"]);
+    assert_eq!(code, 0, "{body}");
+    let source = note(&tmp, "unknown.txt", b"synthetic-unknown\n");
+    let (code, imported) = run(&[
+        "import",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "keep",
+        "--media-type",
+        "text/plain",
+        "--source",
+        source.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{imported}");
+    leave_wal_frames(&vault.join("vault.db"), "PRAGMA user_version=4;");
+    let sealed = vault_files(&vault);
+    assert_eq!(header_user_version(&vault.join("vault.db")), 2);
+    assert_eq!(ro(&vault, "PRAGMA user_version;"), "4");
+    let (code, body) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 14, "{body}");
+    assert_eq!(body["reason"], "newer_schema");
+    assert_eq!(body["schema_version_found"], 4);
+    assert_eq!(vault_files(&vault), sealed);
+    assert_eq!(header_user_version(&vault.join("vault.db")), 2);
+    assert_eq!(ro(&vault, "PRAGMA user_version;"), "4");
+    assert_eq!(ro(&vault, "SELECT count(*) FROM sources;"), "1");
+
+    let vault = tmp.path().join("meta");
+    let (code, body) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "2"]);
+    assert_eq!(code, 0, "{body}");
+    let source = note(&tmp, "meta.txt", b"synthetic-meta\n");
+    let (code, imported) = run(&[
+        "import",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "keep",
+        "--media-type",
+        "text/plain",
+        "--source",
+        source.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{imported}");
+    fs::write(vault.join("staging").join("keep.bin"), b"stage").unwrap();
+    leave_wal_frames(
+        &vault.join("vault.db"),
+        "UPDATE meta SET value='9' WHERE key='vault_format';",
+    );
+    let sealed = vault_files(&vault);
+    assert_eq!(header_user_version(&vault.join("vault.db")), 2);
+    assert_eq!(ro(&vault, "PRAGMA user_version;"), "2");
+    assert_eq!(
+        ro(&vault, "SELECT value FROM meta WHERE key='vault_format';"),
+        "9"
+    );
+    assert_eq!(
+        sql_uri(
+            &vault.join("vault.db"),
+            "mode=ro&immutable=1",
+            "SELECT value FROM meta WHERE key='vault_format';"
+        ),
+        "2"
+    );
+    assert_eq!(
+        ro(&vault, "SELECT value FROM meta WHERE key='schema_version';"),
+        "1"
+    );
+    let (code, body) = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 14, "{body}");
+    assert_eq!(body["reason"], "vault_format_unverified");
+    assert_eq!(vault_files(&vault), sealed);
+    assert_eq!(
+        ro(&vault, "SELECT value FROM meta WHERE key='vault_format';"),
+        "9"
+    );
+    assert_eq!(
+        sql_uri(
+            &vault.join("vault.db"),
+            "mode=ro&immutable=1",
+            "SELECT value FROM meta WHERE key='vault_format';"
+        ),
+        "2"
+    );
+    assert_eq!(
+        fs::read(vault.join("staging").join("keep.bin")).unwrap(),
+        b"stage"
+    );
+    assert_eq!(ro(&vault, "SELECT count(*) FROM sources;"), "1");
+}
+
+fn ro(vault: &Path, statement: &str) -> String {
+    sql_uri(&vault.join("vault.db"), "mode=ro", statement)
+}
+
+fn leave_wal_frames(db: &Path, sql: &str) {
+    let ready = std::env::temp_dir().join(format!(
+        "subvault-wal-ready-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut child = Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"
+import sqlite3, sys, time
+db, ready, sql = sys.argv[1:]
+con = sqlite3.connect(db)
+con.execute("PRAGMA wal_autocheckpoint=0")
+con.executescript(sql)
+con.commit()
+open(ready, "w").write("ready")
+time.sleep(30)
+"#,
+        )
+        .arg(db)
+        .arg(&ready)
+        .arg(sql)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    loop {
+        if ready.is_file() {
+            break;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("external wal helper exited before its frames were visible: {status}");
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            panic!("external wal helper did not commit");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success(),
+        "stopping the helper keeps it from checkpointing on close; this is not a power-loss proof"
+    );
+    let _ = child.wait();
+    let _ = fs::remove_file(&ready);
+}
+
+struct Flock {
+    child: Option<std::process::Child>,
+}
+
+impl Flock {
+    fn hold(lock: &Path) -> Self {
+        let ready = std::env::temp_dir().join(format!(
+            "subvault-flock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(
+                r#"
+import fcntl, sys, time
+handle = open(sys.argv[1], "a+")
+fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+open(sys.argv[2], "w").write("ready")
+time.sleep(30)
+"#,
+            )
+            .arg(lock)
+            .arg(&ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        loop {
+            if ready.is_file() {
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("flock helper exited: {status}");
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                let _ = child.kill();
+                panic!("flock helper did not take the lock");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_file(&ready);
+        Self { child: Some(child) }
+    }
+}
+
+impl Drop for Flock {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = Command::new("kill")
+                .args(["-KILL", &child.id().to_string()])
+                .status();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn hold_flock(lock: &Path) -> Flock {
+    Flock::hold(lock)
 }

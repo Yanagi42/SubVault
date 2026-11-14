@@ -69,7 +69,8 @@ pub fn query_candidates(vault: &Path, source_id: Option<String>) -> Report {
 }
 
 fn require_body_format(vault: &Path) -> Result<(), Fail> {
-    match super::read_vault_format(vault)? {
+    super::guard_vault(vault)?;
+    match super::accept_wal_format(&vault.join("vault.db"))? {
         1 => Err(needs_upgrade()),
         2 => Ok(()),
         version => Err(
@@ -113,6 +114,11 @@ pub fn cancel_fragment(req: CancelRequest) -> Result<Report, Fail> {
     };
     let _lock = lock;
     super::guard_vault(&req.vault)?;
+    match super::accept_wal_format(&req.vault.join("vault.db")) {
+        Ok(1) => return Err(needs_upgrade().extra("cancel_applied", json!(false))),
+        Ok(_) => {}
+        Err(fail) => return Err(fail.extra("cancel_applied", json!(false))),
+    }
     let conn = super::open_writer(&req.vault)?;
     if let Some(existing) =
         store::command(&conn, &req.command_id).map_err(|err| unseen_db(err, "command_lookup"))?
@@ -811,6 +817,7 @@ fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fa
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|err| unseen_db(err, "candidates_open"))?;
+    super::accept_connection_format(&vault.join("vault.db"), &conn)?;
     let schema = store::meta(&conn, "body_schema").map_err(|err| unseen_db(err, "body_schema"))?;
     if schema.is_none() {
         let mut body = body_outcome("Candidates");
@@ -1674,6 +1681,11 @@ fn cancel_while_busy(req: &CancelRequest) -> Result<Report, Fail> {
     }
     if journal.generation != req.generation {
         return Err(refused("generation_mismatch").extra("cancel_applied", json!(false)));
+    }
+    match super::accept_wal_format(&req.vault.join("vault.db")) {
+        Ok(1) => return Err(needs_upgrade().extra("cancel_applied", json!(false))),
+        Ok(_) => {}
+        Err(fail) => return Err(fail.extra("cancel_applied", json!(false))),
     }
     write_control(&req.vault, &req.command_id, req.generation, "fragment")?;
     let mut body = body_outcome("CancelPending");

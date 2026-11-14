@@ -1284,6 +1284,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
         None => return cancel_without_lock(&req),
     };
     let _lock = lock;
+    accept_wal_format(&req.vault.join("vault.db"))?;
     let conn = open_writer(&req.vault)?;
     if let Some(existing) =
         store::command(&conn, &req.command_id).map_err(|err| unseen_db(err, "command_lookup"))?
@@ -1359,11 +1360,6 @@ fn guard_vault(path: &Path) -> Result<i64, Fail> {
     Ok(magic)
 }
 
-fn read_vault_format(path: &Path) -> Result<i64, Fail> {
-    guard_vault(path)?;
-    inspect_version_readonly(path)
-}
-
 fn open_session(path: &Path) -> Result<Session, Fail> {
     let magic = guard_vault(path)?;
     let lock = lockfile::VaultLock::try_acquire(&path.join("writer.lock"))
@@ -1371,6 +1367,7 @@ fn open_session(path: &Path) -> Result<Session, Fail> {
         .ok_or_else(|| {
             Fail::new(EXIT_LOCKED, "Locked", "writer_busy").extra("created_new_vault", json!(false))
         })?;
+    accept_wal_format(&path.join("vault.db"))?;
     let conn = open_writer(path)?;
     Ok(Session {
         root: path.to_path_buf(),
@@ -1516,6 +1513,122 @@ fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
 /// Version inspection only. immutable=1 does not see a commit that is still in the WAL.
 fn readonly_uri(path: &Path) -> Result<String, Fail> {
     file_uri(path, "mode=ro&immutable=1")
+}
+
+/// Main-file header, WAL-visible version, and the meta that version needs.
+/// Read-only: no writer configuration, no cleanup, and no checkpoint.
+/// A caller about to open a writer already holds `writer.lock`. A query or a
+/// busy cancel uses the snapshot it already opened and does not take that lock.
+/// This open may create or touch `-shm`. It is not a claim that the directory
+/// received no files.
+fn accept_wal_format(db: &Path) -> Result<i64, Fail> {
+    // No WAL frames means the main file is the effective database. Skipping the
+    // extra open avoids creating an empty `-wal` on a checkpointed vault.
+    let mut wal_name = db.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let frames = fs::metadata(Path::new(&wal_name))
+        .map(|meta| meta.is_file() && meta.len() > 0)
+        .unwrap_or(false);
+    if !frames {
+        let (header, format, schema) = visible_main_format(db)?;
+        return judge_format(header, header, format.as_deref(), schema.as_deref());
+    }
+    let uri = wal_visible_uri(db)?;
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_unreadable")
+            .extra("created_new_vault", json!(false))
+    })?;
+    accept_connection_format(db, &conn)
+}
+
+fn accept_connection_format(db: &Path, conn: &Connection) -> Result<i64, Fail> {
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
+    let (header, _, _) = visible_main_format(db)?;
+    let (effective, format, schema) = effective_view(conn)?;
+    judge_format(header, effective, format.as_deref(), schema.as_deref())
+}
+
+fn effective_view(conn: &Connection) -> Result<(i64, Option<String>, Option<String>), Fail> {
+    let version = store::user_version(conn).map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "user_version_unreadable")
+            .extra("created_new_vault", json!(false))
+    })?;
+    let format = store::meta(conn, "vault_format").map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
+            .extra("created_new_vault", json!(false))
+    })?;
+    let schema = store::meta(conn, "schema_version").map_err(|_| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
+            .extra("created_new_vault", json!(false))
+    })?;
+    Ok((version, format, schema))
+}
+
+fn judge_format(
+    header: i64,
+    effective: i64,
+    format: Option<&str>,
+    schema: Option<&str>,
+) -> Result<i64, Fail> {
+    if effective > 2 {
+        return Err(
+            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
+                .extra("schema_version_found", json!(effective))
+                .extra("created_new_vault", json!(false)),
+        );
+    }
+    if effective != 1 && effective != 2 {
+        return Err(
+            Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "unexpected_user_version")
+                .extra("schema_version_found", json!(effective))
+                .extra("created_new_vault", json!(false)),
+        );
+    }
+    if header != effective {
+        let seen = match format {
+            Some(value) => json!(value),
+            None => Value::Null,
+        };
+        return Err(
+            Fail::new(EXIT_VERSION, "VersionUnsupported", "format_inconsistent")
+                .extra("schema_version_found", json!(effective))
+                .extra("header_user_version", json!(header))
+                .extra("vault_format_seen", seen)
+                .extra("created_new_vault", json!(false)),
+        );
+    }
+    if effective == 1 {
+        if schema != Some("1") {
+            return Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "schema_mismatch")
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
+        if format.is_some() && format != Some("1") {
+            return Err(Fail::new(
+                EXIT_VERSION,
+                "VersionUnsupported",
+                "vault_format_unverified",
+            )
+            .extra("schema_version_found", json!(1))
+            .extra("created_new_vault", json!(false)));
+        }
+        return Ok(1);
+    }
+    if format != Some("2") || schema != Some("1") {
+        return Err(Fail::new(
+            EXIT_VERSION,
+            "VersionUnsupported",
+            "vault_format_unverified",
+        )
+        .extra("schema_version_found", json!(2))
+        .extra("created_new_vault", json!(false)));
+    }
+    Ok(2)
 }
 
 /// Command lookup. mode=ro without immutable sees a committed row while the writer still holds the lock.
@@ -1962,6 +2075,7 @@ fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "generation_mismatch")
             .extra("cancel_applied", json!(false)));
     }
+    accept_wal_format(&req.vault.join("vault.db"))?;
     write_control(&req.vault, &req.command_id, req.generation, &req.kind)?;
     let mut body = honesty("CancelPending");
     body.insert("command_id".into(), json!(req.command_id));
@@ -1994,6 +2108,7 @@ fn read_committed(root: &Path, command_id: &str) -> Result<Option<CommandRow>, F
     )
     .map_err(|err| uncertain(command_id, "wal_open", &err.to_string()))?;
     let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
+    accept_connection_format(&db, &conn)?;
     store::command(&conn, command_id)
         .map_err(|err| uncertain(command_id, "wal_query", &err.to_string()))
 }
