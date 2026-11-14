@@ -59,38 +59,52 @@ sha256sum "$bin" >"$out/binary.sha256"
 "$bin" version >"$out/version.json"
 
 python3 - "$out/licenses" <<'PY'
-import json, os, shutil, subprocess, sys
+import os, shutil, subprocess, sys
 dest = sys.argv[1]
-meta = json.loads(subprocess.check_output(["cargo", "metadata", "--offline", "--format-version", "1"]))
-root_id = next(p["id"] for p in meta["packages"] if p["name"] == "subvault" and p["source"] is None)
-nodes = {n["id"]: n for n in next(r["nodes"] for r in meta["resolve"]["root"] if r["id"] == root_id)}
-wanted = set(nodes) - {root_id}
-lines = []
-for pkg in sorted(meta["packages"], key=lambda p: (p["name"], p["version"])):
-    if pkg["id"] not in wanted:
+registry = "/usr/local/cargo/registry/src"
+regs = [os.path.join(registry, name) for name in os.listdir(registry) if name.startswith("index.crates.io")]
+tree = subprocess.check_output(["cargo", "tree", "--offline", "--locked", "--prefix", "none"], text=True)
+seen = []
+for line in tree.splitlines():
+    line = line.strip()
+    if not line or line.startswith("subvault") or line.endswith("(*)"):
         continue
-    license_name = pkg.get("license") or ""
-    lines.append(f"{pkg['name']} {pkg['version']} {license_name}")
-    folder = os.path.join(dest, f"{pkg['name']}-{pkg['version']}")
+    name, version = line.rsplit(" v", 1)
+    if (name, version) not in seen:
+        seen.append((name, version))
+lines = []
+sqlite = None
+for name, version in seen:
+    src = next((os.path.join(reg, f"{name}-{version}") for reg in regs if os.path.isdir(os.path.join(reg, f"{name}-{version}"))), None)
+    if src is None:
+        raise SystemExit(f"resolved crate is not in the local registry: {name} {version}")
+    license_field = ""
+    cargo_toml = os.path.join(src, "Cargo.toml")
+    for raw in open(cargo_toml, encoding="utf-8", errors="replace"):
+        if raw.startswith("license = "):
+            license_field = raw.split("=", 1)[1].strip().strip('"').strip("'")
+            break
+        if raw.startswith("license="):
+            license_field = raw.split("=", 1)[1].strip().strip('"').strip("'")
+            break
+    lines.append(f"{name} {version} {license_field}")
+    folder = os.path.join(dest, f"{name}-{version}")
     os.makedirs(folder, exist_ok=True)
-    src = os.path.dirname(pkg["manifest_path"])
     copied = False
-    for name in os.listdir(src):
-        if name.upper().startswith("LICENSE") or name.upper().startswith("COPYING"):
-            shutil.copy2(os.path.join(src, name), os.path.join(folder, name))
+    for entry in os.listdir(src):
+        if entry.upper().startswith("LICENSE") or entry.upper().startswith("COPYING"):
+            shutil.copy2(os.path.join(src, entry), os.path.join(folder, entry))
             copied = True
     if not copied:
-        open(os.path.join(folder, "NO_LICENSE_FILE"), "w").write(license_name + "\n")
+        raise SystemExit(f"no license file in {src}")
+    if name == "libsqlite3-sys":
+        sqlite = os.path.join(src, "sqlite3", "sqlite3.h")
 open(os.path.join(dest, "packages.txt"), "w").write("\n".join(lines) + "\n")
-sqlite = None
-for pkg in meta["packages"]:
-    if pkg["name"] == "libsqlite3-sys" and pkg["id"] in wanted:
-        sqlite = os.path.join(os.path.dirname(pkg["manifest_path"]), "sqlite3", "sqlite3.h")
-if sqlite and os.path.isfile(sqlite):
-    text = open(sqlite, encoding="utf-8", errors="replace").read().splitlines()
-    version = next((line for line in text if "SQLITE_VERSION " in line and "#define" in line), "")
-    notice = "\n".join(text[:12])
-    open(os.path.join(dest, "sqlite-amalgamation-notice.txt"), "w").write(notice + "\n\n" + version + "\n")
+if not sqlite or not os.path.isfile(sqlite):
+    raise SystemExit("bundled sqlite3.h was not found")
+text = open(sqlite, encoding="utf-8", errors="replace").read().splitlines()
+version = next(line for line in text if "#define SQLITE_VERSION " in line)
+open(os.path.join(dest, "sqlite-amalgamation-notice.txt"), "w").write("\n".join(text[:12]) + "\n\n" + version + "\n")
 PY
 
 enospc_note=$out/enospc.txt
