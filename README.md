@@ -123,7 +123,7 @@ scripts/run-t1-evidence.sh
 
 同 logical key 已经成功时，另一次提交返回 `AlreadyPublished`，不新增候选。失败和取消不写入永久失败；下一次提交使用新的 attempt。取消或晚到的发布不写入新的可用候选，已成功的候选和原件字节保留。来源行已经提交之后，这一次发布失败不会把该来源改写成 `not_preserved`；回执里的 `preservation` 是 `preserved`，`candidates_published` 是 false。状态行没有写上时，回执标明 `attempt_update` 或 `run_update` 为 `failed`，不把仍在 `running` 的 attempt 说成已经清理。来源提交之前的失败，包括 `body_schema`，仍然是 `not_preserved`。`user_version` 保持 1。正文表由第一次成功路径上的事务添加，`meta.body_schema` 记为 `1`。这步失败会回滚，不改已有的 T1 行，也不抬高 `user_version`。已有 T1 库仍按原来的打开规则工作。PDF、OCR、T3 采纳和其它平台都没有做。
 
-`candidates` 只读查询。它不建表，也不写库。
+`candidates` 只读查询。它不建表，也不写库。候选的 `value_json` 或 `locator_json` 读不出来时，不返回 `value` 为 null 的候选。运行配置或 attempt 明细读不出来时同样留下告警。这些都是退出码 12，原件字节不改。
 
 ## 这轮没有做
 

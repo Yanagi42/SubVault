@@ -1131,6 +1131,76 @@ fn a_failed_status_write_is_not_reported_as_cleanup() {
     assert_eq!(object_bytes(&vault, &first), old_bytes);
 }
 
+#[test]
+fn a_damaged_stored_record_is_not_a_null_candidate() {
+    let tmp = Tmp::new("record");
+    let vault = init(&tmp);
+    let keep = tmp.path().join("keep.txt");
+    write_file(&keep, b"Amount paid USD 15.99\n");
+    let (code, first) = fragment(&vault, "keep", &keep);
+    assert_eq!(code, 0, "{first}");
+    let keep_bytes = object_bytes(&vault, &first);
+    let other = tmp.path().join("other.txt");
+    write_file(&other, b"Amount paid USD 6.00\n");
+    let (code, second) = fragment(&vault, "other", &other);
+    assert_eq!(code, 0, "{second}");
+    let other_bytes = object_bytes(&vault, &second);
+    let candidate_id = second["candidate_ids"][0].as_str().unwrap();
+    let run_id = second["run_id"].as_str().unwrap();
+    let attempt_id = second["attempt_id"].as_str().unwrap();
+    sql(
+        &vault,
+        &format!("UPDATE candidates SET value_json='{{', locator_json='{{' WHERE candidate_id='{candidate_id}';"),
+    );
+    sql(
+        &vault,
+        &format!("UPDATE extraction_runs SET config_json='{{' WHERE run_id='{run_id}';"),
+    );
+    sql(
+        &vault,
+        &format!(
+            "UPDATE extraction_attempts SET detail_json='{{' WHERE attempt_id='{attempt_id}';"
+        ),
+    );
+    let (code, listed) = run(&["candidates", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 12, "{listed}");
+    assert_eq!(listed["outcome"], "RecoveryRequired");
+    assert_eq!(listed["read_only"], true);
+    let rows = listed["candidates"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["candidate_id"], first["candidate_ids"][0]);
+    assert_eq!(rows[0]["excerpt"], "Amount paid USD 15.99");
+    assert!(rows.iter().all(|row| !row["value"].is_null()));
+    let durings: Vec<_> = listed["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|alert| alert["during"].as_str().unwrap())
+        .collect();
+    assert!(durings.contains(&"value_json"));
+    assert!(durings.contains(&"locator_json"));
+    assert!(durings.contains(&"config_json"));
+    assert!(durings.contains(&"detail_json"));
+    assert!(listed["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|alert| { alert["code"] == "stored_record_unreadable" }));
+    let damaged_run = listed["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["run_id"] == run_id)
+        .unwrap();
+    assert!(damaged_run.get("config").is_none());
+    assert!(damaged_run["attempts"][0].get("detail").is_none());
+    assert_eq!(object_bytes(&vault, &first), keep_bytes);
+    assert_eq!(object_bytes(&vault, &second), other_bytes);
+    let opened = run(&["open", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(opened.0, 0, "{}", opened.1);
+    assert_eq!(opened.1["outcome"], "Ready");
+}
+
 fn wait_stopped(child: &mut std::process::Child, checkpoint: &Path) {
     let start = Instant::now();
     loop {

@@ -837,8 +837,33 @@ fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fa
         if !intact {
             continue;
         }
-        let value: Value = serde_json::from_str(&row.7).unwrap_or(Value::Null);
-        let locator: Value = serde_json::from_str(&row.8).unwrap_or(Value::Null);
+        let value = match serde_json::from_str::<Value>(&row.7) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                damaged = true;
+                alerts.push(json!({
+                    "code": "stored_record_unreadable",
+                    "during": "value_json",
+                    "candidate_id": row.0,
+                }));
+                None
+            }
+        };
+        let locator = match serde_json::from_str::<Value>(&row.8) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                damaged = true;
+                alerts.push(json!({
+                    "code": "stored_record_unreadable",
+                    "during": "locator_json",
+                    "candidate_id": row.0,
+                }));
+                None
+            }
+        };
+        let (Some(value), Some(locator)) = (value, locator) else {
+            continue;
+        };
         candidates.push(json!({
             "candidate_id": row.0,
             "run_id": row.1,
@@ -863,7 +888,7 @@ fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fa
         }));
     }
     drop(stmt);
-    let runs = list_runs(&conn, source_id)?;
+    let runs = list_runs(&conn, source_id, &mut alerts, &mut damaged)?;
     let mut body = body_outcome("Candidates");
     body.insert("new_effect".into(), json!(false));
     body.insert("read_only".into(), json!(true));
@@ -882,7 +907,12 @@ fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fa
     Ok((EXIT_OK, Value::Object(body)))
 }
 
-fn list_runs(conn: &Connection, source_id: Option<&str>) -> Result<Value, Fail> {
+fn list_runs(
+    conn: &Connection,
+    source_id: Option<&str>,
+    alerts: &mut Vec<Value>,
+    damaged: &mut bool,
+) -> Result<Value, Fail> {
     let mut stmt = conn
         .prepare(
             "SELECT run_id, logical_key, source_id, source_version_id, extractor, extractor_version, normalization, join_version, rules_version, config_json, status FROM extraction_runs WHERE (?1 IS NULL OR source_id = ?1) ORDER BY run_id",
@@ -908,8 +938,8 @@ fn list_runs(conn: &Connection, source_id: Option<&str>) -> Result<Value, Fail> 
     let mut runs = Vec::new();
     for row in rows {
         let row = row.map_err(|err| unseen_db(err, "runs"))?;
-        let attempts = list_attempts(conn, &row.0)?;
-        runs.push(json!({
+        let attempts = list_attempts(conn, &row.0, alerts, damaged)?;
+        let mut run = json!({
             "run_id": row.0,
             "logical_key": row.1,
             "source_id": row.2,
@@ -919,15 +949,35 @@ fn list_runs(conn: &Connection, source_id: Option<&str>) -> Result<Value, Fail> 
             "normalization": row.6,
             "join": row.7,
             "rules_version": row.8,
-            "config": serde_json::from_str::<Value>(&row.9).unwrap_or(Value::Null),
             "status": row.10,
             "attempts": attempts
-        }));
+        });
+        match serde_json::from_str::<Value>(&row.9) {
+            Ok(config) => {
+                run.as_object_mut()
+                    .expect("run object")
+                    .insert("config".into(), config);
+            }
+            Err(_) => {
+                *damaged = true;
+                alerts.push(json!({
+                    "code": "stored_record_unreadable",
+                    "during": "config_json",
+                    "run_id": row.0,
+                }));
+            }
+        }
+        runs.push(run);
     }
     Ok(Value::Array(runs))
 }
 
-fn list_attempts(conn: &Connection, run_id: &str) -> Result<Value, Fail> {
+fn list_attempts(
+    conn: &Connection,
+    run_id: &str,
+    alerts: &mut Vec<Value>,
+    damaged: &mut bool,
+) -> Result<Value, Fail> {
     let mut stmt = conn
         .prepare(
             "SELECT attempt_id, attempt_no, command_id, status, published, detail_json FROM extraction_attempts WHERE run_id = ?1 ORDER BY attempt_no",
@@ -935,19 +985,43 @@ fn list_attempts(conn: &Connection, run_id: &str) -> Result<Value, Fail> {
         .map_err(|err| unseen_db(err, "attempts"))?;
     let rows = stmt
         .query_map([run_id], |row| {
-            Ok(json!({
-                "attempt_id": row.get::<_, String>(0)?,
-                "attempt_no": row.get::<_, i64>(1)?,
-                "command_id": row.get::<_, String>(2)?,
-                "status": row.get::<_, String>(3)?,
-                "published": row.get::<_, i64>(4)? == 1,
-                "detail": serde_json::from_str::<Value>(&row.get::<_, String>(5)?).unwrap_or(Value::Null)
-            }))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
         })
         .map_err(|err| unseen_db(err, "attempts"))?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.map_err(|err| unseen_db(err, "attempts"))?);
+        let row = row.map_err(|err| unseen_db(err, "attempts"))?;
+        let mut attempt = json!({
+            "attempt_id": row.0,
+            "attempt_no": row.1,
+            "command_id": row.2,
+            "status": row.3,
+            "published": row.4 == 1
+        });
+        match serde_json::from_str::<Value>(&row.5) {
+            Ok(detail) => {
+                attempt
+                    .as_object_mut()
+                    .expect("attempt object")
+                    .insert("detail".into(), detail);
+            }
+            Err(_) => {
+                *damaged = true;
+                alerts.push(json!({
+                    "code": "stored_record_unreadable",
+                    "during": "detail_json",
+                    "attempt_id": row.0,
+                }));
+            }
+        }
+        out.push(attempt);
     }
     Ok(Value::Array(out))
 }
