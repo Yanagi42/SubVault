@@ -133,7 +133,7 @@ fn load_sources(vault: &Path) -> Result<Vec<SourceLine>, Fail> {
 enum ExportLink {
     Unset,
     NoneMatched,
-    Paths(Vec<String>),
+    Paths(Vec<(String, String)>),
 }
 
 impl ExportLink {
@@ -157,7 +157,7 @@ fn export_link(package: Option<&Path>, sources: &[SourceLine]) -> ExportLink {
     }
 }
 
-fn verified_originals(package: &Path, sources: &[SourceLine]) -> Vec<String> {
+fn verified_originals(package: &Path, sources: &[SourceLine]) -> Vec<(String, String)> {
     let mut paths = Vec::new();
     for source in sources {
         if !safe_object_id(&source.object_id) {
@@ -166,7 +166,7 @@ fn verified_originals(package: &Path, sources: &[SourceLine]) -> Vec<String> {
         let relative = format!("originals/{}", source.object_id);
         let path = package.join("originals").join(&source.object_id);
         if original_matches(&path, &source.content_sha256, source.byte_length) {
-            paths.push(relative);
+            paths.push((source.source_id.clone(), relative));
         }
     }
     paths
@@ -204,18 +204,49 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex_encode(&hasher.finalize())
 }
 
-fn push_conclusion(text: &mut String, facts: Option<&Vec<Value>>, link: &ExportLink) {
+fn push_conclusion(
+    text: &mut String,
+    facts: Option<&Vec<Value>>,
+    sources: &[SourceLine],
+    link: &ExportLink,
+) {
     text.push_str("当前结论\n");
     let rows: &[Value] = facts.map(Vec::as_slice).unwrap_or(&[]);
-    if rows.is_empty() {
+    let source_ids = conclusion_sources(rows, sources);
+    if source_ids.is_empty() {
         text.push_str("当前没有事实。没有可写的当前金额或服务期。\n");
     } else {
-        for fact in conclusion_order(rows) {
-            text.push_str(&conclusion_line(fact));
-            text.push('\n');
+        for source_id in &source_ids {
+            text.push_str(&format!("来源分组 source_id={}\n", show(source_id)));
+            let group = rows
+                .iter()
+                .filter(|fact| fact["source_id"].as_str() == Some(source_id))
+                .collect::<Vec<_>>();
+            if group.is_empty() {
+                text.push_str("这条来源没有当前金额或服务期。\n");
+            } else {
+                for fact in conclusion_order(&group) {
+                    text.push_str(&conclusion_line(fact));
+                    text.push('\n');
+                }
+                if group.len() > 1 {
+                    text.push_str("同一来源上的多条事实不代表已核同一笔支付。\n");
+                }
+            }
+            match link {
+                ExportLink::Paths(paths) => {
+                    let matched = paths.iter().find(|(id, _)| id == source_id);
+                    if let Some((_, path)) = matched {
+                        text.push_str(&format!("原件相对位置 {}\n", show(path)));
+                    } else {
+                        text.push_str("这条来源在给出的导出目录里没有对上的原件。\n");
+                    }
+                }
+                ExportLink::Unset | ExportLink::NoneMatched => {}
+            }
         }
-        if shares_source(rows) {
-            text.push_str("同一来源上的多条事实不代表已核同一笔支付。\n");
+        if source_ids.len() > 1 {
+            text.push_str("不同来源不是同一笔支付。\n");
         }
     }
     let payment_unverified =
@@ -238,16 +269,29 @@ fn push_conclusion(text: &mut String, facts: Option<&Vec<Value>>, link: &ExportL
         ExportLink::NoneMatched => {
             text.push_str("给出的导出目录里没有对上的原件，本单不写路径。\n");
         }
-        ExportLink::Paths(paths) => {
-            for path in paths {
-                text.push_str(&format!("原件相对位置 {}\n", show(path)));
-            }
+        ExportLink::Paths(_) => {
             text.push_str(
-                "上面的相对位置在关联的导出目录内，已核对文件存在且内容哈希与库中的收录标识一致。\n",
+                "上面写出的相对位置在关联的导出目录内，已核对文件存在且内容哈希与库中的收录标识一致。\n",
             );
         }
     }
     text.push_str("请按源码查看，程序不打开、不渲染 HTML。\n");
+}
+
+fn conclusion_sources(facts: &[Value], sources: &[SourceLine]) -> Vec<String> {
+    let mut ids = sources
+        .iter()
+        .map(|source| source.source_id.clone())
+        .collect::<Vec<_>>();
+    for fact in facts {
+        let Some(id) = fact["source_id"].as_str() else {
+            continue;
+        };
+        if !ids.iter().any(|kept| kept == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 fn conclusion_line(fact: &Value) -> String {
@@ -290,34 +334,20 @@ fn period_conclusion(value: &Value) -> String {
     }
 }
 
-fn conclusion_order(facts: &[Value]) -> Vec<&Value> {
+fn conclusion_order<'a>(facts: &[&'a Value]) -> Vec<&'a Value> {
     let mut amounts = Vec::new();
     let mut periods = Vec::new();
     let mut rest = Vec::new();
     for fact in facts {
         match fact["fact_type"].as_str() {
-            Some("stated_amount_paid") => amounts.push(fact),
-            Some("stated_service_period") => periods.push(fact),
-            _ => rest.push(fact),
+            Some("stated_amount_paid") => amounts.push(*fact),
+            Some("stated_service_period") => periods.push(*fact),
+            _ => rest.push(*fact),
         }
     }
     amounts.extend(periods);
     amounts.extend(rest);
     amounts
-}
-
-fn shares_source(facts: &[Value]) -> bool {
-    let mut seen = Vec::new();
-    for fact in facts {
-        let Some(id) = fact["source_id"].as_str() else {
-            continue;
-        };
-        if seen.iter().any(|kept: &String| kept == id) {
-            return true;
-        }
-        seen.push(id.to_string());
-    }
-    false
 }
 
 fn render(
@@ -342,7 +372,7 @@ fn render(
 这不是 Windows 界面。
 ",
     );
-    push_conclusion(&mut text, facts, link);
+    push_conclusion(&mut text, facts, sources, link);
     text.push_str(
         "\
 详单
@@ -358,7 +388,7 @@ fn render(
 显示文本不是原件切片。
 提取尝试的 attempt_published 只是库里的尝试标记。这份单没有发布库。
 这份只读打开可能让 SQLite 碰到 -shm。它不改已提交的逻辑数据、原件字节和决定记录。它不证明目录里没有新文件。
-记录顺序 事实按 source_id、fact_id。未成为事实的候选按 source_id、ordinal。决定按库内 rowid。recorded_at 是库里的整数，不是这份单编的时刻。
+记录顺序 每个来源先写自己的事实（source_id、fact_id），再写该来源未成为事实的候选（ordinal）。决定按库内 rowid。recorded_at 是库里的整数，不是这份单编的时刻。
 ",
     );
     if facts_body["slice"].as_str() == Some("T4-html") {
@@ -415,25 +445,64 @@ fn render(
     text.push_str(&format!("事实数 {fact_count}\n"));
     text.push_str(&format!("未成为事实的候选数 {rest}\n"));
     let mut record = 1usize;
-    if let Some(facts) = facts {
-        for fact in facts {
+    let fact_rows = facts.cloned().unwrap_or_default();
+    let candidate_rows = candidates.cloned().unwrap_or_default();
+    let mut seen_sources = Vec::new();
+    for source in sources {
+        seen_sources.push(source.source_id.clone());
+    }
+    for fact in &fact_rows {
+        if let Some(id) = fact["source_id"].as_str() {
+            if !seen_sources.iter().any(|kept| kept == id) {
+                seen_sources.push(id.to_string());
+            }
+        }
+    }
+    for source_id in &seen_sources {
+        let source_facts = fact_rows
+            .iter()
+            .filter(|fact| fact["source_id"].as_str() == Some(source_id))
+            .collect::<Vec<_>>();
+        let source_candidates = candidate_rows
+            .iter()
+            .filter(|row| row["source_id"].as_str() == Some(source_id.as_str()))
+            .filter(|row| {
+                row["candidate_id"]
+                    .as_str()
+                    .map(|id| !cited.iter().any(|kept| kept == id))
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        if source_facts.is_empty() && source_candidates.is_empty() {
+            continue;
+        }
+        text.push_str(&format!("来源分组 source_id={}\n", show(source_id)));
+        for fact in source_facts {
             push_fact(&mut text, record, fact, sources);
             record += 1;
         }
-    }
-    if let Some(candidates) = candidates {
-        for candidate in candidates {
-            let Some(id) = candidate["candidate_id"].as_str() else {
-                push_candidate(&mut text, record, candidate, sources);
-                record += 1;
-                continue;
-            };
-            if cited.iter().any(|kept| kept == id) {
-                continue;
-            }
+        for candidate in source_candidates {
             push_candidate(&mut text, record, candidate, sources);
             record += 1;
         }
+    }
+    for candidate in &candidate_rows {
+        let scoped = candidate["source_id"]
+            .as_str()
+            .map(|id| seen_sources.iter().any(|kept| kept == id))
+            .unwrap_or(false);
+        if scoped {
+            continue;
+        }
+        if candidate["candidate_id"]
+            .as_str()
+            .map(|id| cited.iter().any(|kept| kept == id))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        push_candidate(&mut text, record, candidate, sources);
+        record += 1;
     }
     text.push_str(
         "没有另存的未匹配文字。这份单不从原件再猜，也不把没写成候选的文字补成一条记录。\n",

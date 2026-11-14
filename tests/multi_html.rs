@@ -342,6 +342,102 @@ fn race(vault: &Path, left: &Path, right: &Path, left_id: &str, right_id: &str) 
     assert_ne!(right_body["reason"], "payload_conflict", "{right_body}");
 }
 
+#[test]
+fn review_keeps_each_source_amount_with_its_own_period() {
+    let tmp = Tmp::new("sheet");
+    let vault = init(&tmp);
+    let path_a = write_file(&tmp, "a.html", DOC_A.as_bytes());
+    let path_b = write_file(&tmp, "b.html", DOC_B.as_bytes());
+    let (code, first) = html(&vault, "sheet-a", &path_a);
+    assert_eq!(code, 0, "{first}");
+    let (code, second) = html(&vault, "sheet-b", &path_b);
+    assert_eq!(code, 0, "{second}");
+    let source_a = first["source_id"].as_str().unwrap();
+    let source_b = second["source_id"].as_str().unwrap();
+    let object_a = first["object_id"].as_str().unwrap();
+    let object_b = second["object_id"].as_str().unwrap();
+    let package = tmp.path.join("package");
+    let (code, exported) = run(&[
+        "export",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        package.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{exported}");
+    let sheet = tmp.path.join("review.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        package.to_str().unwrap(),
+        "--out",
+        sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    let text = fs::read_to_string(&sheet).unwrap();
+    let head = text.split("\n详单\n").next().unwrap();
+    let section_a = source_section(head, source_a, source_b);
+    let section_b = source_section(head, source_b, source_a);
+    assert!(
+        section_a.contains("当前记录金额 USD 15.99，与原件所写相同。"),
+        "{section_a}"
+    );
+    assert!(
+        section_a.contains("服务期 2026-09-01 至 2026-09-30。"),
+        "{section_a}"
+    );
+    assert!(section_a.find("当前记录金额").unwrap() < section_a.find("服务期").unwrap());
+    assert!(section_a.contains(&format!("原件相对位置 originals/{object_a}")));
+    assert!(!section_a.contains(object_b), "{section_a}");
+    assert!(
+        section_b.contains("当前记录金额 USD 15.99，与原件所写相同。"),
+        "{section_b}"
+    );
+    assert!(
+        section_b.contains("服务期 2024-01-02 至 2024-03-04。"),
+        "{section_b}"
+    );
+    assert!(section_b.find("当前记录金额").unwrap() < section_b.find("服务期").unwrap());
+    assert!(section_b.contains(&format!("原件相对位置 originals/{object_b}")));
+    assert!(!section_b.contains(object_a), "{section_b}");
+    let group_a = head
+        .find(&format!("来源分组 source_id={source_a}"))
+        .unwrap();
+    let group_b = head
+        .find(&format!("来源分组 source_id={source_b}"))
+        .unwrap();
+    if group_a < group_b {
+        assert!(head[group_a..].find("服务期 2026-09-01").unwrap() < group_b - group_a);
+    } else {
+        assert!(head[group_b..].find("服务期 2024-01-02").unwrap() < group_a - group_b);
+    }
+    assert!(head.contains("不同来源不是同一笔支付。"));
+    assert!(!head.contains("USD 8.00"));
+    assert!(!head.contains("USD 9.00"));
+    assert!(!text.contains(path_a.to_str().unwrap()));
+    assert_eq!(
+        fs::read(package.join("originals").join(object_a)).unwrap(),
+        DOC_A.as_bytes()
+    );
+    assert_eq!(
+        fs::read(package.join("originals").join(object_b)).unwrap(),
+        DOC_B.as_bytes()
+    );
+}
+
+fn source_section<'a>(head: &'a str, source_id: &str, other_id: &str) -> &'a str {
+    let marker = format!("来源分组 source_id={source_id}");
+    let start = head.find(&marker).unwrap();
+    let rest = &head[start..];
+    let other = format!("来源分组 source_id={other_id}");
+    match rest.find(&other) {
+        Some(end) => &rest[..end],
+        None => rest.split("不同来源不是同一笔支付。").next().unwrap(),
+    }
+}
+
 fn submit_until_stored(vault: &Path, command: &str, source: &Path) -> Value {
     for _ in 0..40 {
         let output = Command::new(bin())
