@@ -85,6 +85,8 @@ control/<command-id>
 
 SQLite 使用捆绑的 3.46.0，WAL，`synchronous=FULL`，`foreign_keys=ON`，`busy_timeout=0`。`init` 默认格式 1，主库 `user_version` 是 1。`init --format 2` 只新建一个隔离库，不改已有的格式 1 库。格式 2 在临时目录里写 `user_version=2` 和 `meta.vault_format=2`，`schema_version` 仍是 `1`。然后 `PRAGMA wal_checkpoint(TRUNCATE)` 必须成功且返回的 busy 是 0。再用和旧程序相同的 `immutable=1` 只读打开，确认主库能看见 `user_version` 2 和配套 meta，才把目录改名发布。检查点错误、busy 或这次核验失败都不发布，返回值不忽略。`immutable=1` 看不见还留在 WAL 里的页，所以只执行 `PRAGMA user_version=2` 不够。表是 `meta`、`objects`、`sources`、`occurrences`、`commands`。打开和取消在 `Connection::open` 之前先检查 `SQLite format 3` 文件头，避免 0 字节或坏文件被 SQLite 初始化成空库。写连接还要先拿到 `writer.lock`，再用能看见 WAL 的只读连接核对主库头、有效版本和必要 meta。查询和忙锁取消用自己的只读快照核对，不额外占这把锁。`schema_version` 仍是 `1`，不要求它和 `user_version` 相等。
 
+`init` 的最后一级已经是目录项时退出码 16，reason 是 `vault_path_exists`，`created_new_vault` 是 false，没有 `preservation`。普通文件、目录、已有库和符号链接都算，悬空符号链接和指回自己的链接也算。不跟随最后一级，不改链接，也不改它指到的文件、目录或库。这是发布前的目录项核对，不是并发下的无覆盖证明：核对之后才出现的名字仍可能让 `rename` 失败，本轮没有把那种失败改写成拒绝。只在这台 Linux 上核对。
+
 打开、`verify` 和 `recover` 走同一条内部路径：删除 `staging/` 里的临时文件以及 journal 的临时名，不删除 `objects/` 里的文件。journal 只有在对应命令行已经存在时才尝试标成 committed。标签写失败留在 `journal_label_update=failed`，不中断这份报告，也不把已提交的源改成未保全。某一个对象读失败、对象目录列不出来或未引用对象哈希读失败，同样不中断其余来源；读不出的来源不写 `preserved` 或 `not_preserved`。恢复不会根据对象文件名插入源或购买。未引用对象保持未引用，直到同一个 CommandId 带着匹配字节重试。恢复可以重复执行。
 
 journal 是一份字段表生成的 JSON。未知键被忽略。可选字段缺失和 JSON null 相同。进行中的 journal 可以还没有 `payload_fingerprint`；这表示哈希还没记下，不是已提交结果被二次套用。手改删掉指纹属于损坏，不按普通的双应用缺陷处理。成功回执若不是 JSON 对象，重放返回退出码 12，不另建一套回执模式。

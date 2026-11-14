@@ -243,9 +243,16 @@ pub fn init_vault(path: &Path, format: u8, hooks: Hooks) -> Report {
 }
 
 fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
-    if path.exists() {
-        return Err(Fail::new(EXIT_REJECTED, "Rejected", "vault_path_exists")
-            .extra("created_new_vault", json!(false)));
+    // exists() follows the final component, so a dangling or looping symlink
+    // looks absent. rename of the new directory then fails with ENOTDIR and
+    // was reported as NotPreserved. The directory entry itself is enough.
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            return Err(Fail::new(EXIT_REJECTED, "Rejected", "vault_path_exists")
+                .extra("created_new_vault", json!(false)));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io_fail(err, "init_stat").extra("created_new_vault", json!(false))),
     }
     let parent = path
         .parent()
