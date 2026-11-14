@@ -2,6 +2,7 @@ mod body;
 mod cli;
 mod engine;
 mod facts;
+mod file_identity;
 mod fsutil;
 mod ids;
 mod inspect;
@@ -11,6 +12,8 @@ mod lockfile;
 mod model;
 mod platform;
 mod store;
+#[cfg(windows)]
+mod windows_file_id;
 #[cfg(windows)]
 mod windows_lock;
 

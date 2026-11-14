@@ -5,8 +5,9 @@
 //! inode. Exclusive create and directory fsync still return their errors.
 //! Nothing here chooses a Windows lock, a file id, a cross-volume rename, or
 //! a UI session. The compile gate is `target_os = "linux"`. Android and other
-//! Unix targets stop here, before these calls. `windows_lock` is a separate
-//! `cfg(windows)` lock and is not called from this module.
+//! Unix targets stop here, before these calls. `windows_lock` and
+//! `windows_file_id` are separate `cfg(windows)` modules and are not called
+//! from this module.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!(
@@ -119,6 +120,37 @@ mod linux {
             return path.to_path_buf();
         }
         PathBuf::from(std::ffi::OsString::from_vec(trimmed.to_vec()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Write;
+
+        #[test]
+        fn hard_linked_names_share_device_and_inode_and_distinct_names_do_not() {
+            let dir = std::env::temp_dir().join(format!(
+                "subvault-file-id-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            fs::create_dir(&dir).expect("temp dir");
+            let upper = dir.join("Name");
+            let mut created = File::create(&upper).expect("create");
+            created.write_all(b"same-bytes").expect("write");
+            drop(created);
+            let linked = dir.join("other-name");
+            fs::hard_link(&upper, &linked).expect("hard link");
+            let lower = dir.join("name");
+            File::create(&lower).expect("lower name");
+            let id = directory_device_and_inode(&upper).expect("upper id");
+            assert_eq!(directory_device_and_inode(&linked).expect("link id"), id);
+            assert_ne!(directory_device_and_inode(&lower).expect("lower id"), id);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 }
 
