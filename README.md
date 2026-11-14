@@ -47,7 +47,7 @@ python3 synthetic/generate_corpus.py --check
 | --- | --- |
 | 0 | 完成、已提交过、已取消、取消已挂起，或打开后就绪 |
 | 2 | 用法错误 |
-| 3 | 有告警且引用没有悬空。对象路径被拒绝但规范路径上的字节仍完整，journal 标签没能改写，或来源报告已经列出之后扫描、清理、checkpoint 失败，都走这里。某一个托管对象、对象目录或未引用对象这次读不出，也走这里：读得出的源仍是 `preserved`，读不出的源不写保全结论。托管哈希已经相符但 `read --out` 失败同样是 3，`preservation=preserved`，`output_written=false`。`output_cleanup` 标明半成品是 `not_created`、`removed` 还是 `failed`；`output_written=false` 不等于删除成功。已提交命令的外部路径读不出或不是文件时，导入也用 3，outcome 是 `ExternalUnverified` |
+| 3 | 有告警且引用没有悬空。对象路径被拒绝但规范路径上的字节仍完整，journal 标签没能改写，或来源报告已经列出之后扫描、清理、checkpoint 失败，都走这里。某一个托管对象、对象目录或未引用对象这次读不出，也走这里：读得出的源仍是 `preserved`，读不出的源不写保全结论。托管哈希已经相符但 `read --out` 失败同样是 3，`preservation=preserved`，`output_written=false`。`output_cleanup` 标明半成品是 `not_created`、`removed` 还是 `failed`；`output_written=false` 不等于删除成功。已提交命令的外部路径读不出或不是文件时，导入也用 3，outcome 是 `ExternalUnverified`。`init` 在目录改名成功之后，父目录 `fsync` 失败也走这里：outcome 仍是 `Initialized`，`created_new_vault` 和 `published` 都是 true，`directory_durable` 是 false，reason 是 `directory_durability_unknown`。目录现在就在目标名上，不报未创建，也不报未保全。`export` 在包改名成功之后的父目录 `fsync` 失败同样是 3：包留在 `--out`，`output_written` 仍是 true，`completeness` 不变，`directory_durable` 是 false。这不是写失败，不删除已经改好名的包 |
 | 10 | 不是库。缺失路径不会被创建 |
 | 11 | 另一个进程持有写锁 |
 | 12 | 需要恢复：对象缺失或哈希不符、悬空引用、无法读取的 journal、成功回执不是 JSON 对象。单独 `read` 或重放某一个读不出的托管对象也是 12，`object_unreadable`，那条回执不写 `preservation` |
@@ -59,11 +59,11 @@ python3 synthetic/generate_corpus.py --check
 | 18 | 文件系统被识别为 NFS 或 SMB/CIFS |
 | 19 | 横幅内容已经读到，并且不是合成库横幅。不改写横幅文件 |
 | 20 | 请求的停止点没有到达 |
-| 21 | 这次还不能下保全结论。两路都不写 `preservation`，`new_effect` 为 null。未见历史：读不到 `vault.db` 是 `vault_unreadable`，`during` 是 `sqlite_header`；读不到横幅是 `banner_unreadable`，`during` 是 `banner`；锁、数据库打开、pragma、statfs、canonicalize 和来源目录查询是 `vault_unseen`，`during` 是该步骤，不编来源清单。这些都不是 `COMMIT` 返回了错误。真正的 `COMMIT` 返回错误之后，可见性查询也失败，reason 才是 `commit_visibility_unknown`，`during` 是 `after_commit_error`。这条没有实跑。`db_commit` 注入在 `COMMIT` 之前返回，是确定回滚，不是这条。查询成功时，看得到命令行是已提交，确定没有行是退出码 15。写者仍持锁时，取消若打不开那条能看见 WAL 的连接，或命令查询失败，也是 `commit_visibility_unknown`，`during` 是 `wal_open` 或 `wal_query`；那不是 `COMMIT` 返回错误，也没有单独让它失败。横幅内容已经读到但不匹配，仍是退出码 19 |
+| 21 | 这次还不能下保全结论。两路都不写 `preservation`，`new_effect` 为 null。未见历史：读不到 `vault.db` 是 `vault_unreadable`，`during` 是 `sqlite_header`；读不到横幅是 `banner_unreadable`，`during` 是 `banner`；锁、数据库打开、pragma、statfs、canonicalize 和来源目录查询是 `vault_unseen`，`during` 是该步骤，不编来源清单。这些都不是 `COMMIT` 返回了错误。真正的 `COMMIT` 返回错误之后，可见性查询也失败，reason 才是 `commit_visibility_unknown`，`during` 是 `after_commit_error`。这条没有实跑。`db_commit` 注入在 `COMMIT` 之前返回，是确定回滚，不是这条。查询成功时，看得到命令行是已提交，确定没有行是退出码 15。写者仍持锁时，取消若打不开那条能看见 WAL 的连接，或命令查询失败，也是 `commit_visibility_unknown`，`during` 是 `wal_open` 或 `wal_query`；那不是 `COMMIT` 返回错误，也没有单独让它失败。横幅内容已经读到但不匹配，仍是退出码 19。标准输出的 `write` 或 `flush` 失败也是 21，并且没有 JSON 回执。进程不在打印时 panic，也不把这次退出当成 0 或 15。调用方把结果当未知，用同一个 CommandId 再查或再试，不换新 ID。这一条本身不是 `COMMIT` 返回了错误 |
 
 `--stop-at during_copy` 在对象发布前停下，包括 0 字节、1 字节、2 字节，以及把第一次 `read` 强制成 1 字节的情况。多字节读取会留下短于全文的前缀。这个强制短读只作用于路径名含 `SHORTREAD-` 的文件，不是 ext4 自然短读，也不是故障注入。一次复制只停一次，恢复后把剩余字节写完。
 
-`--stop-at` 把检查点写到指定文件后发送 `SIGSTOP`。检查点文件出现只说明文件已经写完。行为测试再读到 `/proc/<pid>/status` 的 `State: T` 才发送 `SIGCONT` 或 `SIGKILL`。等待的是这个状态。只在这台 Linux 上这样验证。`SIGKILL` 只结束进程。它不是断电，也不是硬件 fsync 已经完成的证明。`--inject enospc:POINT` 或 `--inject io_error:POINT` 把见证写到指定文件后返回未保全。注入回执里的 `injected` 是 true，并写明这不是磁盘真的满了。见证文件没有出现时，注入不算已经发生。`db_commit` 注入发生在真正的 `COMMIT` 之前，事务回滚，命令行不存在；它只证明确定的回滚，不是提交结果不确定。
+`--stop-at` 把检查点写到指定文件后发送 `SIGSTOP`。检查点文件出现只说明文件已经写完。行为测试再读到 `/proc/<pid>/status` 的 `State: T` 才发送 `SIGCONT` 或 `SIGKILL`。等待的是这个状态。只在这台 Linux 上这样验证。`SIGKILL` 只结束进程。它不是断电，也不是硬件 fsync 已经完成的证明。`--inject enospc:POINT` 或 `--inject io_error:POINT` 把见证写到指定文件后返回未保全。注入回执里的 `injected` 是 true，并写明这不是磁盘真的满了。见证文件没有出现时，注入不算已经发生。`publish_dir_fsync` 和 `export_dir_fsync` 发生在改名成功之后，不返回未保全：退出码 3，目标目录保留，`published` 为 true，`directory_durable` 为 false。这里的 `injected: true` 只说明故障是注入的，不是磁盘已经失败。`db_commit` 注入发生在真正的 `COMMIT` 之前，事务回滚，命令行不存在；它只证明确定的回滚，不是提交结果不确定。
 
 `cancel --kind extraction` 只返回 `extraction_cancel_not_available`。它不创建提取目录，也没有 PDF 提取实现。`cancel --kind fragment` 只取消一次正文提交。不带 kind 或 `--kind preservation` 遇到 fragment journal 时返回 `command_kind_conflict`，不改 journal，也不写 control；锁闲、锁被占用和重复调用都一样。已经提交的命令仍是 `AlreadyCommitted`。未知 kind 在写之前返回用法错误。保全命令在提交前可以取消。写者已经提交、但仍持有锁时，取消用 `mode=ro` 读取 WAL 里的命令行，返回 `AlreadyCommitted`，`cancel_applied` 为 false，`preservation` 为 `preserved`，不写 control 文件。版本检查仍用 `immutable=1`，那条连接故意看不见尚未检查点的 WAL，不能拿来判断命令是否提交，也不能用 journal 上的状态文字代替数据库。0 字节库、坏文件头和更高的 `user_version` 走与打开相同的非破坏边界。
 
@@ -131,7 +131,7 @@ scripts/run-t1-evidence.sh
 
 `records.json` 有来源、出现、原件身份、来源版本、候选和定位、当前事实，以及全部决定。格式 3 另有 `facts.csv`，只放当前值；空的金额留空，不写成 0。`manifest.json` 记录每个文件的 SHA-256 和长度。`snapshot_id` 是 `records.json` 字节的 SHA-256，不是 SQLite 的历史版本号。原件在 `originals/<object_id>`。保护方式仍是 `undecided`：这是合成库的明文副本，不是获准的真实资料出口。
 
-核对通过才把临时目录改名为 `--out`。此时 `completeness` 是 `complete`，退出码 0。确认缺件或哈希不符时，不带 `--allow-partial yes` 就不发布，退出码 12，`completeness` 是 `incomplete`。带了这个参数才发布 `partial`，缺件留在 `missing`，不把缺的字节补成完整。对象这次读不出来不是缺件，即使带了参数也不发布。决定链对不上、引用断了，同样不发布。写失败或 `--inject io_error:export_write` / `enospc:export_write` 会删掉临时目录，退出码 3，`output_written` 为 false；删不掉则 `output_cleanup` 为 `failed`。已有的成功包不会被这次失败覆盖。
+核对通过才把临时目录改名为 `--out`。此时 `completeness` 是 `complete`，退出码 0。确认缺件或哈希不符时，不带 `--allow-partial yes` 就不发布，退出码 12，`completeness` 是 `incomplete`。带了这个参数才发布 `partial`，缺件留在 `missing`，不把缺的字节补成完整。对象这次读不出来不是缺件，即使带了参数也不发布。决定链对不上、引用断了，同样不发布。写失败或 `--inject io_error:export_write` / `enospc:export_write` 会删掉临时目录，退出码 3，`output_written` 为 false；删不掉则 `output_cleanup` 为 `failed`。已有的成功包不会被这次失败覆盖。改名成功之后父目录 `fsync` 失败，或 `--inject io_error:export_dir_fsync` / `enospc:export_dir_fsync`，也是退出码 3，但包留在 `--out`，`output_written` 仍是 true，`completeness` 保持核对结果。不把这次写成未发布，也不删掉已经改好名的包。
 
 这里没有主体、购买、备份、对象租约、导出取消代次，也不选择加密。复制活动库目录仍然不算完整出口。只在这台 Linux 上核对过路径。
 
