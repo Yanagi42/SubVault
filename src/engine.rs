@@ -243,10 +243,12 @@ pub fn init_vault(path: &Path, format: u8, hooks: Hooks) -> Report {
 }
 
 fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
-    // exists() follows the final component, so a dangling or looping symlink
-    // looks absent. rename of the new directory then fails with ENOTDIR and
-    // was reported as NotPreserved. The directory entry itself is enough.
-    match fs::symlink_metadata(path) {
+    // A trailing slash makes this lstat follow the final symlink. A dangling
+    // name then looks missing, and a loop or file fails the stat itself.
+    // The directory entry is the same name with those slashes removed.
+    // This does not canonicalize, so the final symlink is not replaced by
+    // its target. Ancestor components are unchanged.
+    match fs::symlink_metadata(final_directory_entry(path)) {
         Ok(_) => {
             return Err(Fail::new(EXIT_REJECTED, "Rejected", "vault_path_exists")
                 .extra("created_new_vault", json!(false)));
@@ -392,6 +394,28 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     }
     hooks.stop("after_publish", init_point(true, format))?;
     Ok(init_ready(&vault_id, format, magic))
+}
+
+/// Final directory entry for the init target. Trailing slashes are a
+/// spelling of that entry. Stripping them stops the kernel from requiring
+/// the final component to be a directory it can walk. The root path is
+/// only slashes, and it stays `/`.
+fn final_directory_entry(path: &Path) -> PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let bytes = path.as_os_str().as_bytes();
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte != b'/')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let trimmed = &bytes[..end];
+    if trimmed.is_empty() {
+        return PathBuf::from("/");
+    }
+    if trimmed.len() == bytes.len() {
+        return path.to_path_buf();
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(trimmed.to_vec()))
 }
 
 fn init_ready(vault_id: &str, format: u8, magic: i64) -> Report {
