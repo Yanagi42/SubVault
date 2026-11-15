@@ -244,7 +244,17 @@ fn query_inner(
     )
     .map_err(|err| unseen_db(err, "facts_open"))?;
     super::accept_connection_format(&vault.join("vault.db"), &conn)?;
-    require_fact_tables(&conn)?;
+    read_facts(&conn, version, source_id, fact_id)
+}
+
+pub(super) fn read_facts(
+    conn: &Connection,
+    version: i64,
+    source_id: Option<&str>,
+    fact_id: Option<&str>,
+) -> Result<(i32, Value), Fail> {
+    refuse_without_facts(version)?;
+    require_fact_tables(conn)?;
     let mut stmt = conn
         .prepare(
             "SELECT fact_id, source_id, source_version_id, run_id, candidate_id, fact_type, value_json, revision FROM facts WHERE (?1 IS NULL OR source_id = ?1) AND (?2 IS NULL OR fact_id = ?2) ORDER BY source_id, fact_id",

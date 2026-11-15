@@ -2101,6 +2101,38 @@ fn acquire_writer_lock(path: &Path) -> Result<lockfile::VaultLock, Fail> {
         })
 }
 
+/// One read of a vault. The connection is declared before the lock so it
+/// closes first. `BEGIN` keeps sources, facts, candidates, and decision
+/// history on that connection. A writer either commits before this lock or
+/// waits until the read drops it.
+struct ReviewRead {
+    conn: Connection,
+    _lock: VaultLock,
+}
+
+impl ReviewRead {
+    fn connection(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+fn open_review_read(vault: &Path) -> Result<(ReviewRead, i64), Fail> {
+    vault_shape(vault)?;
+    let lock = acquire_writer_lock(vault)?;
+    let db = vault.join("vault.db");
+    let uri = wal_visible_uri(&db)?;
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|err| busy_is_locked(err, "sqlite_unreadable", false))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
+    conn.execute_batch("BEGIN")
+        .map_err(|err| busy_is_locked(err, "user_version_unreadable", false))?;
+    let version = accept_connection_format(&db, &conn)?;
+    Ok((ReviewRead { conn, _lock: lock }, version))
+}
+
 fn open_session(path: &Path) -> Result<Session, Fail> {
     let magic = vault_shape(path)?;
     let lock = acquire_writer_lock(path)?;
@@ -2245,31 +2277,15 @@ fn visible_main_format(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
-    .map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_unreadable")
-            .extra("created_new_vault", json!(false))
-            .extra("published", json!(false))
-    })?;
-    let version = store::user_version(&conn).map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "user_version_unreadable")
-            .extra("created_new_vault", json!(false))
-            .extra("published", json!(false))
-    })?;
-    let format = store::meta(&conn, "vault_format").map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
-            .extra("created_new_vault", json!(false))
-            .extra("published", json!(false))
-    })?;
-    let schema = store::meta(&conn, "schema_version").map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
-            .extra("created_new_vault", json!(false))
-            .extra("published", json!(false))
-    })?;
-    let html_schema = store::meta(&conn, "html_body_schema").map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
-            .extra("created_new_vault", json!(false))
-            .extra("published", json!(false))
-    })?;
+    .map_err(|err| busy_is_locked(err, "sqlite_unreadable", true))?;
+    let version = store::user_version(&conn)
+        .map_err(|err| busy_is_locked(err, "user_version_unreadable", true))?;
+    let format = store::meta(&conn, "vault_format")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
+    let schema = store::meta(&conn, "schema_version")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
+    let html_schema = store::meta(&conn, "html_body_schema")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
     Ok((version, format, schema, html_schema))
 }
 
@@ -2295,8 +2311,9 @@ fn readonly_uri(path: &Path) -> Result<String, Fail> {
 
 /// Main-file header, WAL-visible version, and the meta that version needs.
 /// Read-only: no writer configuration, no cleanup, and no checkpoint.
-/// A caller about to open a writer already holds `writer.lock`. A query or a
-/// busy cancel uses the snapshot it already opened and does not take that lock.
+/// This function does not take `writer.lock`. A writer takes it before calling
+/// here. A review that must be one snapshot takes it before opening SQLite.
+/// A locked database is `writer_busy`, not a damaged vault.
 /// This open may create or touch `-shm`. It is not a claim that the directory
 /// received no files.
 fn accept_wal_format(db: &Path) -> Result<i64, Fail> {
@@ -2322,11 +2339,30 @@ fn accept_wal_format(db: &Path) -> Result<i64, Fail> {
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
-    .map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_unreadable")
-            .extra("created_new_vault", json!(false))
-    })?;
+    .map_err(|err| busy_is_locked(err, "sqlite_unreadable", false))?;
     accept_connection_format(db, &conn)
+}
+
+fn sqlite_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(ffi, _) if ffi.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+/// A busy read is lock contention. It is not evidence the vault is damaged.
+fn busy_is_locked(err: rusqlite::Error, damaged: &'static str, published: bool) -> Fail {
+    if sqlite_busy(&err) {
+        return Fail::new(EXIT_LOCKED, "Locked", "writer_busy")
+            .extra("created_new_vault", json!(false))
+            .extra("new_effect", json!(false));
+    }
+    let mut fail = Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", damaged)
+        .extra("created_new_vault", json!(false));
+    if published {
+        fail = fail.extra("published", json!(false));
+    }
+    fail
 }
 
 fn accept_connection_format(db: &Path, conn: &Connection) -> Result<i64, Fail> {
@@ -2345,22 +2381,14 @@ fn accept_connection_format(db: &Path, conn: &Connection) -> Result<i64, Fail> {
 fn effective_view(
     conn: &Connection,
 ) -> Result<(i64, Option<String>, Option<String>, Option<String>), Fail> {
-    let version = store::user_version(conn).map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "user_version_unreadable")
-            .extra("created_new_vault", json!(false))
-    })?;
-    let format = store::meta(conn, "vault_format").map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
-            .extra("created_new_vault", json!(false))
-    })?;
-    let schema = store::meta(conn, "schema_version").map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
-            .extra("created_new_vault", json!(false))
-    })?;
-    let html_schema = store::meta(conn, "html_body_schema").map_err(|_| {
-        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "meta_unreadable")
-            .extra("created_new_vault", json!(false))
-    })?;
+    let version = store::user_version(conn)
+        .map_err(|err| busy_is_locked(err, "user_version_unreadable", false))?;
+    let format = store::meta(conn, "vault_format")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
+    let schema = store::meta(conn, "schema_version")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
+    let html_schema = store::meta(conn, "html_body_schema")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
     Ok((version, format, schema, html_schema))
 }
 

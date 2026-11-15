@@ -1290,7 +1290,15 @@ fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fa
     )
     .map_err(|err| unseen_db(err, "candidates_open"))?;
     super::accept_connection_format(&vault.join("vault.db"), &conn)?;
-    let schema = store::meta(&conn, "body_schema").map_err(|err| unseen_db(err, "body_schema"))?;
+    read_candidates(vault, &conn, source_id)
+}
+
+pub(super) fn read_candidates(
+    vault: &Path,
+    conn: &Connection,
+    source_id: Option<&str>,
+) -> Result<(i32, Value), Fail> {
+    let schema = store::meta(conn, "body_schema").map_err(|err| unseen_db(err, "body_schema"))?;
     let html_schema =
         store::meta(&conn, "html_body_schema").map_err(|err| unseen_db(err, "html_body_schema"))?;
     let html = schema.is_none() && html_schema.as_deref() == Some(store::HTML_BODY_SCHEMA);

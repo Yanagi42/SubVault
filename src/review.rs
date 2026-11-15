@@ -1,16 +1,16 @@
 //! Read-only UTF-8 review sheet for one synthetic vault.
 //!
-//! The sheet reuses `query_facts` and `query_candidates`. Those results do
-//! not carry `sources.media_type`, so this also reads that stored column and
-//! `source_versions.role`. It does not extract, migrate, publish, or change
-//! a fact, an original, or a decision.
+//! One `writer.lock` and one deferred read transaction cover the vault
+//! version, sources, facts, candidates, and each fact's decision history.
+//! A new commit lands entirely before that read or entirely after it.
+//! The sheet does not extract, migrate, publish, or change a fact, an
+//! original, or a decision.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -20,27 +20,12 @@ use crate::model::{
 };
 
 pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>) -> Report {
-    let facts = super::query_facts(vault, None, None);
-    if facts.code != EXIT_OK {
-        return facts;
-    }
-    let candidates = super::query_candidates(vault, None);
-    if candidates.code != EXIT_OK {
-        return candidates;
-    }
-    if !facts.body.is_object() || !candidates.body.is_object() {
-        return Fail::new(EXIT_RECOVERY, "RecoveryRequired", "review_unreadable")
-            .extra("read_only", json!(true))
-            .extra("new_effect", json!(false))
-            .extra("output_written", json!(false))
-            .into_report();
-    }
-    let sources = match load_sources(vault) {
+    let (facts, candidates, sources) = match read_snapshot(vault) {
         Ok(rows) => rows,
-        Err(fail) => return fail.into_report(),
+        Err(report) => return report,
     };
     let link = export_link(package, &sources);
-    let (text, fact_count, rest) = render(&facts.body, &candidates.body, &sources, &link);
+    let (text, fact_count, rest) = render(&facts, &candidates, &sources, &link);
     match super::place_output(vault, out) {
         super::Place::Inside => return reject("output_inside_vault"),
         super::Place::Unresolved(message) => return reject_message("output_unresolved", message),
@@ -52,7 +37,7 @@ pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>) -> Report 
         return report;
     }
     reviewed(
-        &facts.body,
+        &facts,
         out,
         fact_count,
         rest,
@@ -60,6 +45,48 @@ pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>) -> Report 
         package.is_some(),
         link.verified(),
     )
+}
+
+fn read_snapshot(vault: &Path) -> Result<(Value, Value, Vec<SourceLine>), Report> {
+    let (read, version) = super::open_review_read(vault).map_err(|fail| fail.into_report())?;
+    let facts = match super::decide::read_facts(read.connection(), version, None, None) {
+        Ok((code, body)) => {
+            if code != EXIT_OK {
+                return Err(Report { code, body });
+            }
+            body
+        }
+        Err(fail) => return Err(tag_facts(fail.into_report())),
+    };
+    let candidates = match super::fragment::read_candidates(vault, read.connection(), None) {
+        Ok((code, body)) => {
+            if code != EXIT_OK {
+                return Err(Report { code, body });
+            }
+            body
+        }
+        Err(fail) => return Err(fail.into_report()),
+    };
+    if !facts.is_object() || !candidates.is_object() {
+        return Err(
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "review_unreadable")
+                .extra("read_only", json!(true))
+                .extra("new_effect", json!(false))
+                .extra("output_written", json!(false))
+                .into_report(),
+        );
+    }
+    let sources = sources_on(read.connection()).map_err(|fail| fail.into_report())?;
+    Ok((facts, candidates, sources))
+}
+
+fn tag_facts(mut report: Report) -> Report {
+    if let Some(map) = report.body.as_object_mut() {
+        if map.get("slice").and_then(|value| value.as_str()) == Some("T1") {
+            map.insert("slice".into(), json!("T3-facts"));
+        }
+    }
+    report
 }
 
 struct SourceLine {
@@ -71,19 +98,7 @@ struct SourceLine {
     roles: Vec<String>,
 }
 
-fn load_sources(vault: &Path) -> Result<Vec<SourceLine>, Fail> {
-    super::guard_vault(vault)?;
-    let _version = super::inspect_version_readonly(vault)?;
-    let db = vault.join("vault.db");
-    let uri = super::wal_visible_uri(&db)?;
-    let conn = Connection::open_with_flags(
-        &uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|err| unseen_db(err, "review_open"))?;
-    conn.busy_timeout(Duration::from_millis(0))
-        .map_err(|err| unseen_db(err, "review_open"))?;
-    super::accept_connection_format(&db, &conn)?;
+fn sources_on(conn: &Connection) -> Result<Vec<SourceLine>, Fail> {
     let mut stmt = conn
         .prepare(
             "SELECT s.source_id, s.object_id, s.content_sha256, s.byte_length, s.media_type, IFNULL(v.role, '') FROM sources s LEFT JOIN source_versions v ON v.source_id = s.source_id ORDER BY s.source_id, v.source_version_id",
