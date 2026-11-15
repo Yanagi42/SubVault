@@ -1069,10 +1069,10 @@ fn review_names_a_package_original_only_after_the_bytes_match() {
         missed.to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "{reviewed}");
-    assert_eq!(reviewed["package_associated"], true);
+    assert_eq!(reviewed["package_associated"], false);
     assert_eq!(reviewed["originals_verified"], 0);
     let text = fs::read_to_string(&missed).unwrap();
-    assert!(text.contains("给出的导出目录里没有对上的原件，本单不写路径。"));
+    assert!(text.contains("给出的导出和这次审阅不是同一范围，本单不关联该导出。"));
     assert!(!text.contains("originals/"));
 
     let truncated = tmp.path.join("truncated");

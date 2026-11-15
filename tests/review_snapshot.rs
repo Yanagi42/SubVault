@@ -420,7 +420,7 @@ fn review_does_not_associate_a_package_after_a_later_source() {
         sheet.to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "{reviewed}");
-    assert_eq!(reviewed["package_associated"], true);
+    assert_eq!(reviewed["package_associated"], false);
     assert_eq!(reviewed["originals_verified"], 0);
     let text = fs::read_to_string(&sheet).unwrap();
     assert!(text.contains("当前记录金额 USD 3.00"));
@@ -493,9 +493,11 @@ fn review_does_not_pair_current_facts_with_an_older_package() {
         sheet.to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["package_associated"], false);
     assert_eq!(reviewed["originals_verified"], 0);
     let text = fs::read_to_string(&sheet).unwrap();
     assert!(text.contains("当前记录金额 USD 12.00"));
+    assert_receipt_matches_sheet(&reviewed, &text);
     assert!(text.contains("给出的导出和这次审阅不是同一范围，本单不关联该导出。"));
     assert!(!text.contains("原件相对位置"));
     assert!(!text.contains("上面写出的相对位置"));
@@ -531,16 +533,127 @@ fn review_does_not_pair_current_facts_with_an_older_package() {
         undone_sheet.to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["package_associated"], false);
     assert_eq!(reviewed["originals_verified"], 0);
     let text = fs::read_to_string(&undone_sheet).unwrap();
     assert!(text.contains("当前记录金额 USD 9.50"));
+    assert!(text.contains("revision=3"));
     assert!(text.contains("给出的导出和这次审阅不是同一范围，本单不关联该导出。"));
     assert!(!text.contains("原件相对位置"));
+    assert_receipt_matches_sheet(&reviewed, &text);
     assert_eq!(fs::read(&original).unwrap(), before);
     assert_eq!(
         fs::read_to_string(package.join("facts.csv")).unwrap(),
         csv_before
     );
+
+    let missing = tmp.path.join("pkg-no-records");
+    copy_tree(&package, &missing);
+    fs::remove_file(missing.join("records.json")).unwrap();
+    let missing_sheet = tmp.path.join("undone-no-records.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        missing.to_str().unwrap(),
+        "--out",
+        missing_sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    let text = fs::read_to_string(&missing_sheet).unwrap();
+    assert!(text.contains("revision=3"));
+    assert!(!text.contains("原件相对位置"));
+    assert_eq!(fs::read(&original).unwrap(), before);
+    assert!(fs::read_to_string(missing.join("facts.csv"))
+        .unwrap()
+        .contains(",1,"));
+    assert_receipt_matches_sheet(&reviewed, &text);
+
+    let broken = tmp.path.join("pkg-bad-records");
+    copy_tree(&package, &broken);
+    fs::write(broken.join("records.json"), "{").unwrap();
+    let broken_sheet = tmp.path.join("undone-bad-records.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        broken.to_str().unwrap(),
+        "--out",
+        broken_sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    let text = fs::read_to_string(&broken_sheet).unwrap();
+    assert!(!text.contains("原件相对位置"));
+    assert_receipt_matches_sheet(&reviewed, &text);
+
+    let drifted = tmp.path.join("pkg-drift");
+    copy_tree(&package, &drifted);
+    let csv_path = drifted.join("facts.csv");
+    let drifted_csv = fs::read_to_string(&csv_path).unwrap().replacen(
+        ",stated_amount_paid,1,",
+        ",stated_amount_paid,9,",
+        1,
+    );
+    fs::write(&csv_path, drifted_csv).unwrap();
+    let drifted_sheet = tmp.path.join("undone-drift.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        drifted.to_str().unwrap(),
+        "--out",
+        drifted_sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    let text = fs::read_to_string(&drifted_sheet).unwrap();
+    assert!(!text.contains("原件相对位置"));
+    assert_receipt_matches_sheet(&reviewed, &text);
+
+    let no_csv = tmp.path.join("pkg-no-csv");
+    copy_tree(&package, &no_csv);
+    fs::remove_file(no_csv.join("facts.csv")).unwrap();
+    let no_csv_sheet = tmp.path.join("undone-no-csv.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        no_csv.to_str().unwrap(),
+        "--out",
+        no_csv_sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    let text = fs::read_to_string(&no_csv_sheet).unwrap();
+    assert!(!text.contains("原件相对位置"));
+    assert_receipt_matches_sheet(&reviewed, &text);
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    let status = Command::new("cp")
+        .args(["-R", from.to_str().unwrap(), to.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn assert_receipt_matches_sheet(reviewed: &Value, text: &str) {
+    let associated = reviewed["package_associated"] == true;
+    let writes_path = text.contains("原件相对位置");
+    let says_unrelated = text.contains("本单不关联该导出") || text.contains("未关联导出目录");
+    let says_checked = text.contains("已核对文件存在且内容哈希");
+    if associated {
+        assert!(writes_path, "{text}");
+        assert!(says_checked, "{text}");
+        assert!(!says_unrelated, "{text}");
+        assert!(reviewed["originals_verified"].as_u64().unwrap() > 0);
+    } else {
+        assert!(!writes_path, "{text}");
+        assert!(!says_checked, "{text}");
+        assert_eq!(reviewed["originals_verified"], 0);
+    }
 }
 
 fn fact_id(body: &Value, source_id: &str, fact_type: &str) -> String {

@@ -43,7 +43,7 @@ pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>) -> Report 
         fact_count,
         rest,
         sources.len(),
-        package.is_some(),
+        link.associated(),
         link.verified(),
     )
 }
@@ -148,16 +148,19 @@ fn sources_on(conn: &Connection) -> Result<Vec<SourceLine>, Fail> {
 
 enum ExportLink {
     Unset,
-    NoneMatched,
-    RangeDiffers,
+    NotAssociated,
     Paths(Vec<(String, String)>),
 }
 
 impl ExportLink {
+    fn associated(&self) -> bool {
+        matches!(self, ExportLink::Paths(_))
+    }
+
     fn verified(&self) -> usize {
         match self {
             ExportLink::Paths(paths) => paths.len(),
-            ExportLink::Unset | ExportLink::NoneMatched | ExportLink::RangeDiffers => 0,
+            ExportLink::Unset | ExportLink::NotAssociated => 0,
         }
     }
 }
@@ -166,15 +169,19 @@ fn export_link(package: Option<&Path>, sources: &[SourceLine], facts: &Value) ->
     let Some(package) = package else {
         return ExportLink::Unset;
     };
-    if package.join("records.json").is_file() && !same_package_range(package, sources, facts) {
-        return ExportLink::RangeDiffers;
+    if !same_package_range(package, sources, facts) {
+        return ExportLink::NotAssociated;
     }
     let paths = verified_originals(package, sources);
-    if paths.is_empty() {
-        ExportLink::NoneMatched
-    } else {
-        ExportLink::Paths(paths)
+    let every_source = sources.iter().all(|source| {
+        paths
+            .iter()
+            .any(|(source_id, _)| source_id == &source.source_id)
+    });
+    if paths.len() != sources.len() || !every_source {
+        return ExportLink::NotAssociated;
     }
+    ExportLink::Paths(paths)
 }
 
 fn same_package_range(package: &Path, sources: &[SourceLine], facts: &Value) -> bool {
@@ -456,14 +463,11 @@ fn push_conclusion(
             }
             match link {
                 ExportLink::Paths(paths) => {
-                    let matched = paths.iter().find(|(id, _)| id == source_id);
-                    if let Some((_, path)) = matched {
+                    if let Some((_, path)) = paths.iter().find(|(id, _)| id == source_id) {
                         text.push_str(&format!("原件相对位置 {}\n", show(path)));
-                    } else {
-                        text.push_str("这条来源在给出的导出目录里没有对上的原件。\n");
                     }
                 }
-                ExportLink::Unset | ExportLink::NoneMatched | ExportLink::RangeDiffers => {}
+                ExportLink::Unset | ExportLink::NotAssociated => {}
             }
         }
         if source_ids.len() > 1 {
@@ -487,10 +491,7 @@ fn push_conclusion(
     text.push_str("摘录不是全文。\n");
     match link {
         ExportLink::Unset => text.push_str("单独生成，未关联导出目录。\n"),
-        ExportLink::NoneMatched => {
-            text.push_str("给出的导出目录里没有对上的原件，本单不写路径。\n");
-        }
-        ExportLink::RangeDiffers => {
+        ExportLink::NotAssociated => {
             text.push_str("给出的导出和这次审阅不是同一范围，本单不关联该导出。\n");
         }
         ExportLink::Paths(_) => {
