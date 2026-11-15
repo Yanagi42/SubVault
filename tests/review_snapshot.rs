@@ -339,6 +339,210 @@ fn review_lock_contention_is_not_damage() {
     assert!(!sheet_torn(&text));
 }
 
+#[test]
+fn review_associates_an_unchanged_package() {
+    let tmp = Tmp::new("package-same");
+    let vault = tmp.path.join("vault");
+    let (code, init) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "4"]);
+    assert_eq!(code, 0, "{init}");
+    let (code, first) = html(&vault, "a", &doc(100));
+    assert_eq!(code, 0, "{first}");
+    let (code, second) = html(&vault, "b", &doc(1599));
+    assert_eq!(code, 0, "{second}");
+    let package = tmp.path.join("package");
+    let (code, exported) = run(&[
+        "export",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        package.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{exported}");
+    let sheet = tmp.path.join("review.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        package.to_str().unwrap(),
+        "--out",
+        sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["package_associated"], true);
+    assert_eq!(reviewed["originals_verified"], 2);
+    let text = fs::read_to_string(&sheet).unwrap();
+    assert!(text.contains("当前记录金额 USD 1.00"));
+    assert!(text.contains("当前记录金额 USD 15.99"));
+    assert_eq!(text.matches("原件相对位置 originals/").count(), 2);
+    assert!(text.contains("上面写出的相对位置在关联的导出目录内"));
+    assert!(!text.contains("不是同一范围"));
+    let object_a = first["object_id"].as_str().unwrap();
+    let object_b = second["object_id"].as_str().unwrap();
+    assert_eq!(
+        fs::read(package.join("originals").join(object_a)).unwrap(),
+        doc(100).into_bytes()
+    );
+    assert_eq!(
+        fs::read(package.join("originals").join(object_b)).unwrap(),
+        doc(1599).into_bytes()
+    );
+}
+
+#[test]
+fn review_does_not_associate_a_package_after_a_later_source() {
+    let tmp = Tmp::new("package-late");
+    let vault = tmp.path.join("vault");
+    let (code, init) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "4"]);
+    assert_eq!(code, 0, "{init}");
+    let (code, first) = html(&vault, "a", &doc(300));
+    assert_eq!(code, 0, "{first}");
+    let package = tmp.path.join("package");
+    let (code, exported) = run(&[
+        "export",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        package.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{exported}");
+    let packed = fs::read(package.join("facts.csv")).unwrap();
+    let (code, later) = html(&vault, "late", &doc(3400));
+    assert_eq!(code, 0, "{later}");
+    let sheet = tmp.path.join("review.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        package.to_str().unwrap(),
+        "--out",
+        sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["package_associated"], true);
+    assert_eq!(reviewed["originals_verified"], 0);
+    let text = fs::read_to_string(&sheet).unwrap();
+    assert!(text.contains("当前记录金额 USD 3.00"));
+    assert!(text.contains("当前记录金额 USD 34.00"));
+    assert!(text.contains("给出的导出和这次审阅不是同一范围，本单不关联该导出。"));
+    assert!(!text.contains("原件相对位置"));
+    assert!(!text.contains("上面写出的相对位置"));
+    assert!(!text.contains("单独生成，未关联导出目录。"));
+    assert_eq!(fs::read(package.join("facts.csv")).unwrap(), packed);
+    let source = later["source_id"].as_str().unwrap();
+    let csv = String::from_utf8(packed).unwrap();
+    assert!(!csv.contains(source));
+}
+
+#[test]
+fn review_does_not_pair_current_facts_with_an_older_package() {
+    let tmp = Tmp::new("package-correct");
+    let vault = tmp.path.join("vault");
+    let (code, init) = run(&["init", "--vault", vault.to_str().unwrap(), "--format", "4"]);
+    assert_eq!(code, 0, "{init}");
+    let (code, stored) = html(&vault, "a", &doc(950));
+    assert_eq!(code, 0, "{stored}");
+    let package = tmp.path.join("package");
+    let (code, exported) = run(&[
+        "export",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--out",
+        package.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{exported}");
+    let object = stored["object_id"].as_str().unwrap();
+    let original = package.join("originals").join(object);
+    let before = fs::read(&original).unwrap();
+    let (code, listed) = run(&["facts", "--vault", vault.to_str().unwrap()]);
+    assert_eq!(code, 0, "{listed}");
+    let fact = fact_id(
+        &listed,
+        stored["source_id"].as_str().unwrap(),
+        "stated_amount_paid",
+    );
+    let (code, corrected) = run(&[
+        "correct",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "fix",
+        "--fact-id",
+        &fact,
+        "--expected-revision",
+        "1",
+        "--amount-text",
+        "12.00",
+        "--actor-id",
+        ACTOR,
+    ]);
+    assert_eq!(code, 0, "{corrected}");
+    assert_eq!(fs::read(&original).unwrap(), before);
+    let csv_before = fs::read_to_string(package.join("facts.csv")).unwrap();
+    assert!(csv_before.contains("9.50"));
+    assert!(!csv_before.contains("12.00"));
+    let sheet = tmp.path.join("review.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        package.to_str().unwrap(),
+        "--out",
+        sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["originals_verified"], 0);
+    let text = fs::read_to_string(&sheet).unwrap();
+    assert!(text.contains("当前记录金额 USD 12.00"));
+    assert!(text.contains("给出的导出和这次审阅不是同一范围，本单不关联该导出。"));
+    assert!(!text.contains("原件相对位置"));
+    assert!(!text.contains("上面写出的相对位置"));
+    assert_eq!(fs::read(&original).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(package.join("facts.csv")).unwrap(),
+        csv_before
+    );
+
+    let decision = corrected["decision_id"].as_str().unwrap();
+    let (code, undone) = run(&[
+        "undo",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "undo-fix",
+        "--decision-id",
+        decision,
+        "--expected-revision",
+        "2",
+        "--actor-id",
+        ACTOR,
+    ]);
+    assert_eq!(code, 0, "{undone}");
+    let undone_sheet = tmp.path.join("undone.txt");
+    let (code, reviewed) = run(&[
+        "review",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--package",
+        package.to_str().unwrap(),
+        "--out",
+        undone_sheet.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{reviewed}");
+    assert_eq!(reviewed["originals_verified"], 0);
+    let text = fs::read_to_string(&undone_sheet).unwrap();
+    assert!(text.contains("当前记录金额 USD 9.50"));
+    assert!(text.contains("给出的导出和这次审阅不是同一范围，本单不关联该导出。"));
+    assert!(!text.contains("原件相对位置"));
+    assert_eq!(fs::read(&original).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(package.join("facts.csv")).unwrap(),
+        csv_before
+    );
+}
+
 fn fact_id(body: &Value, source_id: &str, fact_type: &str) -> String {
     body["facts"]
         .as_array()

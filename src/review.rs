@@ -6,6 +6,7 @@
 //! The sheet does not extract, migrate, publish, or change a fact, an
 //! original, or a decision.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -24,7 +25,7 @@ pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>) -> Report 
         Ok(rows) => rows,
         Err(report) => return report,
     };
-    let link = export_link(package, &sources);
+    let link = export_link(package, &sources, &facts);
     let (text, fact_count, rest) = render(&facts, &candidates, &sources, &link);
     match super::place_output(vault, out) {
         super::Place::Inside => return reject("output_inside_vault"),
@@ -148,6 +149,7 @@ fn sources_on(conn: &Connection) -> Result<Vec<SourceLine>, Fail> {
 enum ExportLink {
     Unset,
     NoneMatched,
+    RangeDiffers,
     Paths(Vec<(String, String)>),
 }
 
@@ -155,21 +157,225 @@ impl ExportLink {
     fn verified(&self) -> usize {
         match self {
             ExportLink::Paths(paths) => paths.len(),
-            ExportLink::Unset | ExportLink::NoneMatched => 0,
+            ExportLink::Unset | ExportLink::NoneMatched | ExportLink::RangeDiffers => 0,
         }
     }
 }
 
-fn export_link(package: Option<&Path>, sources: &[SourceLine]) -> ExportLink {
+fn export_link(package: Option<&Path>, sources: &[SourceLine], facts: &Value) -> ExportLink {
     let Some(package) = package else {
         return ExportLink::Unset;
     };
+    if package.join("records.json").is_file() && !same_package_range(package, sources, facts) {
+        return ExportLink::RangeDiffers;
+    }
     let paths = verified_originals(package, sources);
     if paths.is_empty() {
         ExportLink::NoneMatched
     } else {
         ExportLink::Paths(paths)
     }
+}
+
+fn same_package_range(package: &Path, sources: &[SourceLine], facts: &Value) -> bool {
+    let records = match fs::read(package.join("records.json")) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    let csv = match fs::read_to_string(package.join("facts.csv")) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    let Some(packed_sources) = packed_source_keys(records.get("sources")) else {
+        return false;
+    };
+    let Some(packed_facts) = packed_fact_keys(records.get("facts")) else {
+        return false;
+    };
+    let Some(csv_facts) = csv_fact_keys(&csv) else {
+        return false;
+    };
+    let live_sources = sources.iter().map(source_key).collect::<BTreeSet<_>>();
+    let Some(live_facts) = live_fact_keys(facts) else {
+        return false;
+    };
+    packed_sources == live_sources && packed_facts == live_facts && csv_facts == live_facts
+}
+
+fn source_key(source: &SourceLine) -> String {
+    format!(
+        "{}\t{}\t{}\t{}",
+        source.source_id, source.object_id, source.content_sha256, source.byte_length
+    )
+}
+
+fn packed_source_keys(sources: Option<&Value>) -> Option<BTreeSet<String>> {
+    let rows = sources?.as_array()?;
+    let mut keys = BTreeSet::new();
+    for row in rows {
+        keys.insert(format!(
+            "{}\t{}\t{}\t{}",
+            row.get("source_id")?.as_str()?,
+            row.get("object_id")?.as_str()?,
+            row.get("content_sha256")?.as_str()?,
+            row.get("byte_length")?.as_i64()?
+        ));
+    }
+    Some(keys)
+}
+
+fn live_fact_keys(facts: &Value) -> Option<BTreeSet<String>> {
+    let rows = facts.get("facts")?.as_array()?;
+    let mut keys = BTreeSet::new();
+    for row in rows {
+        let decisions = row.get("decisions")?.as_array()?;
+        let latest = decisions
+            .last()
+            .and_then(|item| item.get("decision_id"))
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        keys.insert(fact_key(
+            row.get("fact_id")?.as_str()?,
+            row.get("source_id")?.as_str()?,
+            row.get("candidate_id")?.as_str()?,
+            row.get("fact_type")?.as_str()?,
+            row.get("revision")?.as_i64()?,
+            field(row.get("value")?, "amount_text"),
+            field(row.get("value")?, "period_start"),
+            field(row.get("value")?, "period_end"),
+            latest,
+        ));
+    }
+    Some(keys)
+}
+
+fn packed_fact_keys(facts: Option<&Value>) -> Option<BTreeSet<String>> {
+    let rows = facts?.as_array()?;
+    let mut keys = BTreeSet::new();
+    for row in rows {
+        let decisions = row.get("decision_ids")?.as_array()?;
+        let latest = decisions
+            .last()
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        keys.insert(fact_key(
+            row.get("fact_id")?.as_str()?,
+            row.get("source_id")?.as_str()?,
+            row.get("candidate_id")?.as_str()?,
+            row.get("fact_type")?.as_str()?,
+            row.get("revision")?.as_i64()?,
+            field(row.get("value")?, "amount_text"),
+            field(row.get("value")?, "period_start"),
+            field(row.get("value")?, "period_end"),
+            latest,
+        ));
+    }
+    Some(keys)
+}
+
+fn csv_fact_keys(text: &str) -> Option<BTreeSet<String>> {
+    let rows = csv_rows(text)?;
+    let header = rows.first()?;
+    let index = |name: &str| header.iter().position(|cell| cell == name);
+    let fact_id = index("fact_id")?;
+    let source_id = index("source_id")?;
+    let candidate_id = index("candidate_id")?;
+    let fact_type = index("fact_type")?;
+    let revision = index("revision")?;
+    let amount = index("amount_text")?;
+    let start = index("period_start")?;
+    let end = index("period_end")?;
+    let latest = index("latest_decision_id")?;
+    let width = header.len();
+    let mut keys = BTreeSet::new();
+    for row in rows.iter().skip(1) {
+        if row.iter().all(|cell| cell.is_empty()) {
+            continue;
+        }
+        if row.len() != width {
+            return None;
+        }
+        keys.insert(fact_key(
+            &row[fact_id],
+            &row[source_id],
+            &row[candidate_id],
+            &row[fact_type],
+            row[revision].parse().ok()?,
+            row[amount].clone(),
+            row[start].clone(),
+            row[end].clone(),
+            &row[latest],
+        ));
+    }
+    Some(keys)
+}
+
+fn fact_key(
+    fact_id: &str,
+    source_id: &str,
+    candidate_id: &str,
+    fact_type: &str,
+    revision: i64,
+    amount: String,
+    start: String,
+    end: String,
+    latest: &str,
+) -> String {
+    format!(
+        "{fact_id}\t{source_id}\t{candidate_id}\t{fact_type}\t{revision}\t{amount}\t{start}\t{end}\t{latest}"
+    )
+}
+
+fn field(value: &Value, key: &str) -> String {
+    match value.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn csv_rows(text: &str) -> Option<Vec<Vec<String>>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut cell = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quoted {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    cell.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                cell.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '"' if cell.is_empty() => quoted = true,
+            ',' => row.push(std::mem::take(&mut cell)),
+            '\n' => {
+                row.push(std::mem::take(&mut cell));
+                rows.push(std::mem::take(&mut row));
+            }
+            '\r' => {}
+            _ => cell.push(ch),
+        }
+    }
+    if quoted {
+        return None;
+    }
+    if !cell.is_empty() || !row.is_empty() {
+        row.push(cell);
+        rows.push(row);
+    }
+    Some(rows)
 }
 
 fn verified_originals(package: &Path, sources: &[SourceLine]) -> Vec<(String, String)> {
@@ -257,7 +463,7 @@ fn push_conclusion(
                         text.push_str("这条来源在给出的导出目录里没有对上的原件。\n");
                     }
                 }
-                ExportLink::Unset | ExportLink::NoneMatched => {}
+                ExportLink::Unset | ExportLink::NoneMatched | ExportLink::RangeDiffers => {}
             }
         }
         if source_ids.len() > 1 {
@@ -283,6 +489,9 @@ fn push_conclusion(
         ExportLink::Unset => text.push_str("单独生成，未关联导出目录。\n"),
         ExportLink::NoneMatched => {
             text.push_str("给出的导出目录里没有对上的原件，本单不写路径。\n");
+        }
+        ExportLink::RangeDiffers => {
+            text.push_str("给出的导出和这次审阅不是同一范围，本单不关联该导出。\n");
         }
         ExportLink::Paths(_) => {
             text.push_str(
