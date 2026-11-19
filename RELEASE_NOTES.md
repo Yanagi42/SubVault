@@ -15,19 +15,20 @@ SubVault `v0.1.0` packages the verified **local-first Rust + SQLite preservation
 1. **Interactive Pure-Static Web Demo (`web/`)**
    - **Preloaded Synthetic Corpus:** Ships out-of-the-box with realistic billing scenarios covering monthly/annual subscriptions, personal vs. work account separation at the same vendor, byte-identical duplicate detection across renamed files, CSV vs. tax-invoice amount conflicts (`$99.00` vs. `$107.91`), credit-note totals vs. paid amounts, cancelled-but-usable renewals, masked unassigned account emails, one-time perpetual software licenses, and Format 4 static HTML table-row bills.
    - **One-Click Sample Import & Local File Drop:** Re-import the 12-file sample batch or drop local `.html`, `.txt`, `.csv`, and `.pdf` files directly in the browser to observe real SHA-256 object reuse, occurrence logging, and non-destructive human `correct` / `undo` decision preservation.
-   - **Zero Lock-In Browser Exports:** Preview and download `review.txt`, `facts.csv`, `records.json`, and a SHA-256 `manifest.json` (`offline-exit-1`) with zero backend calls.
+   - **Zero Lock-In Browser Exports & Native CLI Interop:** Preview and download `review.txt`, `facts.csv`, `records.json`, `manifest.json`, or a single full `.zip` offline exit archive (`web/zip.js`) directly verifiable by `subvault verify-package`, and open/SHA-256-verify real native `subvault export` folders directly in the browser via **Open Native Export**.
+   - **Interactive Human Decisions & Local Persistence:** Inline amount `correct`/`undo`, masked-account attribution (`human_assign_account`/`undo`), and automatic browser `localStorage` persistence with one-click reset.
    - **Subpath-Safe Static Hosting:** All static asset references are strictly relative (`./*`) with `.nojekyll` enabled for zero-error deployment on GitHub Pages (`/SubVault/`).
 
 2. **Verified Rust + SQLite Preservation & Extraction Core (`subvault` CLI)**
    - **Immutable Byte Custody (T1):** Content-addressed `objects/obj_<id>` storage with SHA-256 integrity verification, zero byte normalization, idempotent `CommandId` journaling, exclusive non-blocking `flock`, SQLite 3.46 WAL (`synchronous=FULL`), atomic directory publication via `renameat2(RENAME_NOREPLACE)` + parent fd `fsync`, and 17 distinct honest exit codes.
    - **Source-Stated Candidates & Facts (T2a / T3 / Format 4):** Deterministic extraction for UTF-8 text fragments and constrained static HTML bills (`tl` 0.7.8 + `html-escape` 0.2.13, refusing `<style>` / stylesheets instead of guessing CSS visibility), recording exact Unicode scalar and UTF-8 byte offsets.
    - **Append-Only Human Decisions:** `correct` and `undo` append auditable human revisions while keeping original bytes untouched and surviving re-imports.
-   - **Offline Exit & Read-Only Review Sheet (T5):** `subvault export` produces self-contained packages (`records.json`, `facts.csv`, `manifest.json`, `originals/<object_id>`) with explicit `complete` vs. `partial` reporting; `subvault review` writes a lock-consistent plain-text review sheet linked only to hash-verified package originals.
+   - **Offline Exit, Standalone Verification & Read-Only Review Sheet (T5):** `subvault export` produces self-contained packages (`records.json`, `facts.csv`, `manifest.json`, `originals/<object_id>`) with explicit `complete` vs. `partial` reporting; `subvault verify-package --package PATH` independently validates `manifest.json`, `snapshot_id`, `facts.csv`, and every original file's SHA-256 without needing the live vault; `subvault review` writes a lock-consistent plain-text review sheet linked only to hash-verified package originals.
 
 3. **CI, Automated Packaging & Release Verification**
-   - Added `.github/workflows/ci.yml` running deterministic corpus verification, full Rust unit and historical-worktree compatibility integration tests, Web Demo checks, and portable bundle packaging with `SHA256SUMS.txt` verification.
+   - Added `.github/workflows/ci.yml` running deterministic corpus verification, `cargo fmt --check`, `cargo clippy --lib --bins -- -D warnings`, full Rust unit and historical-worktree compatibility integration tests, bidirectional Web<->CLI interop checks, and portable bundle packaging with `SHA256SUMS.txt` verification.
    - Added `.github/workflows/pages.yml` for automated GitHub Pages deployment with subpath HTTP 200 checks.
-   - Added `scripts/package-release.sh` to generate reproducible portable archives and `SHA256SUMS.txt`.
+   - Added `.github/workflows/release.yml` for tag-driven (`v*`) GitHub Release publishing alongside `scripts/package-release.sh`.
 
 ---
 

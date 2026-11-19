@@ -9,9 +9,9 @@
 
 ### Quick Links
 
-- **Live Interactive Demo (GitHub Pages):** **[https://yanagi42.github.io/SubVault/](https://yanagi42.github.io/SubVault/)** — preloaded synthetic corpus, one-click sample import, real SHA-256 duplicate detection, inline `correct`/`undo`, and downloadable `facts.csv` / `records.json` / `manifest.json`
-- **Portable Releases & Checksums:** **[Download Latest Release](https://github.com/Yanagi42/SubVault/releases/latest)** · [Release Notes (`RELEASE_NOTES.md`)](./RELEASE_NOTES.md)
-- **Full Technical Verification Spec (中文):** [`docs/SPEC-zh.md`](./docs/SPEC-zh.md)
+- **Live Interactive Demo (GitHub Pages):** **[https://yanagi42.github.io/SubVault/](https://yanagi42.github.io/SubVault/)** — preloaded synthetic corpus, one-click sample import, real SHA-256 duplicate detection, inline `correct`/`undo` & masked-account attribution, native CLI export verifier (`Open Native Export`), and one-click `.zip` offline exit download
+- **Portable Releases & Checksums:** **[Download Latest Release](https://github.com/Yanagi42/SubVault/releases/latest)** · [Release Notes (`RELEASE_NOTES.md`)](./RELEASE_NOTES.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md)
+- **Next Iteration Plan (`v0.2.0`) & Full Technical Spec:** [Roadmap (`docs/ROADMAP.md`)](./docs/ROADMAP.md) · [Full Technical Verification Spec (中文)](./docs/SPEC-zh.md)
 
 ---
 
@@ -139,6 +139,10 @@ bash scripts/package-release.sh
   --vault /tmp/my-vault \
   --out /tmp/my-export-pack
 
+# Independently verify the exported package without needing the live vault
+./target/release/subvault verify-package \
+  --package /tmp/my-export-pack
+
 # Generate a lock-consistent plain-text review sheet linked to verified originals
 ./target/release/subvault review \
   --vault /tmp/my-vault \
@@ -154,11 +158,11 @@ bash scripts/package-release.sh
 | --- | --- |
 | `src/` | Rust preservation engine, SQLite WAL store, static text & HTML extractors, append-only decision chain, offline exporter, and review sheet renderer |
 | `tests/` | 19 integration & backward-compatibility test suites (crash/fault hooks, WAL/header consistency, directory `renameat2(RENAME_NOREPLACE)`, parent fd `fsync`) |
-| `web/` | Zero-dependency, subpath-safe pure-static interactive Web Demo (`index.html`, `app.js`, `engine.js`, `demo-data.js`, `styles.css`) |
+| `web/` | Zero-dependency, subpath-safe pure-static interactive Web Demo (`index.html`, `app.js`, `engine.js`, `demo-data.js`, `zip.js`, `styles.css`) |
 | `synthetic/` | Deterministic T0 corpus generator and independent byte/logical expectations |
-| `scripts/` | Release packaging (`package-release.sh`), Web Demo checks (`test-web.mjs`), screenshot capture (`capture-screenshots.py`), and T1 evidence script |
-| `.github/workflows/` | Automated CI (`ci.yml`) and GitHub Pages deployment (`pages.yml`) |
-| `docs/` | Real UI screenshots (`docs/screenshots/`) and the complete Chinese technical specification (`docs/SPEC-zh.md`) |
+| `scripts/` | Release packaging (`package-release.sh`), Web Demo & CLI-interop checks (`test-web.mjs`), screenshot capture (`capture-screenshots.py`), and T1 evidence script |
+| `.github/workflows/` | Automated CI (`ci.yml`), GitHub Pages deployment (`pages.yml`), and tag-driven release publishing (`release.yml`) |
+| `docs/` | Real UI screenshots (`docs/screenshots/`), next-iteration roadmap (`docs/ROADMAP.md`), and the complete Chinese technical specification (`docs/SPEC-zh.md`) |
 
 ---
 
