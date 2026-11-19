@@ -16,7 +16,7 @@
         <div>
           <div class="brand-title">
             <h1>SubVault</h1>
-            <span class="demo-chip">Interactive Demo · Pure Static</span>
+            <span class="demo-chip" id="mode-chip">Interactive Demo · Pure Static</span>
           </div>
           <div class="brand-sub">Local-first, SHA-256 proof-backed subscription &amp; receipt vault — zero bank logins, zero inbox OAuth</div>
         </div>
@@ -30,10 +30,14 @@
           Upload Local File
         </label>
         <input id="file-upload-input" type="file" multiple accept=".html,.htm,.txt,.csv,.pdf" class="hidden">
+        <label class="btn" for="native-export-input" title="Open and SHA-256 verify an exported folder from native `subvault export` CLI">
+          Open Native Export
+        </label>
+        <input id="native-export-input" type="file" webkitdirectory multiple class="hidden">
         <button id="btn-go-export" class="btn btn-primary" type="button">
           Export Exit Pack
         </button>
-        <button id="btn-reset-vault" class="btn btn-ghost" type="button" title="Clear the in-browser demo vault to test fresh import">
+        <button id="btn-reset-vault" class="btn btn-ghost" type="button" title="Clear the in-browser demo vault and local browser cache">
           Reset Vault
         </button>
       </div>

@@ -1,6 +1,7 @@
 import { QUICK_SAMPLE_SCENARIOS } from "./demo-data.js";
 import { SubVaultStore } from "./engine.js";
 
+const STORAGE_KEY = "subvault_demo_state_v1";
 const store = new SubVaultStore();
 
 const state = {
@@ -8,8 +9,48 @@ const state = {
   filter: "all",
   search: "",
   selectedSourceId: null,
-  importCounter: 1
+  importCounter: 1,
+  persistEnabled: true
 };
+
+function persistVault() {
+  if (!state.persistEnabled) return;
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store.toSnapshot()));
+  } catch {
+    // Ignore quota / privacy-mode localStorage errors
+  }
+}
+
+function clearPersistedVault() {
+  try {
+    window.localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Ignore
+  }
+}
+
+function restorePersistedVault() {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    return store.fromSnapshot(JSON.parse(raw));
+  } catch {
+    return false;
+  }
+}
+
+function downloadBinaryFile(filename, uint8, mime = "application/zip") {
+  const blob = new Blob([uint8], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 function esc(value) {
   return String(value ?? "")
@@ -454,6 +495,40 @@ function renderInspector() {
     `;
   }
 
+  let maskedAssignHtml = "";
+  if (source.originalAccountEmail && source.originalAccountEmail.includes("*")) {
+    const acctDecs = store.getAccountDecisionsForSource(source.sourceId);
+    const lastAcct = acctDecs[acctDecs.length - 1];
+    const canUndoAcct = lastAcct && lastAcct.kind !== "undo";
+    const knownMerchantEmails = [...new Set(
+      store.sources
+        .filter((s) => s.merchant === source.merchant && s.accountEmail && !s.accountEmail.includes("*") && s.accountEmail !== "Not stated")
+        .map((s) => s.accountEmail)
+    )];
+    const presetBtns = knownMerchantEmails
+      .map(
+        (email) => `<button class="btn btn-sm btn-assign-preset" data-email="${esc(email)}" type="button">Assign → ${esc(email)}</button>`
+      )
+      .join("");
+    maskedAssignHtml = `
+      <div class="inspector-section">
+        <h4>
+          <span>Masked Account Attribution (${acctDecs.length})</span>
+          <span class="mono">${source.accountEmail.includes("*") ? "Unassigned" : "Human Attributed"}</span>
+        </h4>
+        <div style="font-size:12px;color:var(--ink-secondary);margin-bottom:8px">
+          Current: <strong class="mono">${esc(source.accountEmail)}</strong> · Original notice still says <strong class="mono">${esc(source.originalAccountEmail)}</strong>.
+        </div>
+        ${presetBtns ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">${presetBtns}</div>` : ""}
+        <form class="correct-form" id="assign-account-form">
+          <input id="assign-account-input" class="correct-input" style="width:200px" type="email" placeholder="account@domain.example" value="${source.accountEmail.includes("*") ? "" : esc(source.accountEmail)}" aria-label="Full account email">
+          <button class="btn btn-sm btn-primary" type="submit">Assign</button>
+          ${canUndoAcct ? `<button id="btn-undo-account" class="btn btn-sm" type="button">Undo</button>` : ""}
+        </form>
+      </div>
+    `;
+  }
+
   body.innerHTML = `
     <div class="inspector-section">
       <h4>
@@ -486,6 +561,7 @@ function renderInspector() {
     </div>
 
     ${decisionSectionHtml}
+    ${maskedAssignHtml}
   `;
 
   const form = document.getElementById("correct-amount-form");
@@ -510,6 +586,48 @@ function renderInspector() {
         store.undoLastDecision(amtFact.factId);
         renderAll();
         showToast(`Appended compensating undo decision on ${source.displayName}.`, false);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+  }
+
+  for (const btn of body.querySelectorAll(".btn-assign-preset")) {
+    btn.addEventListener("click", () => {
+      try {
+        const email = btn.dataset.email;
+        const label = /jordan|work/i.test(email) ? "Work (Attributed)" : "Personal (Attributed)";
+        store.assignMaskedAccount(source.sourceId, email, label);
+        renderAll();
+        showToast(`Attributed masked notice to ${email} — original bytes still show ${source.originalAccountEmail}.`, false);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+  }
+
+  const assignForm = document.getElementById("assign-account-form");
+  if (assignForm) {
+    assignForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const email = document.getElementById("assign-account-input").value;
+      try {
+        store.assignMaskedAccount(source.sourceId, email, "Human Attributed");
+        renderAll();
+        showToast(`Attributed masked notice to ${email.trim()} — original bytes untouched.`, false);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+  }
+
+  const undoAcctBtn = document.getElementById("btn-undo-account");
+  if (undoAcctBtn) {
+    undoAcctBtn.addEventListener("click", () => {
+      try {
+        store.undoAccountAssignment(source.sourceId);
+        renderAll();
+        showToast(`Undid account attribution on ${source.displayName} — restored ${source.accountEmail}.`, false);
       } catch (err) {
         showToast(err.message, true);
       }
@@ -574,6 +692,9 @@ function renderAudit() {
                   <div style="font-size:12px;color:var(--ink-secondary)">Held as un-adopted <code>csv_charged_amount</code> candidate</div>
                 </div>
               </div>
+              <div style="margin-top:8px">
+                <button class="btn btn-sm btn-jump-source" data-source-id="${esc(c.invoiceSource.sourceId)}" type="button">Inspect &amp; Resolve Invoice →</button>
+              </div>
             </div>
           `
           )
@@ -607,6 +728,9 @@ function renderAudit() {
               <div style="font-weight:700;margin-bottom:3px">Masked email: <span class="mono">${esc(s.accountEmail)}</span></div>
               <div style="font-size:12px;color:var(--ink-secondary)">
                 Auto-renewal cancelled; still usable through <span class="mono">${esc(s.metadata?.usableThrough || "stated date")}</span>. Held unassigned — SubVault refuses to guess ownership by initial letter or vendor name.
+              </div>
+              <div style="margin-top:8px">
+                <button class="btn btn-sm btn-jump-source" data-source-id="${esc(s.sourceId)}" type="button">Assign Account in Inspector →</button>
               </div>
             </div>
           `
@@ -684,6 +808,12 @@ function renderAudit() {
   if (reimportBtn) {
     reimportBtn.addEventListener("click", handleImportSampleBatch);
   }
+  for (const btn of root.querySelectorAll(".btn-jump-source")) {
+    btn.addEventListener("click", () => {
+      state.selectedSourceId = btn.dataset.sourceId;
+      setView("ledger");
+    });
+  }
 }
 
 function renderExport() {
@@ -726,6 +856,7 @@ function renderExport() {
           <span class="badge badge-emerald">Zero Lock-In</span>
         </div>
         <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap;background:var(--surface-subtle)">
+          <button id="dl-zip" class="btn btn-sm btn-emerald" type="button">Download Full Exit Pack (.zip)</button>
           <button id="dl-csv" class="btn btn-sm btn-primary" type="button">Download facts.csv</button>
           <button id="dl-records" class="btn btn-sm" type="button">Download records.json</button>
           <button id="dl-manifest" class="btn btn-sm" type="button">Download manifest.json</button>
@@ -737,6 +868,11 @@ function renderExport() {
     </div>
   `;
 
+  document.getElementById("dl-zip").addEventListener("click", () => {
+    const { zipBytes, filename } = store.buildExitZip();
+    downloadBinaryFile(filename, zipBytes, "application/zip");
+    showToast(`Downloaded ${filename} (includes originals/, records.json, facts.csv, manifest.json — verifiable with 'subvault verify-package').`, false);
+  });
   document.getElementById("dl-review").addEventListener("click", () =>
     downloadTextFile("subvault-review.txt", pkg.reviewTxt, "text/plain;charset=utf-8")
   );
@@ -779,12 +915,29 @@ function renderActivityLog() {
     .join("");
 }
 
+function updateModeChip() {
+  const chip = document.getElementById("mode-chip");
+  if (!chip) return;
+  if (store.mode === "native_export") {
+    const nv = store.nativeVerification;
+    chip.textContent = nv?.verified
+      ? `Native CLI Export · ${nv.verifiedFiles} Files SHA-256 Verified`
+      : nv?.hasManifest
+      ? `Native CLI Export · ${nv.defects.length} Integrity Defect(s)`
+      : "Native CLI Export · records.json Loaded";
+  } else {
+    chip.textContent = "Interactive Demo · Pure Static";
+  }
+}
+
 function renderAll() {
+  updateModeChip();
   renderKpis();
   if (state.view === "ledger") renderLedger();
   if (state.view === "audit") renderAudit();
   if (state.view === "export") renderExport();
   renderActivityLog();
+  persistVault();
 }
 
 function handleImportSampleBatch() {
@@ -807,10 +960,46 @@ function handleImportSampleBatch() {
   }
 }
 
+async function handleNativeExportSelection(fileList) {
+  try {
+    const fileMap = new Map();
+    for (const file of fileList) {
+      const rel = file.webkitRelativePath || file.name;
+      const buf = await file.arrayBuffer();
+      fileMap.set(rel, new Uint8Array(buf));
+    }
+    const verdict = store.loadNativeExitPackage(fileMap);
+    state.selectedSourceId = store.sources[0]?.sourceId || null;
+    renderAll();
+    if (verdict.hasManifest && verdict.verified) {
+      showToast(
+        `Verified native CLI export (snapshot ${verdict.snapshotId.slice(0, 12)}…): ${verdict.verifiedFiles} file(s) passed SHA-256 checks.`,
+        false
+      );
+    } else if (verdict.hasManifest) {
+      showToast(
+        `Loaded native export with ${verdict.defects.length} integrity defect(s): ${verdict.defects.map((d) => `${d.path} (${d.reason})`).join(", ")}`,
+        true
+      );
+    } else {
+      showToast(
+        `Loaded records.json (${store.sources.length} sources). Select the full export folder including manifest.json to verify SHA-256 hashes.`,
+        true
+      );
+    }
+  } catch (err) {
+    showToast(`Could not load native export: ${err.message}`, true);
+  }
+}
+
 async function handleUploadedFiles(fileList) {
+  const files = [...fileList];
+  if (files.some((f) => f.name === "records.json" || f.name === "manifest.json")) {
+    return handleNativeExportSelection(files);
+  }
   let added = 0;
   let reused = 0;
-  for (const file of fileList) {
+  for (const file of files) {
     const content = await file.text();
     const lower = file.name.toLowerCase();
     const mediaType = lower.endsWith(".html") || lower.endsWith(".htm")
@@ -846,14 +1035,22 @@ function wireEvents() {
 
   document.getElementById("btn-reset-vault").addEventListener("click", () => {
     store.reset();
+    clearPersistedVault();
     state.selectedSourceId = null;
     renderAll();
-    showToast("Demo vault cleared. Click '+ Import Sample Batch' to reload preloaded bills from scratch.", true);
+    showToast("Demo vault & local browser cache cleared. Click '+ Import Sample Batch' to reload preloaded bills from scratch.", true);
   });
 
   document.getElementById("file-upload-input").addEventListener("change", (e) => {
     if (e.target.files?.length) {
       handleUploadedFiles(e.target.files);
+      e.target.value = "";
+    }
+  });
+
+  document.getElementById("native-export-input").addEventListener("change", (e) => {
+    if (e.target.files?.length) {
+      handleNativeExportSelection(e.target.files);
       e.target.value = "";
     }
   });
@@ -898,11 +1095,18 @@ function wireEvents() {
 initQuickSamples();
 wireEvents();
 
-// Preload the full 12-file synthetic corpus out-of-the-box!
-store.loadDemoCorpus("b_demo_initial");
+const params = new URLSearchParams(window.location.search);
+const hasDeterministicParams = params.has("view") || params.has("select") || params.has("demoEdit");
+state.persistEnabled = !hasDeterministicParams;
+
+// Restore saved local browser vault if present (except on explicit query-param demo links)
+const restored = state.persistEnabled && restorePersistedVault();
+if (!restored) {
+  // Preload the full 12-file synthetic corpus out-of-the-box!
+  store.loadDemoCorpus("b_demo_initial");
+}
 
 // Select September receipt (demonstrates SHA-256 duplicate reuse + decision chain right away)
-const params = new URLSearchParams(window.location.search);
 const selectName = params.get("select");
 if (selectName) {
   const found = store.sources.find((s) => s.displayName === selectName);

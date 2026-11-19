@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,7 +39,15 @@ assert.equal(audit.maskedUnassigned.length, 1, "must keep masked j*** email unas
 assert.equal(audit.separatedAccounts.length, 1, "Paperlantern Cloud personal & work accounts must stay separate");
 assert.equal(audit.separatedAccounts[0].merchant, "Paperlantern Cloud");
 
-// 3. Verify Format 4 HTML table extraction & CSS safety boundary
+// 3. Verify masked account human attribution & undo
+const maskedSrc = audit.maskedUnassigned[0];
+store.assignMaskedAccount(maskedSrc.sourceId, "jordan.hale.example@paperlantern.example", "Work (Attributed)");
+assert.equal(store.getAuditReport().maskedUnassigned.length, 0, "attributed notice leaves unassigned queue");
+assert.equal(maskedSrc.originalAccountEmail, "j***@paperlantern.example", "original masked email stays untouched");
+store.undoAccountAssignment(maskedSrc.sourceId);
+assert.equal(store.getAuditReport().maskedUnassigned.length, 1, "undo restores unassigned masked state");
+
+// 4. Verify Format 4 HTML table extraction & CSS safety boundary
 const htmlSource = store.sources.find((s) => s.displayName === "northline-2026-11-email.html");
 assert.ok(htmlSource, "HTML bill must be in demo corpus");
 const htmlFacts = store.getFactsForSource(htmlSource.sourceId);
@@ -49,7 +59,7 @@ assert.equal(styledRes.source.preservation, "preserved");
 assert.equal(styledRes.source.extractionStatus, "unsupported");
 assert.equal(store.getFactsForSource(styledRes.source.sourceId).length, 0);
 
-// 4. Verify human correction & undo survive re-import without duplicating objects
+// 5. Verify human correction & undo survive re-import without duplicating objects
 const sepSource = store.sources.find((s) => s.displayName === "v-2026-09-receipt.pdf");
 const amtFact = store.getFactsForSource(sepSource.sourceId).find((f) => f.factType === "stated_amount_paid");
 assert.equal(amtFact.value.amount_text, "15.99");
@@ -63,11 +73,17 @@ assert.equal(secondLoad.added, 0, "re-import must create zero new objects");
 assert.equal(secondLoad.reused, 12, "all 12 files must reuse existing SHA-256 objects");
 assert.equal(amtFact.value.amount_text, "14.99", "human correction must survive re-import");
 
+// 6. Verify snapshot serialization round-trip (localStorage contract)
+const cloned = new SubVaultStore();
+assert.equal(cloned.fromSnapshot(JSON.parse(JSON.stringify(store.toSnapshot()))), true);
+assert.equal(cloned.sources.length, store.sources.length);
+assert.equal(cloned.objects.size, store.objects.size);
+
 store.undoLastDecision(amtFact.factId);
 assert.equal(amtFact.value.amount_text, "15.99", "undo must restore previous value");
 assert.equal(store.getDecisionsForFact(amtFact.factId).length, 3, "rule_adopt + human_correct + undo");
 
-// 5. Verify offline exit package integrity
+// 7. Verify offline exit package integrity & pure-JS ZIP build
 const pkg = store.buildExitPackage();
 assert.equal(pkg.manifest.completeness, "complete");
 assert.equal(pkg.snapshotId, sha256Text(pkg.recordsJson));
@@ -77,9 +93,88 @@ for (const entry of pkg.manifest.files) {
   if (entry.path === "review.txt") assert.equal(entry.sha256, sha256Text(pkg.reviewTxt));
 }
 assert.ok(pkg.reviewTxt.includes("CURRENT CONCLUSIONS"));
-assert.ok(pkg.factsCsv.startsWith("fact_id,source_id,"));
+assert.ok(
+  pkg.factsCsv.startsWith(
+    "fact_id,source_id,candidate_id,fact_type,revision,statement,currency,amount_text,period_start,period_end,latest_decision_id"
+  ),
+  "facts.csv header must match native Rust exporter contract"
+);
 
-// 6. Verify static hosting & subpath safety in web/
+// Verify native export loader round-trip (clean + tamper detection)
+const fileMap = new Map([
+  ["export-pack/manifest.json", pkg.manifestJson],
+  ["export-pack/records.json", pkg.recordsJson],
+  ["export-pack/facts.csv", pkg.factsCsv],
+  ["export-pack/review.txt", pkg.reviewTxt],
+  ...pkg.originals.map((o) => [`export-pack/${o.path}`, o.bytes])
+]);
+const loadedNative = new SubVaultStore();
+const verdict = loadedNative.loadNativeExitPackage(fileMap);
+assert.equal(verdict.verified, true, `native export loader must verify clean package: ${JSON.stringify(verdict)}`);
+assert.equal(verdict.defects.length, 0);
+assert.equal(loadedNative.sources.length, store.sources.length);
+
+// Flip one byte in records.json -> must detect defect
+const badMap = new Map(fileMap);
+badMap.set("export-pack/records.json", pkg.recordsJson + " ");
+const badVerdict = new SubVaultStore().loadNativeExitPackage(badMap);
+assert.equal(badVerdict.verified, false, "tampered records.json must fail verification");
+assert.ok(badVerdict.defects.length >= 1);
+
+// 8. Bidirectional Rust CLI <-> Web Demo interop verification (when native binary exists)
+const nativeBin = [
+  path.join(root, "target/release/subvault"),
+  path.join(root, "target/debug/subvault")
+].find((p) => fs.existsSync(p));
+
+if (nativeBin) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "subvault-interop-"));
+  try {
+    // A) Web-exported ZIP -> unzip -> native `subvault verify-package` must pass!
+    const { zipBytes } = store.buildExitZip();
+    const zipPath = path.join(tmpDir, "web-exit.zip");
+    const unzipDir = path.join(tmpDir, "web-unzipped");
+    fs.writeFileSync(zipPath, zipBytes);
+    fs.mkdirSync(unzipDir);
+    execFileSync("python3", ["-m", "zipfile", "-e", zipPath, unzipDir]);
+    const verifyOut = JSON.parse(
+      execFileSync(nativeBin, ["verify-package", "--package", unzipDir], { encoding: "utf8" })
+    );
+    assert.equal(verifyOut.outcome, "Verified", `Web ZIP failed native verify-package: ${JSON.stringify(verifyOut)}`);
+    assert.equal(verifyOut.facts_csv_checked, true);
+
+    // B) Native `subvault export` -> Web `loadNativeExitPackage` must verify cleanly!
+    const vaultDir = path.join(tmpDir, "vault");
+    const billPath = path.join(tmpDir, "bill.html");
+    const nativePack = path.join(tmpDir, "native-export");
+    fs.writeFileSync(
+      billPath,
+      "<!doctype html><html><body><table><tr><th>Amount paid</th><td>USD 19.50</td></tr><tr><th>Service period:</th><td>2026-11-01 through 2026-11-30</td></tr></table></body></html>\n"
+    );
+    execFileSync(nativeBin, ["init", "--vault", vaultDir, "--format", "4"]);
+    execFileSync(nativeBin, ["html", "--vault", vaultDir, "--command-id", "c1", "--source", billPath]);
+    execFileSync(nativeBin, ["export", "--vault", vaultDir, "--out", nativePack]);
+
+    const nativeFiles = new Map();
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else nativeFiles.set(path.relative(tmpDir, full).replace(/\\/g, "/"), fs.readFileSync(full));
+      }
+    };
+    walk(nativePack);
+    const interopStore = new SubVaultStore();
+    const nativeVerdict = interopStore.loadNativeExitPackage(nativeFiles);
+    assert.equal(nativeVerdict.verified, true, `Native export failed Web verifier: ${JSON.stringify(nativeVerdict)}`);
+    assert.equal(interopStore.sources.length, 1);
+    assert.equal(interopStore.facts.length, 2);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+// 9. Verify static hosting & subpath safety in web/
 assert.ok(fs.existsSync(path.join(webDir, ".nojekyll")), "web/.nojekyll must exist for GitHub Pages");
 const html = fs.readFileSync(path.join(webDir, "index.html"), "utf8");
 assert.ok(!/(?:src|href)\s*=\s*["']\//.test(html), "index.html must not contain root-absolute / paths");
@@ -94,4 +189,6 @@ for (const match of html.matchAll(/(?:src|href)\s*=\s*["'](\.\/[^"']+)["']/g)) {
 const css = fs.readFileSync(path.join(webDir, "styles.css"), "utf8");
 assert.ok(!/url\(\s*['"]?\//.test(css), "styles.css must not contain root-absolute url(/...)");
 
-console.log("web smoke & subpath tests passed (all assertions green)");
+console.log(
+  `web smoke, subpath & ${nativeBin ? "bidirectional Rust-CLI<->Web interop " : ""}tests passed (all assertions green)`
+);

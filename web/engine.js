@@ -2,6 +2,7 @@
 // Rust/SQLite preservation, extraction, append-only decision, and offline-exit contracts.
 
 import { DEMO_BATCH_DOCS, REVIEW_ANCHOR_DATE } from "./demo-data.js";
+import { buildZip } from "./zip.js";
 
 // --- Deterministic Pure-JS SHA-256 (works on http://, https://, file://, and Node) ---
 
@@ -451,13 +452,16 @@ export class SubVaultStore {
   }
 
   reset() {
+    this.mode = "demo";
+    this.nativeVerification = null;
     this.vaultFormat = 4;
     this.reviewAnchorDate = REVIEW_ANCHOR_DATE;
     this.objects = new Map();      // sha256 -> object record
     this.sources = [];             // array of source records (ordered)
     this.occurrences = [];         // array of occurrence records
     this.facts = [];               // array of fact records
-    this.decisions = [];           // append-only decision chain
+    this.decisions = [];           // append-only fact decision chain
+    this.accountDecisions = [];    // append-only account attribution decisions for masked notices
     this.activityLog = [];         // human-readable audit log of recent commands
     this.seq = 1;
   }
@@ -562,6 +566,8 @@ export class SubVaultStore {
       merchant: inferredMerchant,
       accountLabel: inferredAccount,
       accountEmail: inferredEmail,
+      originalAccountLabel: inferredAccount,
+      originalAccountEmail: inferredEmail,
       billingCategory: input.billingCategory || inferCategory(input.content, input.mediaType),
       orderId: input.orderId || extracted.metadata.orderId || extracted.metadata.docId || null,
       scenarioTags: input.scenarioTags || [],
@@ -734,6 +740,79 @@ export class SubVaultStore {
     return { fact, decision };
   }
 
+  getAccountDecisionsForSource(sourceId) {
+    return this.accountDecisions.filter((d) => d.sourceId === sourceId);
+  }
+
+  assignMaskedAccount(sourceId, targetEmail, accountLabel = "Attributed", actorId = "act_human_reviewer") {
+    const email = String(targetEmail || "").trim();
+    if (!email || !email.includes("@") || email.includes("*")) {
+      throw new Error("Provide a full unmasked account email address.");
+    }
+    const source = this.sources.find((s) => s.sourceId === sourceId);
+    if (!source) throw new Error("Source not found");
+    const prior = { accountEmail: source.accountEmail, accountLabel: source.accountLabel };
+    const next = { accountEmail: email, accountLabel: String(accountLabel || "Attributed").trim() };
+    source.accountEmail = next.accountEmail;
+    source.accountLabel = next.accountLabel;
+
+    const decision = {
+      decisionId: this.nextId("dec", `acct:${sourceId}:${this.accountDecisions.length + 1}`),
+      sourceId,
+      commandId: this.nextId("cmd", `assign:${sourceId}`),
+      kind: "human_assign_account",
+      actorKind: "human",
+      actorId,
+      recordedAt: Date.now(),
+      priorValue: prior,
+      newValue: next,
+      targetDecisionId: null
+    };
+    this.accountDecisions.push(decision);
+    this.activityLog.unshift({
+      type: "human_assign_account",
+      commandId: decision.commandId,
+      sourceId,
+      message: `Attributed masked notice "${source.displayName}" (${source.originalAccountEmail}) → ${next.accountEmail} (${next.accountLabel}). Original bytes untouched.`
+    });
+    return { source, decision };
+  }
+
+  undoAccountAssignment(sourceId, actorId = "act_human_reviewer") {
+    const source = this.sources.find((s) => s.sourceId === sourceId);
+    if (!source) throw new Error("Source not found");
+    const list = this.getAccountDecisionsForSource(sourceId);
+    const latest = list[list.length - 1];
+    if (!latest || latest.kind === "undo") {
+      throw new Error("No account attribution to undo");
+    }
+    const prior = { accountEmail: source.accountEmail, accountLabel: source.accountLabel };
+    const restored = { ...latest.priorValue };
+    source.accountEmail = restored.accountEmail;
+    source.accountLabel = restored.accountLabel;
+
+    const decision = {
+      decisionId: this.nextId("dec", `acct_undo:${sourceId}:${this.accountDecisions.length + 1}`),
+      sourceId,
+      commandId: this.nextId("cmd", `undo_assign:${sourceId}`),
+      kind: "undo",
+      actorKind: "human",
+      actorId,
+      recordedAt: Date.now(),
+      priorValue: prior,
+      newValue: restored,
+      targetDecisionId: latest.decisionId
+    };
+    this.accountDecisions.push(decision);
+    this.activityLog.unshift({
+      type: "undo",
+      commandId: decision.commandId,
+      sourceId,
+      message: `Undid account attribution on "${source.displayName}": restored ${restored.accountEmail} (${restored.accountLabel}).`
+    });
+    return { source, decision };
+  }
+
   getFactsForSource(sourceId) {
     return this.facts.filter((f) => f.sourceId === sourceId);
   }
@@ -801,9 +880,11 @@ export class SubVaultStore {
       }
     }
 
-    // Masked unassigned accounts
-    const maskedUnassigned = this.sources.filter((s) =>
-      s.candidates.some((c) => c.kind === "masked_account_email")
+    // Masked unassigned accounts (only those still masked / unattributed by a human)
+    const maskedUnassigned = this.sources.filter(
+      (s) =>
+        s.accountEmail.includes("*") &&
+        s.candidates.some((c) => c.kind === "masked_account_email")
     );
 
     // Non-payment totals (credit notes, order confirmations)
@@ -838,7 +919,9 @@ export class SubVaultStore {
     const duplicateHits = this.occurrences.filter((o) => o.storageReused).length;
     const paidFacts = this.facts.filter((f) => f.factType === "stated_amount_paid");
     const statedUsdTotal = paidFacts.reduce((sum, f) => sum + parseFloat(f.value.amount_text || "0"), 0);
-    const humanCorrections = this.decisions.filter((d) => d.kind === "human_correct").length;
+    const humanCorrections =
+      this.decisions.filter((d) => d.kind === "human_correct").length +
+      this.accountDecisions.filter((d) => d.kind === "human_assign_account").length;
     const needsHumanCall = audit.conflicts.length + audit.maskedUnassigned.length;
 
     return {
@@ -919,13 +1002,17 @@ export class SubVaultStore {
     return lines.join("\n");
   }
 
-  // --- Verifiable Offline Exit Package (mirrors src/export.rs) ---
+  // --- Verifiable Offline Exit Package (100% compatible with `subvault verify-package`) ---
 
   buildExitPackage() {
+    const objectEntries = [...this.objects.values()];
     const recordsObj = {
       package_version: "offline-exit-1",
       vault_format: this.vaultFormat,
-      completeness: "complete",
+      protection: "undecided",
+      security_complete: false,
+      synthetic_only: true,
+      live_directory_copy: false,
       review_anchor_date: this.reviewAnchorDate,
       field_notes: {
         payment_verified: "false on all rule-adopted facts; receipts are source statements, not bank settlement proof.",
@@ -939,19 +1026,48 @@ export class SubVaultStore {
         media_type: s.mediaType,
         role: s.role,
         merchant: s.merchant,
+        account_label: s.accountLabel,
         account_email: s.accountEmail,
-        preservation: s.preservation,
-        occurrences: this.getOccurrencesForSource(s.sourceId).map((o) => ({
-          occurrence_id: o.occurrenceId,
-          display_name: o.displayName,
-          external_path: o.externalPath,
-          storage_reused: o.storageReused
-        }))
+        original_account_email: s.originalAccountEmail,
+        preservation: s.preservation
       })),
+      occurrences: this.occurrences.map((o) => ({
+        occurrence_id: o.occurrenceId,
+        source_id: o.sourceId,
+        command_id: o.commandId,
+        batch_id: o.batchId,
+        display_name: o.displayName,
+        external_path: o.externalPath,
+        storage_reused: o.storageReused,
+        recorded_at: o.recordedAt
+      })),
+      objects: objectEntries.map((o) => ({
+        object_id: o.objectId,
+        content_sha256: o.contentSha256,
+        byte_length: o.byteLength,
+        stored_relpath: o.relpath,
+        stored_relpath_differs: false,
+        package_path: `originals/${o.objectId}`,
+        copy_state: "copied"
+      })),
+      candidates: this.sources.flatMap((s) =>
+        s.candidates.map((c) => ({
+          candidate_id: c.candidateId,
+          source_id: s.sourceId,
+          object_id: s.objectId,
+          ordinal: c.ordinal,
+          kind: c.kind,
+          usable: Boolean(c.usable),
+          excerpt: c.excerpt,
+          value: c.value,
+          locator: c.locator,
+          cited_by_fact: this.facts.some((f) => f.candidateId === c.candidateId)
+        }))
+      ),
       facts: this.facts.map((f) => ({
         fact_id: f.factId,
         source_id: f.sourceId,
-        candidate_id: f.candidateId,
+        candidate_id: f.candidateId || "",
         fact_type: f.factType,
         revision: f.revision,
         value: f.value,
@@ -960,50 +1076,52 @@ export class SubVaultStore {
       decisions: this.decisions.map((d) => ({
         decision_id: d.decisionId,
         fact_id: d.factId,
+        command_id: d.commandId,
+        slot: d.slot,
         kind: d.kind,
         actor_kind: d.actorKind,
+        actor_id: d.actorId,
+        recorded_at: d.recordedAt,
+        rule_version: d.ruleVersion,
         prior_value: d.priorValue,
         new_value: d.newValue,
         target_decision_id: d.targetDecisionId
-      }))
+      })),
+      account_decisions: this.accountDecisions
     };
 
     const recordsJson = JSON.stringify(recordsObj, null, 2);
     const snapshotId = sha256Text(recordsJson);
 
+    // Exact column contract from src/export.rs (`facts_csv`) for native `verify-package` parity
     const csvHeader = [
       "fact_id",
       "source_id",
-      "merchant",
-      "account_email",
+      "candidate_id",
       "fact_type",
       "revision",
+      "statement",
       "currency",
       "amount_text",
       "period_start",
       "period_end",
-      "payment_verified",
-      "current_status",
       "latest_decision_id"
     ].join(",");
 
     const csvRows = this.facts.map((f) => {
-      const s = this.sources.find((src) => src.sourceId === f.sourceId);
       const decs = this.getDecisionsForFact(f.factId);
       const latestDec = decs.length ? decs[decs.length - 1].decisionId : "";
       const cols = [
         f.factId,
         f.sourceId,
-        s?.merchant || "",
-        s?.accountEmail || "",
+        f.candidateId || "",
         f.factType,
         String(f.revision),
+        f.value.statement || "source_stated",
         f.value.currency || "",
         f.value.amount_text || "",
         f.value.period_start || "",
         f.value.period_end || "",
-        String(Boolean(f.value.payment_verified)),
-        f.value.current_status || "unknown",
         latestDec
       ];
       return cols.map(csvEscape).join(",");
@@ -1016,26 +1134,34 @@ export class SubVaultStore {
       { path: "records.json", sha256: snapshotId, byte_length: utf8Bytes(recordsJson).length },
       { path: "facts.csv", sha256: sha256Text(factsCsv), byte_length: utf8Bytes(factsCsv).length },
       { path: "review.txt", sha256: sha256Text(reviewTxt), byte_length: utf8Bytes(reviewTxt).length },
-      ...[...this.objects.values()].map((o) => ({
+      ...objectEntries.map((o) => ({
         path: `originals/${o.objectId}`,
         sha256: o.contentSha256,
-        byte_length: o.byteLength
+        byte_length: o.byteLength,
+        object_id: o.objectId
       }))
     ].sort((a, b) => a.path.localeCompare(b.path));
 
     const manifestObj = {
       package_version: "offline-exit-1",
-      completeness: "complete",
       snapshot_id: snapshotId,
+      completeness: "complete",
       vault_format: this.vaultFormat,
+      protection: "undecided",
+      security_complete: false,
+      synthetic_only: true,
+      live_directory_copy: false,
+      files,
+      missing: [],
       counts: {
         sources: this.sources.length,
-        objects: this.objects.size,
         occurrences: this.occurrences.length,
+        objects: this.objects.size,
+        objects_copied: this.objects.size,
+        objects_not_copied: 0,
         facts: this.facts.length,
         decisions: this.decisions.length
-      },
-      files
+      }
     };
     const manifestJson = JSON.stringify(manifestObj, null, 2);
 
@@ -1045,8 +1171,272 @@ export class SubVaultStore {
       factsCsv,
       manifestJson,
       reviewTxt,
-      manifest: manifestObj
+      manifest: manifestObj,
+      originals: objectEntries.map((o) => ({
+        path: `originals/${o.objectId}`,
+        objectId: o.objectId,
+        bytes: utf8Bytes(o.rawContent)
+      }))
     };
+  }
+
+  buildExitZip() {
+    const pkg = this.buildExitPackage();
+    const entries = [
+      { path: "manifest.json", bytes: utf8Bytes(pkg.manifestJson) },
+      { path: "records.json", bytes: utf8Bytes(pkg.recordsJson) },
+      { path: "facts.csv", bytes: utf8Bytes(pkg.factsCsv) },
+      { path: "review.txt", bytes: utf8Bytes(pkg.reviewTxt) },
+      ...pkg.originals.map((o) => ({ path: o.path, bytes: o.bytes }))
+    ].sort((a, b) => a.path.localeCompare(b.path));
+    return {
+      zipBytes: buildZip(entries),
+      filename: `subvault-offline-exit-${pkg.snapshotId.slice(0, 10)}.zip`,
+      pkg
+    };
+  }
+
+  // --- Load & Verify Native CLI `subvault export` Package ---
+
+  loadNativeExitPackage(fileMap) {
+    const entries = fileMap instanceof Map ? fileMap : new Map(Object.entries(fileMap));
+    const normalized = new Map();
+    for (const [rawPath, val] of entries.entries()) {
+      const clean = String(rawPath).replace(/\\/g, "/").replace(/^\/+/, "");
+      const bytes = val instanceof Uint8Array ? val : utf8Bytes(String(val));
+      normalized.set(clean, bytes);
+    }
+
+    // Strip a common leading folder prefix (e.g. from webkitdirectory selection `my-export/records.json`)
+    const findKey = (target) => {
+      if (normalized.has(target)) return { prefix: "", key: target };
+      for (const k of normalized.keys()) {
+        if (k.endsWith(`/${target}`)) {
+          return { prefix: k.slice(0, k.length - target.length), key: k };
+        }
+      }
+      return null;
+    };
+
+    const recHit = findKey("records.json");
+    if (!recHit) {
+      throw new Error("Selected files must include records.json from a SubVault offline-exit-1 export.");
+    }
+    const prefix = recHit.prefix;
+    const getBytes = (rel) => normalized.get(prefix + rel) || null;
+    const dec = new TextDecoder("utf-8", { fatal: false });
+
+    const recordsBytes = getBytes("records.json");
+    const recordsText = dec.decode(recordsBytes);
+    const records = JSON.parse(recordsText);
+    if (records.package_version !== "offline-exit-1") {
+      throw new Error(`Unsupported package_version: ${records.package_version}`);
+    }
+
+    const defects = [];
+    let verifiedFiles = 0;
+    let snapshotId = sha256Bytes(recordsBytes);
+    const manifestBytes = getBytes("manifest.json");
+    let manifest = null;
+
+    if (manifestBytes) {
+      manifest = JSON.parse(dec.decode(manifestBytes));
+      if (manifest.snapshot_id && manifest.snapshot_id !== snapshotId) {
+        defects.push({ path: "records.json", reason: "snapshot_id_mismatch" });
+      }
+      for (const item of manifest.files || []) {
+        const b = getBytes(item.path);
+        if (!b) {
+          defects.push({ path: item.path, reason: "missing_file" });
+          continue;
+        }
+        const h = sha256Bytes(b);
+        if (b.length !== item.byte_length || h !== item.sha256) {
+          defects.push({ path: item.path, reason: "hash_mismatch" });
+          continue;
+        }
+        verifiedFiles++;
+      }
+    }
+
+    // Hydrate store cleanly from native export
+    this.reset();
+    this.mode = "native_export";
+    this.vaultFormat = Number(records.vault_format || 4);
+    this.nativeVerification = {
+      hasManifest: Boolean(manifest),
+      verified: Boolean(manifest) && defects.length === 0,
+      verifiedFiles,
+      defects,
+      snapshotId,
+      completeness: manifest?.completeness || "unknown"
+    };
+
+    const rawOccs = Array.isArray(records.occurrences) ? records.occurrences : [];
+    const rawCands = Array.isArray(records.candidates) ? records.candidates : [];
+    const rawFacts = Array.isArray(records.facts) ? records.facts : [];
+    const rawDecisions = Array.isArray(records.decisions) ? records.decisions : [];
+
+    for (const obj of records.objects || []) {
+      const origBytes = obj.package_path ? getBytes(obj.package_path) : null;
+      const rawContent = origBytes
+        ? dec.decode(origBytes)
+        : `(Original bytes at ${obj.package_path || obj.object_id} were not included in this file selection.)`;
+      this.objects.set(obj.content_sha256, {
+        objectId: obj.object_id,
+        contentSha256: obj.content_sha256,
+        byteLength: obj.byte_length,
+        relpath: obj.stored_relpath || `objects/${obj.object_id}`,
+        rawContent,
+        state: obj.copy_state || "complete"
+      });
+    }
+
+    for (const o of rawOccs) {
+      this.occurrences.push({
+        occurrenceId: o.occurrence_id,
+        sourceId: o.source_id,
+        objectId: (records.sources || []).find((s) => s.source_id === o.source_id)?.object_id || "",
+        commandId: o.command_id,
+        batchId: o.batch_id,
+        displayName: o.display_name,
+        externalPath: o.external_path || o.display_name,
+        storageReused: Boolean(o.storage_reused),
+        recordedAt: o.recorded_at || Date.now()
+      });
+    }
+
+    for (const s of records.sources || []) {
+      const obj = this.objects.get(s.content_sha256);
+      const rawContent = obj?.rawContent || "";
+      const occs = this.occurrences.filter((o) => o.sourceId === s.source_id);
+      const primaryName = occs[0]?.displayName || `${s.object_id}`;
+      const primaryPath = occs[0]?.externalPath || primaryName;
+      const meta = extractCommonMetadata(rawContent);
+      const cands = rawCands
+        .filter((c) => c.source_id === s.source_id)
+        .map((c) => ({
+          candidateId: c.candidate_id,
+          ordinal: c.ordinal,
+          kind: c.kind,
+          usable: Boolean(c.usable),
+          excerpt: c.excerpt || "",
+          displayExcerpt: c.value?.display_excerpt || c.excerpt || "",
+          value: c.value || {},
+          locator: c.locator || null
+        }));
+
+      const acctEmail = s.account_email || meta.email || "Not stated";
+      const acctLabel =
+        s.account_label ||
+        (acctEmail.includes("*") ? "Unassigned (Masked)" : /work/i.test(rawContent) ? "Work" : "Personal");
+
+      this.sources.push({
+        sourceId: s.source_id,
+        objectId: s.object_id,
+        contentSha256: s.content_sha256,
+        byteLength: s.byte_length,
+        mediaType: s.media_type,
+        role: s.role || (s.media_type?.includes("html") ? "user_provided_html" : "native_export_source"),
+        displayName: primaryName,
+        externalPath: primaryPath,
+        merchant: s.merchant || inferMerchant(rawContent, primaryName),
+        accountLabel: acctLabel,
+        accountEmail: acctEmail,
+        originalAccountLabel: acctLabel,
+        originalAccountEmail: s.original_account_email || acctEmail,
+        billingCategory: inferCategory(rawContent, s.media_type),
+        orderId: meta.orderId || meta.docId || null,
+        scenarioTags: ["native-cli-export"],
+        preservation: "preserved",
+        extractionStatus: cands.length > 0 ? "ok" : "no_match",
+        extractionRule: "native-export",
+        extractionNote: null,
+        candidates: cands,
+        occurrenceIds: occs.map((o) => o.occurrenceId),
+        metadata: meta
+      });
+    }
+
+    for (const d of rawDecisions) {
+      this.decisions.push({
+        decisionId: d.decision_id,
+        factId: d.fact_id,
+        sourceId: rawFacts.find((f) => f.fact_id === d.fact_id)?.source_id || "",
+        commandId: d.command_id || "",
+        slot: d.slot || "",
+        kind: d.kind,
+        actorKind: d.actor_kind,
+        actorId: d.actor_id,
+        ruleVersion: d.rule_version || null,
+        recordedAt: d.recorded_at || Date.now(),
+        priorValue: d.prior_value || null,
+        newValue: d.new_value || {},
+        targetDecisionId: d.target_decision_id || null
+      });
+    }
+
+    for (const f of rawFacts) {
+      const factDecs = this.decisions.filter((d) => d.factId === f.fact_id);
+      const firstVal = factDecs[0]?.newValue || f.value;
+      this.facts.push({
+        factId: f.fact_id,
+        sourceId: f.source_id,
+        candidateId: f.candidate_id || null,
+        factType: f.fact_type,
+        revision: Number(f.revision || 1),
+        value: { ...(f.value || {}) },
+        originalValue: { ...(firstVal || f.value || {}) }
+      });
+    }
+
+    this.activityLog.unshift({
+      type: defects.length === 0 ? "committed" : "human_correct",
+      commandId: `native_${snapshotId.slice(0, 10)}`,
+      sourceId: this.sources[0]?.sourceId || "",
+      message: manifest
+        ? `Loaded native CLI export (format ${this.vaultFormat}, snapshot ${snapshotId.slice(0, 12)}…): verified ${verifiedFiles} file(s), ${defects.length} defect(s).`
+        : `Loaded standalone records.json (format ${this.vaultFormat}, ${this.sources.length} source(s)); select full export folder including manifest.json to verify SHA-256 hashes.`
+    });
+
+    return this.nativeVerification;
+  }
+
+  // --- Browser LocalStorage Snapshot Serialization ---
+
+  toSnapshot() {
+    return {
+      schema: "subvault-web-state-1",
+      mode: this.mode,
+      nativeVerification: this.nativeVerification,
+      vaultFormat: this.vaultFormat,
+      reviewAnchorDate: this.reviewAnchorDate,
+      seq: this.seq,
+      objects: [...this.objects.entries()],
+      sources: this.sources,
+      occurrences: this.occurrences,
+      facts: this.facts,
+      decisions: this.decisions,
+      accountDecisions: this.accountDecisions,
+      activityLog: this.activityLog.slice(0, 40)
+    };
+  }
+
+  fromSnapshot(snap) {
+    if (!snap || snap.schema !== "subvault-web-state-1") return false;
+    this.mode = snap.mode || "demo";
+    this.nativeVerification = snap.nativeVerification || null;
+    this.vaultFormat = Number(snap.vaultFormat || 4);
+    this.reviewAnchorDate = snap.reviewAnchorDate || REVIEW_ANCHOR_DATE;
+    this.seq = Number(snap.seq || 1);
+    this.objects = new Map(snap.objects || []);
+    this.sources = snap.sources || [];
+    this.occurrences = snap.occurrences || [];
+    this.facts = snap.facts || [];
+    this.decisions = snap.decisions || [];
+    this.accountDecisions = snap.accountDecisions || [];
+    this.activityLog = snap.activityLog || [];
+    return true;
   }
 }
 
