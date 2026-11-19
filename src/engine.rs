@@ -244,6 +244,7 @@ pub fn help_report() -> Report {
             "facts --vault PATH [--source-id ID] [--fact-id ID]",
             "review --vault PATH --out PATH [--package PATH]",
             "export --vault PATH --out PATH [--allow-partial yes]",
+            "verify-package --package PATH",
             "correct --vault PATH --command-id ID --fact-id ID --expected-revision N --amount-text TEXT --actor-id ID",
             "undo --vault PATH --command-id ID --decision-id ID --expected-revision N --actor-id ID",
             "cancel --vault PATH --command-id ID --generation N [--kind preservation|fragment|extraction]",
@@ -2269,9 +2270,9 @@ fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
     Ok(1)
 }
 
-fn visible_main_format(
-    db: &Path,
-) -> Result<(i64, Option<String>, Option<String>, Option<String>), Fail> {
+type FormatView = (i64, Option<String>, Option<String>, Option<String>);
+
+fn visible_main_format(db: &Path) -> Result<FormatView, Fail> {
     let uri = readonly_uri(db)?;
     let conn = Connection::open_with_flags(
         &uri,
@@ -2378,9 +2379,7 @@ fn accept_connection_format(db: &Path, conn: &Connection) -> Result<i64, Fail> {
     )
 }
 
-fn effective_view(
-    conn: &Connection,
-) -> Result<(i64, Option<String>, Option<String>, Option<String>), Fail> {
+fn effective_view(conn: &Connection) -> Result<FormatView, Fail> {
     let version = store::user_version(conn)
         .map_err(|err| busy_is_locked(err, "user_version_unreadable", false))?;
     let format = store::meta(conn, "vault_format")

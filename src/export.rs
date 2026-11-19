@@ -1184,8 +1184,7 @@ fn facts_csv(facts: &[Value], decisions: &[DecisionRow]) -> Vec<u8> {
         let value = &fact["value"];
         let latest = decisions
             .iter()
-            .filter(|row| row.fact_id == fact_id)
-            .last()
+            .rfind(|row| row.fact_id == fact_id)
             .map(|row| row.decision_id.as_str())
             .unwrap_or("");
         let cells = [

@@ -289,8 +289,8 @@ pub(super) fn read_facts(
                     .extra("new_effect", json!(false)),
             );
         }
-        let locator = candidate_anchor(&conn, &row.4, &row.1)?;
-        let decisions = decision_history(&conn, &row.0)?;
+        let locator = candidate_anchor(conn, &row.4, &row.1)?;
+        let decisions = decision_history(conn, &row.0)?;
         facts.push(json!({
             "fact_id": row.0,
             "source_id": row.1,
@@ -1155,6 +1155,7 @@ fn successor_count(conn: &Connection, fact_id: &str, decision_id: &str) -> Resul
     .map_err(|err| unseen_db(err, "successor_lookup"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_human(
     tx: &Transaction<'_>,
     decision_id: &str,
@@ -1239,6 +1240,7 @@ enum CommitProbe {
 }
 
 /// `correct` and `undo`. Fragment publish settles the same T3 receipt and does not read `commands`.
+#[allow(clippy::too_many_arguments)]
 fn conclude_commit(
     root: &Path,
     db: &Path,

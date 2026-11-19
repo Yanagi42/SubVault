@@ -687,6 +687,7 @@ fn commit(
     Ok(body)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receipt(
     req: &HtmlRequest,
     journal: &Journal,
@@ -1101,7 +1102,7 @@ fn record_block(
 
 fn collect_inline(tag: &tl::HTMLTag, parser: &tl::Parser, scan: &mut Scan) -> String {
     let mut text = String::new();
-    for handle in tag.children().top().iter().copied() {
+    for handle in tag.children().top().iter() {
         let Some(node) = handle.get(parser) else {
             scan.span_broken = true;
             continue;
@@ -1242,7 +1243,7 @@ struct RowCell {
 
 fn record_row(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Scan) {
     let mut cells = Vec::new();
-    for handle in tag.children().top().iter().copied() {
+    for handle in tag.children().top().iter() {
         let Some(node) = handle.get(parser) else {
             scan.span_broken = true;
             continue;
@@ -1300,7 +1301,7 @@ fn note_row_child(
 }
 
 fn walk_nested(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Scan) {
-    for handle in tag.children().top().iter().copied() {
+    for handle in tag.children().top().iter() {
         let Some(tl::Node::Tag(child)) = handle.get(parser) else {
             continue;
         };

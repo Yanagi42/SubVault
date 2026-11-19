@@ -12,6 +12,7 @@ mod lockfile;
 mod model;
 mod platform;
 mod store;
+mod verify_package;
 #[cfg(windows)]
 mod windows_file_id;
 #[cfg(windows)]

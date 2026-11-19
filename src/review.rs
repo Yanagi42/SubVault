@@ -320,6 +320,7 @@ fn csv_fact_keys(text: &str) -> Option<BTreeSet<String>> {
     Some(keys)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fact_key(
     fact_id: &str,
     source_id: &str,

@@ -406,9 +406,8 @@ fn continue_after_source(
                 .extra("run_id", json!(opened.run_id)));
         }
     };
-    match req.hooks.inject_point.as_deref() {
-        Some(point @ ("extract_status" | "replay_tx")) => return Err(missed(point)),
-        _ => {}
+    if let Some(point @ ("extract_status" | "replay_tx")) = req.hooks.inject_point.as_deref() {
+        return Err(missed(point));
     }
 
     let byte_len = journal.byte_length.unwrap_or(0) as u64;
@@ -907,6 +906,7 @@ enum V3Absent {
 }
 
 /// Format 3 only. The receipt read uses `t3_receipts`, not `commands`.
+#[allow(clippy::too_many_arguments)]
 fn settle_v3_commit(
     root: &Path,
     command_id: &str,
@@ -1059,6 +1059,7 @@ fn take_v3_commit_probe(hooks: &mut HookRun) -> Result<V3Probe, Fail> {
     Ok(probe)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_v3_commit(
     db: &Path,
     command_id: &str,
@@ -1300,7 +1301,7 @@ pub(super) fn read_candidates(
 ) -> Result<(i32, Value), Fail> {
     let schema = store::meta(conn, "body_schema").map_err(|err| unseen_db(err, "body_schema"))?;
     let html_schema =
-        store::meta(&conn, "html_body_schema").map_err(|err| unseen_db(err, "html_body_schema"))?;
+        store::meta(conn, "html_body_schema").map_err(|err| unseen_db(err, "html_body_schema"))?;
     let html = schema.is_none() && html_schema.as_deref() == Some(store::HTML_BODY_SCHEMA);
     if schema.is_none() && !html {
         let mut body = body_outcome("Candidates");
@@ -1315,7 +1316,7 @@ pub(super) fn read_candidates(
         return Err(refused("body_schema_unsupported").extra("new_effect", json!(false)));
     }
     for name in store::BODY_TABLES {
-        if !store::table_exists(&conn, name).map_err(|err| unseen_db(err, "body_schema"))? {
+        if !store::table_exists(conn, name).map_err(|err| unseen_db(err, "body_schema"))? {
             return Err(
                 Fail::new(EXIT_RECOVERY, "RecoveryRequired", "body_schema_mismatch")
                     .extra("new_effect", json!(false)),
@@ -1446,7 +1447,7 @@ pub(super) fn read_candidates(
         candidates.push(item);
     }
     drop(stmt);
-    let runs = list_runs(&conn, source_id, &mut alerts, &mut damaged)?;
+    let runs = list_runs(conn, source_id, &mut alerts, &mut damaged)?;
     let mut body = body_outcome("Candidates");
     body.insert("new_effect".into(), json!(false));
     body.insert("read_only".into(), json!(true));

@@ -79,6 +79,9 @@ pub fn execute(args: Vec<String>) -> Report {
     if command == "review" && (flags.stop_at.is_some() || flags.inject.is_some()) {
         return usage("review_has_no_hook");
     }
+    if command == "verify-package" && (flags.stop_at.is_some() || flags.inject.is_some()) {
+        return usage("verify_package_has_no_hook");
+    }
     let hooks = match hooks_from(&flags) {
         Ok(hooks) => hooks,
         Err(fail) => return fail.into_report(),
@@ -89,7 +92,7 @@ pub fn execute(args: Vec<String>) -> Report {
     if flags.allow_partial.is_some() && command != "export" {
         return usage("allow_partial_only_on_export");
     }
-    if flags.package.is_some() && command != "review" {
+    if flags.package.is_some() && command != "review" && command != "verify-package" {
         return usage("package_only_on_review");
     }
     match command.as_str() {
@@ -210,6 +213,12 @@ pub fn execute(args: Vec<String>) -> Report {
                 return usage("review_required_flags");
             };
             engine::review_sheet(&vault, &out, flags.package.as_deref())
+        }
+        "verify-package" => {
+            let Some(package) = flags.package else {
+                return usage("verify_package_required_flags");
+            };
+            crate::verify_package::verify_package(&package)
         }
         "export" => {
             let (Some(vault), Some(out)) = (flags.vault, flags.out) else {
