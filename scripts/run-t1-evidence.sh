@@ -4,7 +4,10 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
-out=/opt/cursor/artifacts/subvault-t0-t1
+out="${SUBVAULT_EVIDENCE_OUT:-/opt/cursor/artifacts/subvault-t0-t1}"
+if [[ "$out" == "/opt/cursor/artifacts/subvault-t0-t1" ]] && [[ ! -w /opt/cursor ]] && [[ ! -w /opt ]]; then
+  out="$root/target/t1-evidence-bundle"
+fi
 rm -rf "$out"
 mkdir -p "$out/licenses"
 
@@ -61,8 +64,19 @@ sha256sum "$bin" >"$out/binary.sha256"
 python3 - "$out/licenses" <<'PY'
 import os, shutil, subprocess, sys
 dest = sys.argv[1]
-registry = "/usr/local/cargo/registry/src"
-regs = [os.path.join(registry, name) for name in os.listdir(registry) if name.startswith("index.crates.io")]
+cargo_home = os.environ.get("CARGO_HOME") or os.path.expanduser("~/.cargo")
+registry_candidates = [
+    os.path.join(cargo_home, "registry", "src"),
+    "/usr/local/cargo/registry/src",
+]
+regs = []
+for registry in registry_candidates:
+    if os.path.isdir(registry):
+        regs.extend(
+            os.path.join(registry, name)
+            for name in os.listdir(registry)
+            if name.startswith("index.crates.io")
+        )
 tree = subprocess.check_output(["cargo", "tree", "--offline", "--locked", "--prefix", "none"], text=True)
 seen = []
 for line in tree.splitlines():

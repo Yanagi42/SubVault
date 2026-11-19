@@ -1,0 +1,82 @@
+name: Release Portable Bundles
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Portable Linux + Web Bundles
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 gcc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run pre-release verification gate
+        env:
+          SUBVAULT_GIT_SHA: ${{ github.sha }}
+        run: |
+          python3 synthetic/generate_corpus.py --check
+          cargo fetch --locked
+          cargo fmt --check
+          cargo clippy --lib --bins --locked -- -D warnings
+          cargo test --locked -- --test-threads=1
+
+      - name: Package portable archives & SHA256SUMS.txt
+        env:
+          SUBVAULT_GIT_SHA: ${{ github.sha }}
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+        run: |
+          bash scripts/package-release.sh "$TAG_NAME"
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+          node scripts/test-web.mjs
+
+      - name: Create or update GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" \
+              dist/*.zip \
+              dist/*.tar.gz \
+              dist/SHA256SUMS.txt \
+              --clobber
+          else
+            gh release create "$TAG_NAME" \
+              dist/*.zip \
+              dist/*.tar.gz \
+              dist/SHA256SUMS.txt \
+              --title "SubVault $TAG_NAME" \
+              --notes-file RELEASE_NOTES.md
+          fi

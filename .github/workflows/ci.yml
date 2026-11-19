@@ -27,6 +27,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -41,6 +43,11 @@ jobs:
 
       - name: Prefetch locked crates for offline worktree compatibility tests
         run: cargo fetch --locked
+
+      - name: Check formatting and Clippy lints (lib & binary)
+        run: |
+          cargo fmt --check
+          cargo clippy --lib --bins --locked -- -D warnings
 
       - name: Build release binary
         env:
