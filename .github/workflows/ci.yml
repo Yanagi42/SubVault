@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-and-package:
+    name: Rust Core, Web Demo & Release Bundle (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history for format-compatibility worktrees)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 gcc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Verify deterministic synthetic T0 corpus
+        run: python3 synthetic/generate_corpus.py --check
+
+      - name: Prefetch locked crates for offline worktree compatibility tests
+        run: cargo fetch --locked
+
+      - name: Build release binary
+        env:
+          SUBVAULT_GIT_SHA: ${{ github.sha }}
+        run: cargo build --locked --release
+
+      - name: Run full Rust unit & integration test suite
+        env:
+          SUBVAULT_GIT_SHA: ${{ github.sha }}
+        run: cargo test --locked -- --test-threads=1
+
+      - name: Run Web Demo unit & subpath asset checks
+        run: node scripts/test-web.mjs
+
+      - name: Build portable release bundle & verify SHA256SUMS
+        env:
+          SUBVAULT_GIT_SHA: ${{ github.sha }}
+        run: |
+          bash scripts/package-release.sh
+          (cd dist && sha256sum -c SHA256SUMS.txt)
