@@ -1,0 +1,77 @@
+name: Deploy Demo to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "web/**"
+      - "scripts/test-web.mjs"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate static demo & subpath asset links
+        run: node scripts/test-web.mjs
+
+      - name: Verify live subpath serving under /SubVault/
+        run: |
+          python3 - <<'PY'
+          import functools, http.server, shutil, socketserver, tempfile, threading, urllib.request
+          from pathlib import Path
+
+          with tempfile.TemporaryDirectory() as tmp:
+              shutil.copytree("web", Path(tmp) / "SubVault")
+              handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=tmp)
+              httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
+              port = httpd.server_address[1]
+              t = threading.Thread(target=httpd.serve_forever, daemon=True)
+              t.start()
+              try:
+                  for rel in ["", "index.html", "styles.css", "app.js", "engine.js", "demo-data.js", "assets/icon.svg"]:
+                      url = f"http://127.0.0.1:{port}/SubVault/{rel}"
+                      with urllib.request.urlopen(url) as resp:
+                          assert resp.status == 200, f"{url} returned {resp.status}"
+                  print("Verified all /SubVault/ static assets return HTTP 200")
+              finally:
+                  httpd.shutdown()
+                  httpd.server_close()
+          PY
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload static web artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "web"
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

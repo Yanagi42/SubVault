@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SubVault — Local-First Verifiable Subscription &amp; Receipt Vault (Live Demo)</title>
+  <meta name="description" content="Local-first, SHA-256 verifiable subscription, invoice, and software-license vault. No bank logins, no inbox OAuth, no fabricated Active/Expired states.">
+  <link rel="icon" type="image/svg+xml" href="./assets/icon.svg">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <img class="brand-icon" src="./assets/icon.svg" alt="SubVault mark" width="32" height="32">
+        <div>
+          <div class="brand-title">
+            <h1>SubVault</h1>
+            <span class="demo-chip">Interactive Demo · Pure Static</span>
+          </div>
+          <div class="brand-sub">Local-first, SHA-256 proof-backed subscription &amp; receipt vault — zero bank logins, zero inbox OAuth</div>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <button id="btn-import-sample" class="btn btn-emerald" type="button" title="Import the 12-file synthetic corpus (re-clicking demonstrates byte-identical duplicate detection)">
+          + Import Sample Batch
+        </button>
+        <label class="btn" for="file-upload-input" title="Drop or select local .html, .txt, .csv, or .pdf files — hashed locally in browser">
+          Upload Local File
+        </label>
+        <input id="file-upload-input" type="file" multiple accept=".html,.htm,.txt,.csv,.pdf" class="hidden">
+        <button id="btn-go-export" class="btn btn-primary" type="button">
+          Export Exit Pack
+        </button>
+        <button id="btn-reset-vault" class="btn btn-ghost" type="button" title="Clear the in-browser demo vault to test fresh import">
+          Reset Vault
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container" id="drop-zone">
+    <section class="demo-banner" aria-label="Demo controls">
+      <div class="demo-banner-copy">
+        <span class="badge badge-slate">Format 4 · Anchor 2026-11-14</span>
+        <span>
+          <strong>Preloaded synthetic corpus active:</strong> covers monthly/annual plans, personal vs. work accounts, byte-identical duplicate reuse, CSV vs. invoice conflicts, and static HTML bills.
+        </span>
+      </div>
+      <div class="quick-samples" id="quick-sample-bar">
+        <span class="quick-label">Try one-click:</span>
+      </div>
+    </section>
+
+    <div id="status-toast" class="toast" role="status" aria-live="polite">
+      <span id="status-toast-text"></span>
+      <button id="status-toast-close" class="btn btn-sm btn-ghost" type="button">Dismiss</button>
+    </div>
+
+    <section class="kpi-grid" id="kpi-grid" aria-label="Vault summary metrics"></section>
+
+    <nav class="nav-row" aria-label="Workspace views">
+      <div class="view-tabs" role="tablist">
+        <button class="tab-btn active" data-view="ledger" role="tab" aria-selected="true" type="button">
+          Overview Ledger <span class="tab-badge" id="tab-count-ledger">0</span>
+        </button>
+        <button class="tab-btn" data-view="audit" role="tab" aria-selected="false" type="button">
+          Duplicate &amp; Conflict Audit <span class="tab-badge tab-badge-amber" id="tab-count-audit">0</span>
+        </button>
+        <button class="tab-btn" data-view="export" role="tab" aria-selected="false" type="button">
+          Review Sheet &amp; Offline Exit <span class="tab-badge" id="tab-count-export">CSV + JSON</span>
+        </button>
+      </div>
+      <div class="brand-sub">
+        All processing happens locally in your browser. Drag &amp; drop any <code>.html</code>, <code>.txt</code>, or <code>.csv</code> file onto this page to test SHA-256 preservation.
+      </div>
+    </nav>
+
+    <!-- View 1: Overview Ledger + Right-side Evidence Inspector -->
+    <section id="view-ledger" class="workspace-grid">
+      <div class="panel">
+        <div class="panel-header">
+          <div class="filter-pills" id="filter-pills">
+            <button class="pill-btn active" data-filter="all" type="button">All Sources</button>
+            <button class="pill-btn" data-filter="subscriptions" type="button">Subscriptions</button>
+            <button class="pill-btn" data-filter="duplicates" type="button">Duplicates</button>
+            <button class="pill-btn" data-filter="review" type="button">Conflicts &amp; Ambiguities</button>
+            <button class="pill-btn" data-filter="other" type="button">One-Time &amp; HTML</button>
+          </div>
+          <input id="search-input" class="search-input" type="search" placeholder="Filter vendor, email, order, hash…">
+        </div>
+        <div class="table-wrap" id="ledger-table-container"></div>
+      </div>
+
+      <aside class="panel" id="inspector-panel" aria-label="Evidence and decision inspector">
+        <div class="panel-header">
+          <h2 class="panel-title">Evidence &amp; Decision Inspector</h2>
+          <span class="badge badge-emerald" id="inspector-integrity-badge">SHA-256 Verified</span>
+        </div>
+        <div class="inspector-body" id="inspector-body"></div>
+      </aside>
+    </section>
+
+    <!-- View 2: Duplicate Detection & Conflict Audit -->
+    <section id="view-audit" class="hidden"></section>
+
+    <!-- View 3: Read-Only Review Sheet & Verifiable Offline Exit -->
+    <section id="view-export" class="hidden"></section>
+
+    <section class="log-strip" aria-label="Recent vault command log">
+      <h4>Command &amp; Preservation Log (Append-Only Audit Trail)</h4>
+      <div class="log-entries" id="activity-log"></div>
+    </section>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
