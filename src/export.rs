@@ -1267,9 +1267,14 @@ fn field_notes(vault_format: i64) -> Value {
         "protection": "保护方式未定。这是合成库的明文副本，不是获准的真实资料出口。",
         "paths": "包内原件只用 originals/ 下的相对路径。出现记录里的外部路径只是当时的取得记录。"
     });
-    if vault_format == 4 {
+    if vault_format == 4 || vault_format == 5 {
         notes["html_original"] = json!(
             "包内 HTML 只作为文本保存和展示。程序不执行它，不连接网络，也不自动加载其中的外部引用。"
+        );
+    }
+    if vault_format == 5 {
+        notes["pdf_original"] = json!(
+            "包内 PDF 原样保存原始字节。文本提取只读取静态 PDF 内容流，不做 OCR，也不解密加密文档。"
         );
     }
     notes

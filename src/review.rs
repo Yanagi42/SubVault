@@ -619,6 +619,8 @@ fn render(
     );
     if facts_body["slice"].as_str() == Some("T4-html") {
         text.push_str("格式 4 不收纯文本片段。这份单没有把纯文本塞进这个库。\n");
+    } else if facts_body["slice"].as_str() == Some("T5-pdf") {
+        text.push_str("格式 5 收录静态 PDF 与 HTML 原件，不收纯文本片段，也不做 OCR。\n");
     }
     text.push_str("来源\n");
     if sources.is_empty() {

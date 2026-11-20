@@ -313,7 +313,11 @@ pub(super) fn read_facts(
     let mut body = honesty("Facts");
     body.insert(
         "slice".into(),
-        json!(if version == 4 { "T4-html" } else { "T3-facts" }),
+        json!(match version {
+            5 => "T5-pdf",
+            4 => "T4-html",
+            _ => "T3-facts",
+        }),
     );
     body.insert("new_effect".into(), json!(false));
     body.insert("read_only".into(), json!(true));

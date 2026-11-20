@@ -81,6 +81,14 @@ fn require_body_format(vault: &Path) -> Result<(), Fail> {
         .extra("schema_version_found", json!(4))
         .extra("new_effect", json!(false))
         .extra("vault_format", json!(4))),
+        5 => Err(Fail::new(
+            EXIT_VERSION,
+            "VersionUnsupported",
+            "format_5_refuses_fragment",
+        )
+        .extra("schema_version_found", json!(5))
+        .extra("new_effect", json!(false))
+        .extra("vault_format", json!(5))),
         version => Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(version))
@@ -100,7 +108,7 @@ fn needs_upgrade() -> Fail {
 fn as_body_slice(mut report: Report) -> Report {
     if let Some(map) = report.body.as_object_mut() {
         let slice = map.get("slice").and_then(|value| value.as_str());
-        if slice != Some("T3-facts") && slice != Some("T4-html") {
+        if slice != Some("T3-facts") && slice != Some("T4-html") && slice != Some("T5-pdf") {
             map.insert("slice".into(), json!("T2a-body"));
         }
     }
@@ -1302,8 +1310,11 @@ pub(super) fn read_candidates(
     let schema = store::meta(conn, "body_schema").map_err(|err| unseen_db(err, "body_schema"))?;
     let html_schema =
         store::meta(conn, "html_body_schema").map_err(|err| unseen_db(err, "html_body_schema"))?;
+    let pdf_schema =
+        store::meta(conn, "pdf_body_schema").map_err(|err| unseen_db(err, "pdf_body_schema"))?;
     let html = schema.is_none() && html_schema.as_deref() == Some(store::HTML_BODY_SCHEMA);
-    if schema.is_none() && !html {
+    let pdf = schema.is_none() && pdf_schema.as_deref() == Some(store::PDF_BODY_SCHEMA);
+    if schema.is_none() && !html && !pdf {
         let mut body = body_outcome("Candidates");
         body.insert("new_effect".into(), json!(false));
         body.insert("body_schema".into(), Value::Null);
@@ -1312,7 +1323,7 @@ pub(super) fn read_candidates(
         body.insert("read_only".into(), json!(true));
         return Ok((EXIT_OK, Value::Object(body)));
     }
-    if !html && schema.as_deref() != Some(store::BODY_SCHEMA) {
+    if !html && !pdf && schema.as_deref() != Some(store::BODY_SCHEMA) {
         return Err(refused("body_schema_unsupported").extra("new_effect", json!(false)));
     }
     for name in store::BODY_TABLES {
@@ -1451,7 +1462,11 @@ pub(super) fn read_candidates(
     let mut body = body_outcome("Candidates");
     body.insert("new_effect".into(), json!(false));
     body.insert("read_only".into(), json!(true));
-    if html {
+    if pdf {
+        body.insert("slice".into(), json!("T5-pdf"));
+        body.insert("body_schema".into(), Value::Null);
+        body.insert("pdf_body_schema".into(), json!(store::PDF_BODY_SCHEMA));
+    } else if html {
         body.insert("slice".into(), json!("T4-html"));
         body.insert("body_schema".into(), Value::Null);
         body.insert("html_body_schema".into(), json!(store::HTML_BODY_SCHEMA));

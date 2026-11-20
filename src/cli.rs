@@ -182,6 +182,23 @@ pub fn execute(args: Vec<String>) -> Report {
                 hooks,
             })
         }
+        "pdf" => {
+            let (Some(vault), Some(command_id), Some(source)) =
+                (flags.vault, flags.command_id, flags.source)
+            else {
+                return usage("pdf_required_flags");
+            };
+            if flags.media_type.is_some() {
+                return usage("pdf_media_type_fixed");
+            }
+            engine::submit_pdf(engine::PdfRequest {
+                vault,
+                command_id,
+                source,
+                batch_id: flags.batch_id,
+                hooks,
+            })
+        }
         "fragment" => {
             let (Some(vault), Some(command_id), Some(fragment)) =
                 (flags.vault, flags.command_id, flags.fragment)
@@ -353,6 +370,7 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
                     "2" => 2,
                     "3" => 3,
                     "4" => 4,
+                    "5" => 5,
                     _ => return Err(Fail::new(EXIT_USAGE, "Usage", "bad_format")),
                 });
             }

@@ -10,6 +10,7 @@ mod journal;
 mod lock_contract;
 mod lockfile;
 mod model;
+mod pdf_parse;
 mod platform;
 mod store;
 mod verify_package;

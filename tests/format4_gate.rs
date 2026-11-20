@@ -177,7 +177,7 @@ fn format_4_is_a_new_vault_and_does_not_accept_plain_import_or_fragment() {
         "--vault",
         missing.to_str().unwrap(),
         "--format",
-        "5",
+        "6",
     ]);
     assert_eq!(code, 2, "{bad}");
     assert_eq!(bad["reason"], "bad_format");

@@ -38,6 +38,8 @@ mod export;
 mod fragment;
 #[path = "html.rs"]
 mod html;
+#[path = "pdf.rs"]
+mod pdf;
 #[path = "review.rs"]
 mod review;
 
@@ -45,6 +47,7 @@ pub use decide::{correct_fact, query_facts, undo_decision, CorrectRequest, UndoR
 pub use export::{export_copy, ExportRequest};
 pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
 pub use html::{submit_html, HtmlRequest};
+pub use pdf::{submit_pdf, PdfRequest};
 pub use review::review_sheet;
 
 const IMPORT_STOPS: &[&str] = &[
@@ -232,7 +235,7 @@ pub fn help_report() -> Report {
         json!([
             "help",
             "version",
-            "init --vault PATH [--format 1|2|3|4]",
+            "init --vault PATH [--format 1|2|3|4|5]",
             "open --vault PATH",
             "verify --vault PATH",
             "import --vault PATH --command-id ID --media-type TYPE --source PATH [--batch-id ID] [--display-name NAME]",
@@ -240,6 +243,7 @@ pub fn help_report() -> Report {
             "marker --vault PATH --command-id ID --source-id ID --value TEXT",
             "fragment --vault PATH --command-id ID --fragment PATH [--batch-id ID]",
             "html --vault PATH --command-id ID --source PATH [--batch-id ID]",
+            "pdf --vault PATH --command-id ID --source PATH [--batch-id ID]",
             "candidates --vault PATH [--source-id ID]",
             "facts --vault PATH [--source-id ID] [--fact-id ID]",
             "review --vault PATH --out PATH [--package PATH]",
@@ -273,7 +277,7 @@ pub fn version_report() -> Report {
     let mut body = honesty("Version");
     body.insert("git_sha".into(), json!(env!("SUBVAULT_GIT_SHA")));
     body.insert("vault_format".into(), json!(1));
-    body.insert("supported_vault_formats".into(), json!([1, 2, 3, 4]));
+    body.insert("supported_vault_formats".into(), json!([1, 2, 3, 4, 5]));
     body.insert("capabilities".into(), capabilities());
     body.insert("platform_limits".into(), platform_limits(None));
     Report {
@@ -334,7 +338,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
                     .extra("created_new_vault", json!(false)),
             );
         }
-    } else if format == 2 || format == 3 || format == 4 {
+    } else if format == 2 || format == 3 || format == 4 || format == 5 {
         validate_hook_names(
             hooks.stop_at.as_deref(),
             hooks.inject_point.as_deref(),
@@ -392,6 +396,17 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES ('html_body_schema', ?1)",
                     [store::HTML_BODY_SCHEMA],
+                )
+                .map_err(|err| db_fail(err, "init_schema"))?;
+                conn.execute_batch(store::FACT_DDL)
+                    .map_err(|err| db_fail(err, "init_schema"))?;
+            }
+            if format == 5 {
+                conn.execute_batch(store::PDF_DDL)
+                    .map_err(|err| db_fail(err, "init_schema"))?;
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('pdf_body_schema', ?1)",
+                    [store::PDF_BODY_SCHEMA],
                 )
                 .map_err(|err| db_fail(err, "init_schema"))?;
                 conn.execute_batch(store::FACT_DDL)
@@ -889,6 +904,7 @@ fn read_main_meta(conn: &Connection) -> Result<MainMeta, Fail> {
         "slice",
         "body_schema",
         "html_body_schema",
+        "pdf_body_schema",
     ] {
         let value = store::meta(conn, key).map_err(|_| verify_damaged("meta_unreadable"))?;
         values.push((key, value));
@@ -981,6 +997,30 @@ fn compare_main(format: u8, vault_id: &str, main: &MainMeta) -> Result<(), Fail>
             ))
             .extra("during", json!("init_verify"))
             .extra("meta_key", json!("html_body_schema"))
+            .extra("meta_seen", json!(seen)));
+        }
+    }
+    if format == 5 {
+        let plain = meta_value(&main.values, "body_schema");
+        if plain.is_some() {
+            return Err(unpublished(Fail::new(
+                EXIT_NOT_PRESERVED,
+                "NotPreserved",
+                "body_schema_mismatch",
+            ))
+            .extra("during", json!("init_verify"))
+            .extra("meta_key", json!("body_schema"))
+            .extra("meta_seen", json!(plain)));
+        }
+        let seen = meta_value(&main.values, "pdf_body_schema");
+        if seen != Some(store::PDF_BODY_SCHEMA) {
+            return Err(unpublished(Fail::new(
+                EXIT_NOT_PRESERVED,
+                "NotPreserved",
+                "pdf_body_schema_mismatch",
+            ))
+            .extra("during", json!("init_verify"))
+            .extra("meta_key", json!("pdf_body_schema"))
             .extra("meta_seen", json!(seen)));
         }
     }
@@ -1194,6 +1234,16 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
         )
         .extra("new_effect", json!(false))
         .extra("vault_format", json!(4))
+        .extra("created_new_vault", json!(false)));
+    }
+    if let Ok(5) = accept_wal_format(&req.vault.join("vault.db")) {
+        return Err(Fail::new(
+            EXIT_VERSION,
+            "VersionUnsupported",
+            "format_5_refuses_import",
+        )
+        .extra("new_effect", json!(false))
+        .extra("vault_format", json!(5))
         .extra("created_new_vault", json!(false)));
     }
     let session = open_session(&req.vault)?;
@@ -2146,10 +2196,28 @@ fn open_html_session(path: &Path) -> Result<Session, Fail> {
     let magic = vault_shape(path)?;
     let lock = acquire_writer_lock(path)?;
     match accept_wal_format(&path.join("vault.db"))? {
-        4 => {}
+        4 | 5 => {}
         version => {
             return Err(
                 Fail::new(EXIT_VERSION, "VersionUnsupported", "html_requires_format_4")
+                    .extra("schema_version_found", json!(version))
+                    .extra("vault_format", json!(version))
+                    .extra("new_effect", json!(false))
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
+    }
+    finish_session(path, lock, magic)
+}
+
+fn open_pdf_session(path: &Path) -> Result<Session, Fail> {
+    let magic = vault_shape(path)?;
+    let lock = acquire_writer_lock(path)?;
+    match accept_wal_format(&path.join("vault.db"))? {
+        5 => {}
+        version => {
+            return Err(
+                Fail::new(EXIT_VERSION, "VersionUnsupported", "pdf_requires_format_5")
                     .extra("schema_version_found", json!(version))
                     .extra("vault_format", json!(version))
                     .extra("new_effect", json!(false))
@@ -2223,7 +2291,18 @@ fn vault_unreadable(err: &io::Error, reason: &'static str, during: &str) -> Fail
 }
 
 fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
-    let (version, format, schema, html_schema) = visible_main_format(&path.join("vault.db"))?;
+    let (version, format, schema, html_schema, pdf_schema) =
+        visible_main_format(&path.join("vault.db"))?;
+    if version == 5 {
+        if consistent_format_5(format.as_deref(), schema.as_deref(), pdf_schema.as_deref()) {
+            return Ok(5);
+        }
+        return Err(
+            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
+                .extra("schema_version_found", json!(version))
+                .extra("created_new_vault", json!(false)),
+        );
+    }
     if version == 4 {
         if consistent_format_4(format.as_deref(), schema.as_deref(), html_schema.as_deref()) {
             return Ok(4);
@@ -2247,7 +2326,7 @@ fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
         .extra("schema_version_found", json!(version))
         .extra("created_new_vault", json!(false)));
     }
-    if version > 4 {
+    if version > 5 {
         return Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(version))
@@ -2270,7 +2349,13 @@ fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
     Ok(1)
 }
 
-type FormatView = (i64, Option<String>, Option<String>, Option<String>);
+type FormatView = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 fn visible_main_format(db: &Path) -> Result<FormatView, Fail> {
     let uri = readonly_uri(db)?;
@@ -2287,7 +2372,9 @@ fn visible_main_format(db: &Path) -> Result<FormatView, Fail> {
         .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
     let html_schema = store::meta(&conn, "html_body_schema")
         .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
-    Ok((version, format, schema, html_schema))
+    let pdf_schema = store::meta(&conn, "pdf_body_schema")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
+    Ok((version, format, schema, html_schema, pdf_schema))
 }
 
 fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
@@ -2326,13 +2413,14 @@ fn accept_wal_format(db: &Path) -> Result<i64, Fail> {
         .map(|meta| meta.is_file() && meta.len() > 0)
         .unwrap_or(false);
     if !frames {
-        let (header, format, schema, html_schema) = visible_main_format(db)?;
+        let (header, format, schema, html_schema, pdf_schema) = visible_main_format(db)?;
         return judge_format(
             header,
             header,
             format.as_deref(),
             schema.as_deref(),
             html_schema.as_deref(),
+            pdf_schema.as_deref(),
         );
     }
     let uri = wal_visible_uri(db)?;
@@ -2368,14 +2456,15 @@ fn busy_is_locked(err: rusqlite::Error, damaged: &'static str, published: bool) 
 
 fn accept_connection_format(db: &Path, conn: &Connection) -> Result<i64, Fail> {
     let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
-    let (header, _, _, _) = visible_main_format(db)?;
-    let (effective, format, schema, html_schema) = effective_view(conn)?;
+    let (header, _, _, _, _) = visible_main_format(db)?;
+    let (effective, format, schema, html_schema, pdf_schema) = effective_view(conn)?;
     judge_format(
         header,
         effective,
         format.as_deref(),
         schema.as_deref(),
         html_schema.as_deref(),
+        pdf_schema.as_deref(),
     )
 }
 
@@ -2388,7 +2477,9 @@ fn effective_view(conn: &Connection) -> Result<FormatView, Fail> {
         .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
     let html_schema = store::meta(conn, "html_body_schema")
         .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
-    Ok((version, format, schema, html_schema))
+    let pdf_schema = store::meta(conn, "pdf_body_schema")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
+    Ok((version, format, schema, html_schema, pdf_schema))
 }
 
 fn consistent_format_4(
@@ -2399,13 +2490,34 @@ fn consistent_format_4(
     format == Some("4") && schema == Some("1") && html_schema == Some(store::HTML_BODY_SCHEMA)
 }
 
+fn consistent_format_5(
+    format: Option<&str>,
+    schema: Option<&str>,
+    pdf_schema: Option<&str>,
+) -> bool {
+    format == Some("5") && schema == Some("1") && pdf_schema == Some(store::PDF_BODY_SCHEMA)
+}
+
 fn judge_format(
     header: i64,
     effective: i64,
     format: Option<&str>,
     schema: Option<&str>,
     html_schema: Option<&str>,
+    pdf_schema: Option<&str>,
 ) -> Result<i64, Fail> {
+    // A user_version of 5 is format 5 only when the header and the format meta
+    // agree. A bumped older vault stays newer_schema and is not migrated.
+    if effective == 5 {
+        if header == 5 && consistent_format_5(format, schema, pdf_schema) {
+            return Ok(5);
+        }
+        return Err(
+            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
+                .extra("schema_version_found", json!(effective))
+                .extra("created_new_vault", json!(false)),
+        );
+    }
     // A user_version of 4 is format 4 only when the header and the format meta
     // agree. A format 2 or 3 vault whose version was bumped to 4 stays
     // newer_schema and is not migrated.
@@ -2419,7 +2531,7 @@ fn judge_format(
                 .extra("created_new_vault", json!(false)),
         );
     }
-    if effective > 4 {
+    if effective > 5 {
         return Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(effective))

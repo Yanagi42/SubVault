@@ -431,6 +431,9 @@ pub const BODY_SCHEMA: &str = "1";
 /// Format 4 only. This is not `body_schema` and it is not applied to an older vault.
 pub const HTML_BODY_SCHEMA: &str = "1";
 
+/// Format 5 only. Supports text-PDF and static HTML sources in one isolated vault.
+pub const PDF_BODY_SCHEMA: &str = "1";
+
 pub const BODY_TABLES: &[&str] = &[
     "source_versions",
     "extraction_runs",
@@ -550,6 +553,58 @@ CREATE TABLE source_versions (
     byte_length INTEGER NOT NULL,
     media_type TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role = 'user_provided_html'),
+    eml INTEGER NOT NULL CHECK (eml = 0)
+);
+CREATE TABLE extraction_runs (
+    run_id TEXT PRIMARY KEY,
+    logical_key TEXT NOT NULL UNIQUE,
+    source_version_id TEXT NOT NULL REFERENCES source_versions(source_version_id),
+    source_id TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    normalization TEXT NOT NULL,
+    join_version TEXT NOT NULL,
+    rules_version TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open', 'succeeded', 'failed', 'cancelled'))
+);
+CREATE TABLE extraction_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES extraction_runs(run_id),
+    attempt_no INTEGER NOT NULL,
+    command_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled', 'late', 'abandoned', 'partial')),
+    published INTEGER NOT NULL CHECK (published IN (0, 1)),
+    detail_json TEXT NOT NULL,
+    UNIQUE (run_id, attempt_no)
+);
+CREATE TABLE candidates (
+    candidate_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES extraction_runs(run_id),
+    attempt_id TEXT NOT NULL REFERENCES extraction_attempts(attempt_id),
+    source_version_id TEXT NOT NULL REFERENCES source_versions(source_version_id),
+    ordinal INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    usable INTEGER NOT NULL CHECK (usable IN (0, 1)),
+    excerpt TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    locator_json TEXT NOT NULL,
+    adopted INTEGER NOT NULL CHECK (adopted = 0),
+    UNIQUE (run_id, ordinal)
+);
+"#;
+
+/// Format 5 only. Accepts both static text-PDF and static HTML sources.
+/// Older vaults keep their original schema and are never migrated.
+pub const PDF_DDL: &str = r#"
+CREATE TABLE source_versions (
+    source_version_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    object_id TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    byte_length INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user_provided_pdf', 'user_provided_html')),
     eml INTEGER NOT NULL CHECK (eml = 0)
 );
 CREATE TABLE extraction_runs (

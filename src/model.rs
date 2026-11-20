@@ -102,6 +102,7 @@ pub fn capabilities() -> Value {
         "extraction": "not_available",
         "body_fragment": "available",
         "html_static_text": "limited",
+        "pdf_static_text": "limited",
         "html_rendering": "not_available",
         "html_network": "not_available",
         "stated_facts": "available",
