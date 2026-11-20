@@ -11,7 +11,7 @@
 
 - **Live Interactive Demo (GitHub Pages):** **[https://yanagi42.github.io/SubVault/](https://yanagi42.github.io/SubVault/)** — preloaded synthetic corpus, one-click sample import, real SHA-256 duplicate detection, inline `correct`/`undo` & masked-account attribution, native CLI export verifier (`Open Native Export`), and one-click `.zip` offline exit download
 - **Portable Releases & Checksums:** **[Download Latest Release](https://github.com/Yanagi42/SubVault/releases/latest)** · [Release Notes (`RELEASE_NOTES.md`)](./RELEASE_NOTES.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md)
-- **Next Iteration Plan (`v0.2.0`) & Full Technical Spec:** [Roadmap (`docs/ROADMAP.md`)](./docs/ROADMAP.md) · [Full Technical Verification Spec (中文)](./docs/SPEC-zh.md)
+- **Next Milestones (`0.1.x` Roadmap) & Full Technical Spec:** [Roadmap (`docs/ROADMAP.md`)](./docs/ROADMAP.md) · [Full Technical Verification Spec (中文)](./docs/SPEC-zh.md)
 
 ---
 
@@ -87,14 +87,14 @@ Open **[https://yanagi42.github.io/SubVault/](https://yanagi42.github.io/SubVaul
 - Click any row to inspect raw bytes, run **`Correct Amount`** / **`Undo`**, or switch to **`Review Sheet & Offline Exit`** to download `facts.csv`, `records.json`, and `manifest.json`.
 
 ### 2. Run the Portable Release Bundle (Linux x86_64)
-Download `subvault-v0.1.0-linux-x86_64.zip` and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/Yanagi42/SubVault/releases/latest):
+Download `subvault-v0.1.1-linux-x86_64.zip` and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/Yanagi42/SubVault/releases/latest):
 
 ```bash
 sha256sum -c SHA256SUMS.txt
-unzip subvault-v0.1.0-linux-x86_64.zip
-cd subvault-v0.1.0-linux-x86_64
+unzip subvault-v0.1.1-linux-x86_64.zip
+cd subvault-v0.1.1-linux-x86_64
 
-# Run an end-to-end native CLI Format 4 HTML + dedup + export + review walkthrough
+# Run an end-to-end Format 5 PDF + duplicate reuse + HTML + export + verify-package + review walkthrough
 ./run-demo.sh cli
 
 # Or serve the offline pure-static Web Demo locally at http://127.0.0.1:4173
@@ -122,13 +122,19 @@ node scripts/test-web.mjs
 bash scripts/package-release.sh
 ```
 
-### 4. Native CLI Walkthrough (Format 4 HTML + Verifiable Exit)
+### 4. Native CLI Walkthrough (Format 5 PDF + HTML + Verifiable Exit)
 
 ```bash
-# Initialize an isolated Format 4 vault
-./target/release/subvault init --vault /tmp/my-vault --format 4
+# Initialize an isolated Format 5 vault (accepts static text-PDFs & static HTML bills)
+./target/release/subvault init --vault /tmp/my-vault --format 5
 
-# Preserve & extract a static HTML bill
+# Preserve & extract a text-PDF receipt (uncompressed or FlateDecode)
+./target/release/subvault pdf \
+  --vault /tmp/my-vault \
+  --command-id cmd-pdf-1 \
+  --source ./synthetic/corpus/originals/v-2026-09-receipt.pdf
+
+# Preserve & extract a static HTML bill in the same vault
 ./target/release/subvault html \
   --vault /tmp/my-vault \
   --command-id cmd-bill-1 \
@@ -156,9 +162,9 @@ bash scripts/package-release.sh
 
 | Path | Purpose |
 | --- | --- |
-| `src/` | Rust preservation engine, SQLite WAL store, static text & HTML extractors, append-only decision chain, offline exporter, and review sheet renderer |
-| `tests/` | 19 integration & backward-compatibility test suites (crash/fault hooks, WAL/header consistency, directory `renameat2(RENAME_NOREPLACE)`, parent fd `fsync`) |
-| `web/` | Zero-dependency, subpath-safe pure-static interactive Web Demo (`index.html`, `app.js`, `engine.js`, `demo-data.js`, `zip.js`, `styles.css`) |
+| `src/` | Rust preservation engine, SQLite WAL store, static text, HTML & PDF (`FlateDecode`) extractors, append-only decision chain, offline exporter, standalone verifier, and review sheet renderer |
+| `tests/` | 21 integration & backward-compatibility test suites (including `pdf_bill.rs`, `verify_package.rs`, crash/fault hooks, WAL/header consistency, `renameat2(RENAME_NOREPLACE)`, parent fd `fsync`) |
+| `web/` | Zero-dependency, subpath-safe pure-static interactive Web Demo (`index.html`, `app.js`, `engine.js`, `demo-data.js`, `pdf.js`, `zip.js`, `styles.css`) |
 | `synthetic/` | Deterministic T0 corpus generator and independent byte/logical expectations |
 | `scripts/` | Release packaging (`package-release.sh`), Web Demo & CLI-interop checks (`test-web.mjs`), screenshot capture (`capture-screenshots.py`), and T1 evidence script |
 | `.github/workflows/` | Automated CI (`ci.yml`), GitHub Pages deployment (`pages.yml`), and tag-driven release publishing (`release.yml`) |
@@ -170,7 +176,7 @@ bash scripts/package-release.sh
 
 SubVault intentionally separates **verified guarantees** from **unbuilt milestones**:
 
-- **Verified today:** Linux `ext4` single-writer preservation (`flock`, SQLite 3.46 WAL `synchronous=FULL`, `renameat2(RENAME_NOREPLACE)`), Format 1–4 isolation, deterministic UTF-8 fragment & constrained static HTML extraction (`tl` 0.7.8, CSS/stylesheet safely rejected), append-only human `correct`/`undo`, verifiable `offline-exit-1` export packages, read-only `review` sheets, and the pure-static interactive Web Demo.
-- **Not yet completed:** Native PDF text extraction, OCR, at-rest encryption selection (CLI vaults still carry the `SYNTHETIC_ONLY` guard), full-text search, native Windows runtime verification (`src/windows_lock.rs` and `src/windows_file_id.rs` are staged behind `cfg(windows)`), and native desktop UI shell.
+- **Verified today (`v0.1.1`):** Linux `ext4` single-writer preservation (`flock`, SQLite 3.46 WAL `synchronous=FULL`, `renameat2(RENAME_NOREPLACE)`), Format 1–5 isolation, deterministic UTF-8 fragment, constrained static HTML (`tl` 0.7.8), and static text-PDF (`FlateDecode` via `miniz_oxide`, 1-based `pdf_page` locators) extraction, append-only human `correct`/`undo`, verifiable `offline-exit-1` export & standalone `verify-package`, read-only `review` sheets, and the pure-static interactive Web Demo with real binary PDF drop.
+- **Planned next (`0.1.x` → `0.2.0`, see [`docs/ROADMAP.md`](./docs/ROADMAP.md)):** Native Windows runtime wiring & CI (`v0.1.2`, `src/windows_lock.rs` & `src/windows_file_id.rs` are staged behind `cfg(windows)`), at-rest encryption & removing the `SYNTHETIC_ONLY` guard (`v0.1.3`), OCR / full-text search, and native desktop UI shell (`v0.2.0`).
 
 For the exhaustive contract of exit codes (0–21), crash/recovery semantics, and Format 1–4 invariants, see [`docs/SPEC-zh.md`](./docs/SPEC-zh.md).
