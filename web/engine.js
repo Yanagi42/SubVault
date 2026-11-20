@@ -2,6 +2,7 @@
 // Rust/SQLite preservation, extraction, append-only decision, and offline-exit contracts.
 
 import { DEMO_BATCH_DOCS, REVIEW_ANCHOR_DATE } from "./demo-data.js";
+import { extractPdfBinary, hasPdfHeader } from "./pdf.js";
 import { buildZip } from "./zip.js";
 
 // --- Deterministic Pure-JS SHA-256 (works on http://, https://, file://, and Node) ---
@@ -454,7 +455,7 @@ export class SubVaultStore {
   reset() {
     this.mode = "demo";
     this.nativeVerification = null;
-    this.vaultFormat = 4;
+    this.vaultFormat = 5;
     this.reviewAnchorDate = REVIEW_ANCHOR_DATE;
     this.objects = new Map();      // sha256 -> object record
     this.sources = [];             // array of source records (ordered)
@@ -472,7 +473,7 @@ export class SubVaultStore {
   }
 
   ingestDocument(input) {
-    const bytes = utf8Bytes(input.content);
+    const bytes = input.rawBytes instanceof Uint8Array ? input.rawBytes : utf8Bytes(input.content);
     const sha256 = sha256Bytes(bytes);
     const byteLength = bytes.length;
     const commandId = input.commandId || this.nextId("cmd", `${input.displayName}:${Date.now()}`);
@@ -521,11 +522,21 @@ export class SubVaultStore {
       corpusByteLength: input.corpusByteLength || null,
       relpath: `objects/${objectId}`,
       rawContent: input.content,
+      rawBytes: input.rawBytes instanceof Uint8Array ? input.rawBytes : null,
       state: "complete"
     };
     this.objects.set(sha256, objectRow);
 
-    const extracted = extractDocument(input.content, input.mediaType || "text/plain;charset=utf-8");
+    const extracted = input.forcedUnsupportedReason
+      ? {
+          extractionStatus: "unsupported",
+          extractionRule: "stated-pdf-lines-1",
+          extractionNote: `PDF safety boundary (${input.forcedUnsupportedReason}): raw PDF bytes are preserved verbatim; extraction is intentionally skipped (no OCR or decryption).`,
+          candidates: [],
+          adoptable: [],
+          metadata: extractCommonMetadata(input.content)
+        }
+      : extractDocument(input.content, input.mediaType || "text/plain;charset=utf-8");
     const inferredMerchant =
       input.merchant || inferMerchant(input.content, input.displayName);
     const inferredEmail =
@@ -640,6 +651,45 @@ export class SubVaultStore {
     };
     this.activityLog.unshift(entry);
     return { outcome: "Committed", storageReused: false, source, occurrence, entry };
+  }
+
+  async ingestBinaryFile({ displayName, externalPath, mediaType, bytes, batchId }) {
+    const rawBytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const lower = String(displayName || "").toLowerCase();
+    const isPdf = lower.endsWith(".pdf") || mediaType === "application/pdf" || hasPdfHeader(rawBytes);
+
+    if (isPdf && hasPdfHeader(rawBytes)) {
+      const parsed = await extractPdfBinary(rawBytes);
+      return this.ingestDocument({
+        displayName,
+        externalPath: externalPath || `local/${displayName}`,
+        mediaType: "application/pdf",
+        role: "user_provided_pdf",
+        content:
+          parsed.text ||
+          `%PDF binary preserved verbatim (${rawBytes.length} bytes). Static stream extraction status: ${parsed.status} (${parsed.reason || "ok"}).`,
+        rawBytes,
+        forcedUnsupportedReason: parsed.status === "unsupported" ? parsed.reason : null,
+        batchId
+      });
+    }
+
+    const dec = new TextDecoder("utf-8", { fatal: false });
+    const content = dec.decode(rawBytes);
+    return this.ingestDocument({
+      displayName,
+      externalPath: externalPath || `local/${displayName}`,
+      mediaType:
+        mediaType ||
+        (lower.endsWith(".html") || lower.endsWith(".htm")
+          ? "text/html;charset=utf-8"
+          : lower.endsWith(".csv")
+          ? "text/csv"
+          : "text/plain;charset=utf-8"),
+      content,
+      rawBytes,
+      batchId
+    });
   }
 
   loadDemoCorpus(batchTag = "b_demo_initial") {
@@ -1175,7 +1225,7 @@ export class SubVaultStore {
       originals: objectEntries.map((o) => ({
         path: `originals/${o.objectId}`,
         objectId: o.objectId,
-        bytes: utf8Bytes(o.rawContent)
+        bytes: o.rawBytes instanceof Uint8Array ? o.rawBytes : utf8Bytes(o.rawContent)
       }))
     };
   }
@@ -1279,8 +1329,11 @@ export class SubVaultStore {
 
     for (const obj of records.objects || []) {
       const origBytes = obj.package_path ? getBytes(obj.package_path) : null;
+      const isBinaryPdf = origBytes && hasPdfHeader(origBytes);
       const rawContent = origBytes
-        ? dec.decode(origBytes)
+        ? isBinaryPdf
+          ? dec.decode(origBytes).replace(/[^\x09\x0a\x0d\x20-\x7e]/g, "")
+          : dec.decode(origBytes)
         : `(Original bytes at ${obj.package_path || obj.object_id} were not included in this file selection.)`;
       this.objects.set(obj.content_sha256, {
         objectId: obj.object_id,
@@ -1288,6 +1341,7 @@ export class SubVaultStore {
         byteLength: obj.byte_length,
         relpath: obj.stored_relpath || `objects/${obj.object_id}`,
         rawContent,
+        rawBytes: origBytes || null,
         state: obj.copy_state || "complete"
       });
     }
@@ -1412,7 +1466,7 @@ export class SubVaultStore {
       vaultFormat: this.vaultFormat,
       reviewAnchorDate: this.reviewAnchorDate,
       seq: this.seq,
-      objects: [...this.objects.entries()],
+      objects: [...this.objects.entries()].map(([k, v]) => [k, { ...v, rawBytes: null }]),
       sources: this.sources,
       occurrences: this.occurrences,
       facts: this.facts,

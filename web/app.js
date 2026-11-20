@@ -1000,7 +1000,8 @@ async function handleUploadedFiles(fileList) {
   let added = 0;
   let reused = 0;
   for (const file of files) {
-    const content = await file.text();
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
     const lower = file.name.toLowerCase();
     const mediaType = lower.endsWith(".html") || lower.endsWith(".htm")
       ? "text/html;charset=utf-8"
@@ -1010,11 +1011,11 @@ async function handleUploadedFiles(fileList) {
       ? "application/pdf"
       : "text/plain;charset=utf-8";
 
-    const res = store.ingestDocument({
+    const res = await store.ingestBinaryFile({
       displayName: file.name,
       externalPath: `local/${file.name}`,
       mediaType,
-      content,
+      bytes,
       batchId: `b_upload_${state.importCounter++}`
     });
     state.selectedSourceId = res.source.sourceId;

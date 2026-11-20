@@ -47,7 +47,7 @@ jobs:
               t = threading.Thread(target=httpd.serve_forever, daemon=True)
               t.start()
               try:
-                  for rel in ["", "index.html", "styles.css", "app.js", "engine.js", "demo-data.js", "zip.js", "assets/icon.svg"]:
+                  for rel in ["", "index.html", "styles.css", "app.js", "engine.js", "demo-data.js", "pdf.js", "zip.js", "assets/icon.svg"]:
                       url = f"http://127.0.0.1:{port}/SubVault/{rel}"
                       with urllib.request.urlopen(url) as resp:
                           assert resp.status == 200, f"{url} returned {resp.status}"

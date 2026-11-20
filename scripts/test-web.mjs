@@ -121,6 +121,35 @@ const badVerdict = new SubVaultStore().loadNativeExitPackage(badMap);
 assert.equal(badVerdict.verified, false, "tampered records.json must fail verification");
 assert.ok(badVerdict.defects.length >= 1);
 
+// 7b. Verify real binary %PDF-1.4 ingestion & exact SHA-256 deduplication in Web engine
+const pdfStore = new SubVaultStore();
+const sepPdfPath = path.join(root, "synthetic/corpus/originals/v-2026-09-receipt.pdf");
+const dupPdfPath = path.join(root, "synthetic/corpus/originals/renamed/NLV-september-statement-copy.pdf");
+const sepPdfRes = await pdfStore.ingestBinaryFile({
+  displayName: "v-2026-09-receipt.pdf",
+  externalPath: "originals/v-2026-09-receipt.pdf",
+  mediaType: "application/pdf",
+  bytes: fs.readFileSync(sepPdfPath),
+  batchId: "b_pdf_bin"
+});
+assert.equal(
+  sepPdfRes.source.contentSha256,
+  "c69d395d4e1abf23a82ef91c5b50220bdb821c4de53daf03a1f060d49acec8f3",
+  "raw binary PDF SHA-256 must match synthetic/corpus/byte-expectations.json bit-for-bit"
+);
+assert.equal(sepPdfRes.source.byteLength, 941);
+assert.equal(pdfStore.getFactsForSource(sepPdfRes.source.sourceId).length, 2);
+
+const dupPdfRes = await pdfStore.ingestBinaryFile({
+  displayName: "NLV-september-statement-copy.pdf",
+  externalPath: "originals/renamed/NLV-september-statement-copy.pdf",
+  mediaType: "application/pdf",
+  bytes: fs.readFileSync(dupPdfPath),
+  batchId: "b_pdf_bin_2"
+});
+assert.equal(dupPdfRes.storageReused, true, "renamed binary PDF copy must deduplicate via SHA-256");
+assert.equal(pdfStore.objects.size, 1);
+
 // 8. Bidirectional Rust CLI <-> Web Demo interop verification (when native binary exists)
 const nativeBin = [
   path.join(root, "target/release/subvault"),
@@ -130,8 +159,8 @@ const nativeBin = [
 if (nativeBin) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "subvault-interop-"));
   try {
-    // A) Web-exported ZIP -> unzip -> native `subvault verify-package` must pass!
-    const { zipBytes } = store.buildExitZip();
+    // A) Web-exported ZIP (including real binary PDF!) -> unzip -> native `subvault verify-package` must pass!
+    const { zipBytes } = pdfStore.buildExitZip();
     const zipPath = path.join(tmpDir, "web-exit.zip");
     const unzipDir = path.join(tmpDir, "web-unzipped");
     fs.writeFileSync(zipPath, zipBytes);
@@ -143,17 +172,26 @@ if (nativeBin) {
     assert.equal(verifyOut.outcome, "Verified", `Web ZIP failed native verify-package: ${JSON.stringify(verifyOut)}`);
     assert.equal(verifyOut.facts_csv_checked, true);
 
-    // B) Native `subvault export` -> Web `loadNativeExitPackage` must verify cleanly!
-    const vaultDir = path.join(tmpDir, "vault");
+    // B) Native Format 5 `subvault pdf` + `subvault html` -> `subvault export` -> Web `loadNativeExitPackage`!
+    const vaultDir = path.join(tmpDir, "vault5");
     const billPath = path.join(tmpDir, "bill.html");
-    const nativePack = path.join(tmpDir, "native-export");
+    const nativePack = path.join(tmpDir, "native-export-5");
     fs.writeFileSync(
       billPath,
       "<!doctype html><html><body><table><tr><th>Amount paid</th><td>USD 19.50</td></tr><tr><th>Service period:</th><td>2026-11-01 through 2026-11-30</td></tr></table></body></html>\n"
     );
-    execFileSync(nativeBin, ["init", "--vault", vaultDir, "--format", "4"]);
-    execFileSync(nativeBin, ["html", "--vault", vaultDir, "--command-id", "c1", "--source", billPath]);
+    execFileSync(nativeBin, ["init", "--vault", vaultDir, "--format", "5"]);
+    execFileSync(nativeBin, ["pdf", "--vault", vaultDir, "--command-id", "c-pdf", "--source", sepPdfPath]);
+    execFileSync(nativeBin, ["pdf", "--vault", vaultDir, "--command-id", "c-pdf-dup", "--source", dupPdfPath]);
+    execFileSync(nativeBin, ["html", "--vault", vaultDir, "--command-id", "c-html", "--source", billPath]);
     execFileSync(nativeBin, ["export", "--vault", vaultDir, "--out", nativePack]);
+
+    const nativeVerify = JSON.parse(
+      execFileSync(nativeBin, ["verify-package", "--package", nativePack], { encoding: "utf8" })
+    );
+    assert.equal(nativeVerify.outcome, "Verified");
+    assert.equal(nativeVerify.vault_format, 5);
+    assert.equal(nativeVerify.verified_originals, 2);
 
     const nativeFiles = new Map();
     const walk = (dir) => {
@@ -166,9 +204,10 @@ if (nativeBin) {
     walk(nativePack);
     const interopStore = new SubVaultStore();
     const nativeVerdict = interopStore.loadNativeExitPackage(nativeFiles);
-    assert.equal(nativeVerdict.verified, true, `Native export failed Web verifier: ${JSON.stringify(nativeVerdict)}`);
-    assert.equal(interopStore.sources.length, 1);
-    assert.equal(interopStore.facts.length, 2);
+    assert.equal(nativeVerdict.verified, true, `Native Format 5 export failed Web verifier: ${JSON.stringify(nativeVerdict)}`);
+    assert.equal(interopStore.sources.length, 2);
+    assert.equal(interopStore.facts.length, 4);
+    assert.equal(interopStore.getAuditReport().duplicates.length, 1);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
