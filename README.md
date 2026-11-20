@@ -10,8 +10,8 @@
 ### Quick Links
 
 - **Live Interactive Demo (GitHub Pages):** **[https://yanagi42.github.io/SubVault/](https://yanagi42.github.io/SubVault/)** — preloaded synthetic corpus, one-click sample import, real SHA-256 duplicate detection, inline `correct`/`undo` & masked-account attribution, native CLI export verifier (`Open Native Export`), and one-click `.zip` offline exit download
-- **Portable Releases & Checksums:** **[Download Latest Release](https://github.com/Yanagi42/SubVault/releases/latest)** · [Release Notes (`RELEASE_NOTES.md`)](./RELEASE_NOTES.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md)
-- **Next Milestones (`0.1.x` Roadmap) & Full Technical Spec:** [Roadmap (`docs/ROADMAP.md`)](./docs/ROADMAP.md) · [Full Technical Verification Spec (中文)](./docs/SPEC-zh.md)
+- **Portable Bundles & Draft Release Notes:** **[Releases](https://github.com/Yanagi42/SubVault/releases)** · [Draft Release Notes (`RELEASE_NOTES.md`)](./RELEASE_NOTES.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md)
+- **Path to `v0.1.0` & Full Technical Spec:** [Roadmap (`docs/ROADMAP.md`)](./docs/ROADMAP.md) · [Full Technical Verification Spec (中文)](./docs/SPEC-zh.md)
 
 ---
 
@@ -86,13 +86,13 @@ Open **[https://yanagi42.github.io/SubVault/](https://yanagi42.github.io/SubVaul
 - Click **`+ Import Sample Batch`** or **`+ Renamed Duplicate Receipt`** to watch SHA-256 deduplication reuse objects without duplicating spend or losing human edits.
 - Click any row to inspect raw bytes, run **`Correct Amount`** / **`Undo`**, or switch to **`Review Sheet & Offline Exit`** to download `facts.csv`, `records.json`, and `manifest.json`.
 
-### 2. Run the Portable Release Bundle (Linux x86_64)
-Download `subvault-v0.1.1-linux-x86_64.zip` and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/Yanagi42/SubVault/releases/latest):
+### 2. Build & Run the Portable Bundle (Linux x86_64)
+Build locally with `bash scripts/package-release.sh` (or download from [GitHub Releases](https://github.com/Yanagi42/SubVault/releases) once `v0.1.0` is published):
 
 ```bash
-sha256sum -c SHA256SUMS.txt
-unzip subvault-v0.1.1-linux-x86_64.zip
-cd subvault-v0.1.1-linux-x86_64
+(cd dist && sha256sum -c SHA256SUMS.txt)
+unzip dist/subvault-v0.1.0-linux-x86_64.zip
+cd subvault-v0.1.0-linux-x86_64
 
 # Run an end-to-end Format 5 PDF + duplicate reuse + HTML + export + verify-package + review walkthrough
 ./run-demo.sh cli
@@ -176,7 +176,7 @@ bash scripts/package-release.sh
 
 SubVault intentionally separates **verified guarantees** from **unbuilt milestones**:
 
-- **Verified today (`v0.1.1`):** Linux `ext4` single-writer preservation (`flock`, SQLite 3.46 WAL `synchronous=FULL`, `renameat2(RENAME_NOREPLACE)`), Format 1–5 isolation, deterministic UTF-8 fragment, constrained static HTML (`tl` 0.7.8), and static text-PDF (`FlateDecode` via `miniz_oxide`, 1-based `pdf_page` locators) extraction, append-only human `correct`/`undo`, verifiable `offline-exit-1` export & standalone `verify-package`, read-only `review` sheets, and the pure-static interactive Web Demo with real binary PDF drop.
-- **Planned next (`0.1.x` → `0.2.0`, see [`docs/ROADMAP.md`](./docs/ROADMAP.md)):** Native Windows runtime wiring & CI (`v0.1.2`, `src/windows_lock.rs` & `src/windows_file_id.rs` are staged behind `cfg(windows)`), at-rest encryption & removing the `SYNTHETIC_ONLY` guard (`v0.1.3`), OCR / full-text search, and native desktop UI shell (`v0.2.0`).
+- **Verified today (pre-`v0.1.0`):** Linux `ext4` single-writer preservation (`flock`, SQLite 3.46 WAL `synchronous=FULL`, `renameat2(RENAME_NOREPLACE)`), Format 1–5 isolation, deterministic UTF-8 fragment, constrained static HTML (`tl` 0.7.8), and static text-PDF (`FlateDecode` via `miniz_oxide`, 1-based `pdf_page` locators) extraction, append-only human `correct`/`undo`, verifiable `offline-exit-1` export & standalone `verify-package`, read-only `review` sheets, and the pure-static interactive Web Demo with real binary PDF drop.
+- **Remaining before cutting `v0.1.0` (see [`docs/ROADMAP.md`](./docs/ROADMAP.md)):** Native Windows runtime wiring & CI (`src/windows_lock.rs` & `src/windows_file_id.rs` are staged behind `cfg(windows)`), at-rest encryption & removing the `SYNTHETIC_ONLY` guard for real data, and a thin native desktop UI shell.
 
 For the exhaustive contract of exit codes (0–21), crash/recovery semantics, and Format 1–4 invariants, see [`docs/SPEC-zh.md`](./docs/SPEC-zh.md).

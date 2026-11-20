@@ -1,56 +1,48 @@
-# SubVault v0.1.1 Release Notes
+# SubVault v0.1.0 Release Notes (Draft — Pre-Release)
 
-**Release date:** 2026-11-20  
-**Tag:** `v0.1.1`  
+> **Status:** Draft notes for the upcoming first usable **`v0.1.0`** release. SubVault stays on `0.1.0` (unreleased) while remaining real-data milestones in [`docs/ROADMAP.md`](./docs/ROADMAP.md) (Windows native wiring, at-rest encryption, desktop shell) are completed.
+
+**Target tag:** `v0.1.0`  
 **Live Demo:** <https://yanagi42.github.io/SubVault/>
 
 ---
 
-## Highlights
+## Highlights Included So Far
 
-SubVault `v0.1.1` adds **Format 5 native static text-PDF preservation and extraction (`subvault pdf`)** — allowing a single isolated vault to preserve and verify **both** real text-PDFs (uncompressed and `/FlateDecode`) and static HTML billing emails, while keeping Formats 1–4 strictly unmigrated and bringing real binary `.pdf` hashing and parsing into the pure-static Web Demo.
-
-### What's New in `v0.1.1`
-
-1. **Native Text-PDF Preservation & Extraction — Isolated Format 5 (`subvault pdf`)**
-   - **Pure-Rust Bounded-Memory PDF Parser (`src/pdf_parse.rs`, `src/pdf.rs`):** Preserves raw `%PDF-` bytes verbatim in `objects/obj_<id>` (SHA-256 verified, zero normalization) and extracts source-stated lines from uncompressed and `/FlateDecode` (`miniz_oxide` `=0.8.8`, capped at 1 MiB/stream and 4 MiB/PDF) content streams with 1-based `pdf_page` locators.
-   - **Verified Against the Full T0 Synthetic PDF Corpus:** Extracts monthly/yearly `stated_amount_paid` and `stated_service_period` facts, keeps credit-note and order-confirmation `Total` lines un-adopted, preserves masked cancellation notices (`j***@...`, usable-through dates) unassigned, preserves one-time perpetual license scope verbatim without inventing renewal dates, and deduplicates renamed byte-identical copies (`AlreadyPreserved`) without overwriting prior human `correct`/`undo` edits.
-   - **Honest Safety Boundaries:** Encrypted PDFs (`/Encrypt`) are preserved verbatim and reported as `extraction=unsupported` (`encrypted_pdf`); scanned/image-only PDFs report `no_extractable_text` (`ocr=not_available`); fake renamed non-PDF text files are rejected before preservation (`invalid_pdf_header`).
-   - **Mixed PDF + HTML Vault:** Format 5 (`subvault init --format 5`) accepts both `subvault pdf` and `subvault html`, with full support for `facts`, `candidates`, `correct`, `undo`, `export`, `verify-package`, and `review --package`.
+1. **Verified Rust + SQLite Preservation & Extraction Core (`subvault` CLI, Formats 1–5)**
+   - **Immutable Byte Custody (T1):** Content-addressed `objects/obj_<id>` storage with SHA-256 integrity verification, zero byte normalization, idempotent `CommandId` journaling, exclusive non-blocking `flock`, SQLite 3.46 WAL (`synchronous=FULL`), atomic directory publication via `renameat2(RENAME_NOREPLACE)` + parent fd `fsync`, and 17 distinct honest exit codes.
+   - **Native Text-PDF & Static HTML Extraction (Formats 2–5):**
+     - Format 5 (`subvault init --format 5`) accepts **both** `subvault pdf` (uncompressed and `/FlateDecode` via `miniz_oxide =0.8.8`, bounded memory, 1-based `pdf_page` locators) and `subvault html` (`tl` 0.7.8, refusing `<style>`/stylesheets instead of guessing CSS visibility).
+     - Preserves raw bytes verbatim on encrypted PDFs (`encrypted_pdf`), image-only PDFs (`no_extractable_text`, `ocr=not_available`), and CSS-styled HTML; rejects fake renamed `.pdf` text files before preservation (`invalid_pdf_header`).
+   - **Append-Only Human Decisions:** `correct` and `undo` append auditable human revisions while keeping original bytes untouched and surviving byte-identical re-imports (`AlreadyPreserved`).
+   - **Offline Exit, Standalone Verification & Read-Only Review Sheet (T5):** `subvault export` produces self-contained `offline-exit-1` packages (`records.json`, `facts.csv`, `manifest.json`, `originals/<object_id>`); `subvault verify-package --package PATH` independently verifies the exported package without needing the live vault; `subvault review` writes a lock-consistent plain-text review sheet linked only to hash-verified package originals.
 
 2. **Interactive Pure-Static Web Demo (`web/`) — Real Binary PDF Support + Native CLI Bridge**
-   - **Real Binary `.pdf` Drop (`web/pdf.js`):** Dropping local `.pdf` files onto the browser hashes exact raw PDF bytes (matching `synthetic/corpus/byte-expectations.json` SHA-256 bit-for-bit), deduplicates renamed copies, and extracts static text lines client-side.
-   - **Bidirectional CLI ↔ Web Interop:** Download a full `.zip` offline exit archive (`web/zip.js`) directly verifiable by `subvault verify-package`, or open any native `subvault export` directory (Format 3/4/5) via **Open Native Export** to verify every file's SHA-256 in-browser.
-   - **Preloaded Demo & Human Decisions:** Ships preloaded with the 12-file synthetic corpus, inline amount `correct`/`undo`, masked account attribution + undo, and local browser persistence.
+   - **Preloaded Synthetic Corpus:** Ships out-of-the-box with 12 realistic billing scenarios covering monthly/annual plans, personal vs. work account separation, SHA-256 duplicate reuse, CSV vs. invoice conflicts (`$99.00` vs. `$107.91`), credit notes, masked cancellation notices, one-time perpetual licenses, and static HTML bills.
+   - **Real Binary `.pdf` Drop (`web/pdf.js`) & Full `.zip` Export (`web/zip.js`):** Dropping local `.pdf`/`.html`/`.csv`/`.txt` files hashes exact raw bytes locally; **Download Full Exit Pack (.zip)** exports an archive directly verifiable by `subvault verify-package`; **Open Native Export** loads and SHA-256-verifies real native `subvault export` folders in-browser.
 
-3. **CI, Standalone Verifier & Automated Release Verification**
-   - Includes `subvault verify-package --package PATH` for standalone offline verification without the live vault.
-   - Enforces `cargo fmt --check`, `cargo clippy --lib --bins --locked -- -D warnings`, deterministic T0 corpus verification, full Rust unit/integration suites (including `tests/pdf_bill.rs` and `tests/verify_package.rs`), bidirectional Format 5 Web↔CLI interop checks, and portable bundle packaging with `SHA256SUMS.txt`.
+3. **CI, Automated Packaging & Verification**
+   - `.github/workflows/ci.yml`, `.github/workflows/pages.yml`, `.github/workflows/release.yml`, and `scripts/package-release.sh` with `SHA256SUMS.txt`.
 
 ---
 
-## Portable Release Assets
+## Portable Bundle Assets (`scripts/package-release.sh`)
 
 | Asset | Contents |
 | --- | --- |
-| `subvault-v0.1.1-linux-x86_64.zip` | Portable Linux x86_64 `subvault` CLI binary (Formats 1–5), static Web Demo (`web/`), verified T0 synthetic corpus, `run-demo.sh`, and documentation |
-| `subvault-v0.1.1-linux-x86_64.tar.gz` | Same portable bundle in `.tar.gz` format |
-| `subvault-v0.1.1-web-demo.zip` | Pure-static Web Demo files ready for any static host or offline folder |
-| `SHA256SUMS.txt` | SHA-256 checksums for all release archives |
+| `subvault-v0.1.0-linux-x86_64.zip` | Portable Linux x86_64 `subvault` CLI binary (Formats 1–5), static Web Demo (`web/`), verified T0 synthetic corpus, `run-demo.sh`, and documentation |
+| `subvault-v0.1.0-linux-x86_64.tar.gz` | Same portable bundle in `.tar.gz` format |
+| `subvault-v0.1.0-web-demo.zip` | Pure-static Web Demo files ready for any static host or offline folder |
+| `SHA256SUMS.txt` | SHA-256 checksums for all archives |
 
-### Verify Checksums
+### Verify & Run Portable Bundle
 
 ```bash
 sha256sum -c SHA256SUMS.txt
-```
+unzip subvault-v0.1.0-linux-x86_64.zip
+cd subvault-v0.1.0-linux-x86_64
 
-### Quick Start (Portable Bundle)
-
-```bash
-unzip subvault-v0.1.1-linux-x86_64.zip
-cd subvault-v0.1.1-linux-x86_64
-
-# Run an end-to-end Format 5 PDF + duplicate reuse + HTML + export + verify-package + review demo
+# Run Format 5 PDF + duplicate reuse + HTML + export + verify-package + review demo
 ./run-demo.sh cli
 
 # Or launch the local pure-static Web Demo at http://127.0.0.1:4173
@@ -59,8 +51,8 @@ cd subvault-v0.1.1-linux-x86_64
 
 ---
 
-## Known Scope & Platform Boundaries
+## Remaining Scope Before Publishing `v0.1.0`
 
-- **Synthetic Verification Stage:** Native CLI vaults retain the `SYNTHETIC_ONLY` guard (`user_ready=false`, `security_complete=false`) until at-rest encryption and key recovery are finalized (`v0.1.3`).
-- **Platform Support:** Native binary builds and file-locking tests currently target Linux (`ext4` / `flock` / `renameat2`). Windows lock and file-identity contracts (`src/windows_lock.rs`, `src/windows_file_id.rs`) are staged behind `cfg(windows)` for `v0.1.2`.
-- **Not Yet Implemented:** OCR for scanned PDFs, encrypted PDF decryption, at-rest vault encryption, full-text search, and native desktop UI shell.
+- **Windows Native Runtime & CI:** Wire `src/windows_lock.rs` and `src/windows_file_id.rs` and verify on `windows-latest`.
+- **At-Rest Protection & Removing `SYNTHETIC_ONLY`:** Finalize encryption and key recovery for real personal billing data.
+- **Thin Desktop Shell:** Wrap the verified Rust/SQLite core for everyday local use.
