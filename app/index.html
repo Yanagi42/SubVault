@@ -349,6 +349,15 @@
       <div class="stage-content">
         <!-- 视图 A：资产库总览 -->
         <section id="pane-assets" class="stage-pane">
+          <!-- 示例数据一键清空条（仅当账本包含体验示例时出现） -->
+          <div id="demo-notice-bar" class="demo-notice-bar hidden">
+            <div class="demo-notice-text">
+              <span class="pill-tag pill-blue">体验模式</span>
+              <span id="demo-notice-msg">当前账本包含体验示例数据，随时可一键移除且不影响你的真实账单。</span>
+            </div>
+            <button id="btn-clear-demo-pack" class="btn btn-secondary btn-sm" type="button">一键清空示例数据</button>
+          </div>
+
           <!-- 统一财务总览 Bento（含内嵌按需提醒条） -->
           <div id="hero-bento" class="hero-bento"></div>
 
@@ -828,6 +837,16 @@
             <button id="btn-save-item" class="btn btn-primary btn-lg btn-block" type="submit">
               保存修改
             </button>
+            <div class="drawer-danger-zone">
+              <button id="btn-ask-delete-item" class="danger-link-btn" type="button">将此条记录移出账本…</button>
+              <div id="delete-confirm-bar" class="delete-confirm-bar hidden">
+                <span>确认从本账本中永久移除这条记录与原件？</span>
+                <div class="btn-row">
+                  <button id="btn-cancel-delete-item" class="btn btn-ghost btn-sm" type="button">取消</button>
+                  <button id="btn-confirm-delete-item" class="btn btn-danger-soft btn-sm" type="button">确认移出</button>
+                </div>
+              </div>
+            </div>
           </div>
         </form>
       </div>

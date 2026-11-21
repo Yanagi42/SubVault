@@ -778,6 +778,15 @@
 
   // --- View 1: Assets Canvas (Hero Bento + Cards / List) ---
   function renderAssetsPane(ws) {
+    const demoCount = ws.vault?.demo_count || 0;
+    const demoBar = $("demo-notice-bar");
+    if (demoCount > 0) {
+      $("demo-notice-msg").textContent = `当前账本包含 ${demoCount} 项体验示例数据，随时可一键清除且不影响你的真实账单。`;
+      demoBar.classList.remove("hidden");
+    } else {
+      demoBar.classList.add("hidden");
+    }
+
     renderHeroBento(ws);
 
     const hasItems = (ws.items || []).length > 0;
@@ -796,11 +805,11 @@
           <div class="empty-welcome">
             <div class="empty-icon-wrap">${ICO.inbox}</div>
             <h3>开始整理你的第一份资产或账单</h3>
-            <p>直接把 PDF 发票、邮件 HTML、支付宝 / 微信 CSV 账单或收据截图拖进窗口，或先载入一套完整示例资产包体验全部功能。</p>
+            <p>直接把 PDF 发票、邮件 HTML、支付宝 / 微信 CSV 账单或收据截图拖进窗口，或点下方按钮立刻开始。</p>
             <div class="btn-row" style="justify-content:center">
-              <button type="button" id="btn-load-demo-pack" class="btn btn-primary btn-sm">一键载入体验资产包</button>
-              <button type="button" id="btn-empty-import" class="btn btn-secondary btn-sm">选择本地文件导入</button>
-              <button type="button" id="btn-empty-manual" class="btn btn-ghost btn-sm">手动记一笔</button>
+              <button type="button" id="btn-empty-import" class="btn btn-primary btn-sm">选择本地文件导入</button>
+              <button type="button" id="btn-empty-manual" class="btn btn-secondary btn-sm">手动记一笔</button>
+              <button type="button" id="btn-load-demo-pack" class="btn btn-ghost btn-sm">载入体验示例数据（随时可一键清空）</button>
             </div>
           </div>
         `;
@@ -814,11 +823,11 @@
             const snap = await api("POST", "/api/import-demo-pack", {});
             state.workspace = snap;
             renderWorkspace();
-            showToast("示例资产包已就绪：试试复制密钥、切报销状态或看看日历与沙盘", "ok");
+            showToast("示例资产包已就绪，上方随时可一键清空", "ok");
           } catch (err) {
             showToast(err.message, "error");
             demoBtn.disabled = false;
-            demoBtn.textContent = "一键载入体验资产包";
+            demoBtn.textContent = "载入体验示例数据（随时可一键清空）";
           }
         });
       } else {
@@ -1943,6 +1952,8 @@
     state.lastRedactedText = "";
     $("redact-result-wrap").classList.add("hidden");
     $("redact-custom-terms").value = "";
+    $("delete-confirm-bar").classList.add("hidden");
+    $("btn-ask-delete-item").classList.remove("hidden");
     $("drawer-backdrop").classList.remove("hidden");
     $("detail-drawer").classList.remove("hidden");
 
@@ -2679,6 +2690,53 @@
     });
     document.querySelectorAll("[data-collection]").forEach((btn) => {
       btn.addEventListener("click", () => navigateTo("assets", btn.getAttribute("data-collection")));
+    });
+
+    // Clear demo pack button
+    $("btn-clear-demo-pack").addEventListener("click", async () => {
+      const btn = $("btn-clear-demo-pack");
+      btn.disabled = true;
+      btn.textContent = "正在清除…";
+      try {
+        const snap = await api("POST", "/api/clear-demo-pack", {});
+        state.workspace = snap;
+        closeDrawer();
+        renderWorkspace();
+        showToast(`已清除 ${snap.removed_count || 0} 项体验示例数据，你的真实账单完好无损`, "ok");
+      } catch (err) {
+        showToast(err.message, "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "一键清空示例数据";
+      }
+    });
+
+    // Single source delete with inline 2-step confirmation
+    $("btn-ask-delete-item").addEventListener("click", () => {
+      $("btn-ask-delete-item").classList.add("hidden");
+      $("delete-confirm-bar").classList.remove("hidden");
+    });
+    $("btn-cancel-delete-item").addEventListener("click", () => {
+      $("delete-confirm-bar").classList.add("hidden");
+      $("btn-ask-delete-item").classList.remove("hidden");
+    });
+    $("btn-confirm-delete-item").addEventListener("click", async () => {
+      if (!state.selectedSourceId) return;
+      const btn = $("btn-confirm-delete-item");
+      btn.disabled = true;
+      btn.textContent = "移出中…";
+      try {
+        const snap = await api("POST", "/api/sources/delete", { source_id: state.selectedSourceId });
+        state.workspace = snap;
+        closeDrawer();
+        renderWorkspace();
+        showToast("已从当前账本移出这条记录", "ok");
+      } catch (err) {
+        showToast(err.message, "error");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "确认移出";
+      }
     });
 
     // File pickers, lock, shutdown

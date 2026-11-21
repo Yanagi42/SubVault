@@ -1648,6 +1648,84 @@ pub fn update_marker_with_cipher(
     )
 }
 
+/// Format 6 only: atomically deletes the specified sources and all dependent
+/// facts, decisions, extraction runs/candidates, occurrences, and annotations,
+/// returning `(deleted_source_count, orphaned_object_ids_to_unlink)`.
+pub fn delete_sources_atomic(
+    tx: &Transaction<'_>,
+    source_ids: &[String],
+) -> rusqlite::Result<(usize, Vec<String>)> {
+    let mut candidate_objects: Vec<String> = Vec::new();
+    let mut deleted = 0usize;
+
+    for sid in source_ids {
+        let obj_id: Option<String> = tx
+            .query_row(
+                "SELECT object_id FROM sources WHERE source_id = ?1",
+                [sid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(obj_id) = obj_id else {
+            continue;
+        };
+        if !candidate_objects.contains(&obj_id) {
+            candidate_objects.push(obj_id);
+        }
+
+        // Remove self-referencing undo chains leaf-first before deleting root decisions
+        loop {
+            let n = tx.execute(
+                "DELETE FROM decisions \
+                 WHERE fact_id IN (SELECT fact_id FROM facts WHERE source_id = ?1) \
+                   AND target_decision_id IS NOT NULL \
+                   AND decision_id NOT IN ( \
+                       SELECT target_decision_id FROM decisions WHERE target_decision_id IS NOT NULL \
+                   )",
+                [sid],
+            )?;
+            if n == 0 {
+                break;
+            }
+        }
+        tx.execute(
+            "DELETE FROM decisions WHERE fact_id IN (SELECT fact_id FROM facts WHERE source_id = ?1)",
+            [sid],
+        )?;
+        tx.execute("DELETE FROM facts WHERE source_id = ?1", [sid])?;
+        tx.execute(
+            "DELETE FROM candidates WHERE source_version_id IN (SELECT source_version_id FROM source_versions WHERE source_id = ?1)",
+            [sid],
+        )?;
+        tx.execute(
+            "DELETE FROM extraction_attempts WHERE run_id IN (SELECT run_id FROM extraction_runs WHERE source_id = ?1)",
+            [sid],
+        )?;
+        tx.execute("DELETE FROM extraction_runs WHERE source_id = ?1", [sid])?;
+        tx.execute("DELETE FROM source_versions WHERE source_id = ?1", [sid])?;
+        tx.execute("DELETE FROM occurrences WHERE source_id = ?1", [sid])?;
+        if table_exists(tx, "source_annotations")? {
+            tx.execute("DELETE FROM source_annotations WHERE source_id = ?1", [sid])?;
+        }
+        deleted += tx.execute("DELETE FROM sources WHERE source_id = ?1", [sid])?;
+    }
+
+    let mut orphaned_objects = Vec::new();
+    for obj_id in candidate_objects {
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM sources WHERE object_id = ?1",
+            [&obj_id],
+            |r| r.get(0),
+        )?;
+        if remaining == 0 {
+            tx.execute("DELETE FROM objects WHERE object_id = ?1", [&obj_id])?;
+            orphaned_objects.push(obj_id);
+        }
+    }
+
+    Ok((deleted, orphaned_objects))
+}
+
 #[cfg(test)]
 mod checkpoint_contract {
     use super::{

@@ -38,6 +38,32 @@ const ICON_SVG: &str = include_str!("../web/assets/icon.svg");
 const MAX_HTTP_BODY: usize = 16 * 1024 * 1024; // 16 MiB (handles 8 MiB file in base64)
 const WORKBENCH_ACTOR_ID: &str = "act_776f726b62656e63685f757365723031";
 
+const DEMO_PACK_FILENAMES: &[&str] = &[
+    "示例-WPS年卡电子发票.pdf",
+    "sample-openai-sep.html",
+    "sample-openai-receipt.html",
+    "sample-openai-receipt-renamed-copy.html",
+    "sample-github-copilot.html",
+    "示例-Apple-iCloud月账单.html",
+    "sample-netflix-nov.html",
+    "示例-MacBook-Air硬件保修发票.pdf",
+    "sample-raycast-license.html",
+    "示例-腾讯云企业报销发票.pdf",
+    "示例-待补录收据截图.png",
+    "示例-支付宝账单明细.csv",
+];
+
+fn is_demo_source(display_name: &str, occurrences: &[Value]) -> bool {
+    if DEMO_PACK_FILENAMES.contains(&display_name) {
+        return true;
+    }
+    occurrences.iter().any(|o| {
+        o["display_name"]
+            .as_str()
+            .is_some_and(|n| DEMO_PACK_FILENAMES.contains(&n))
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkbenchOptions {
     pub port: u16,
@@ -558,10 +584,12 @@ fn dispatch(req: &HttpRequest, state: &ServerState) -> HttpResponse {
         ("GET", "/api/workspace") => api_workspace(state),
         ("POST", "/api/import") => api_import_file(req, state),
         ("POST", "/api/import-demo-pack") => api_import_demo_pack(state),
+        ("POST", "/api/clear-demo-pack") => api_clear_demo_pack(state),
         ("POST", "/api/manual-entry") => api_manual_entry(req, state),
         ("POST", "/api/csv/promote") => api_csv_promote(req, state),
         ("POST", "/api/sources/save") => api_source_save(req, state),
         ("POST", "/api/sources/reimburse") => api_source_reimburse(req, state),
+        ("POST", "/api/sources/delete") => api_source_delete(req, state),
         ("POST", "/api/facts/undo") => api_fact_undo(req, state),
         ("POST", "/api/sources/redact") => api_source_redact(req, state),
         ("GET", "/api/export/csv") => api_export_csv(state),
@@ -1693,6 +1721,7 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
     let mut conflict_count = 0usize;
     let mut needs_entry_count = 0usize;
     let mut csv_statement_count = 0usize;
+    let mut demo_count = 0usize;
 
     for src in &sources {
         let source_id = src["source_id"].as_str().unwrap_or("").to_string();
@@ -1989,6 +2018,11 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
             }),
         };
 
+        let is_demo = is_demo_source(&display_name, &src_occs);
+        if is_demo {
+            demo_count += 1;
+        }
+
         items.push(json!({
             "source_id": source_id,
             "object_id": src["object_id"],
@@ -1997,6 +2031,7 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
             "media_type": src["media_type"],
             "object_intact": src["object_intact"],
             "display_name": display_name,
+            "is_demo": is_demo,
             "latest_recorded_at": latest_recorded_at,
             "occurrence_count": src_occs.len(),
             "duplicate_hits": duplicate_hits,
@@ -2302,6 +2337,7 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
             "conflict_count": conflict_count,
             "needs_entry_count": needs_entry_count,
             "csv_statement_count": csv_statement_count,
+            "demo_count": demo_count,
             "alerts": open_rep.body["alerts"],
         },
         "summary_by_currency": summary_by_currency,
@@ -2811,6 +2847,69 @@ fn api_source_reimburse(req: &HttpRequest, state: &ServerState) -> HttpResponse 
         }
         match build_workspace_snapshot(active) {
             Ok(snap) => HttpResponse::json(200, snap),
+            Err(resp) => resp,
+        }
+    })
+}
+
+fn api_clear_demo_pack(state: &ServerState) -> HttpResponse {
+    with_active(state, |active| {
+        let snap = match build_workspace_snapshot(active) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        let demo_ids: Vec<String> = snap["items"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|it| it["is_demo"] == json!(true))
+                    .filter_map(|it| it["source_id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let removed = if demo_ids.is_empty() {
+            0
+        } else {
+            match engine::delete_sources(&active.path, &demo_ids, &active.auth()) {
+                Ok(n) => n,
+                Err(fail) => return map_engine_error(&fail.into_report()),
+            }
+        };
+
+        match build_workspace_snapshot(active) {
+            Ok(mut updated) => {
+                if let Some(obj) = updated.as_object_mut() {
+                    obj.insert("removed_count".into(), json!(removed));
+                }
+                HttpResponse::json(200, updated)
+            }
+            Err(resp) => resp,
+        }
+    })
+}
+
+fn api_source_delete(req: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let body = match parse_json_body(req) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let source_id = body["source_id"].as_str().unwrap_or("").trim().to_string();
+    if source_id.is_empty() {
+        return HttpResponse::error(400, "source_id_required", "缺少要移出的记录编号");
+    }
+    with_active(state, |active| {
+        let removed = match engine::delete_sources(&active.path, &[source_id], &active.auth()) {
+            Ok(n) => n,
+            Err(fail) => return map_engine_error(&fail.into_report()),
+        };
+        match build_workspace_snapshot(active) {
+            Ok(mut updated) => {
+                if let Some(obj) = updated.as_object_mut() {
+                    obj.insert("removed_count".into(), json!(removed));
+                }
+                HttpResponse::json(200, updated)
+            }
             Err(resp) => resp,
         }
     })

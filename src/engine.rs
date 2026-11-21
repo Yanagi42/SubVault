@@ -1673,6 +1673,39 @@ pub(crate) fn read_source_bytes(
     Ok((bytes, source.media_type, display_name))
 }
 
+#[allow(dead_code)]
+pub(crate) fn delete_sources(
+    path: &Path,
+    source_ids: &[String],
+    auth: &AuthInput,
+) -> Result<usize, Fail> {
+    if source_ids.is_empty() {
+        return Ok(0);
+    }
+    for sid in source_ids {
+        if !is_prefixed_id(sid, "src_") {
+            return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
+        }
+    }
+    let session = open_real_session(path, auth)?;
+    let tx = session
+        .conn
+        .unchecked_transaction()
+        .map_err(|err| db_fail(err, "delete_sources_begin"))?;
+    let (deleted, orphaned_objects) = store::delete_sources_atomic(&tx, source_ids)
+        .map_err(|err| db_fail(err, "delete_sources"))?;
+    tx.commit()
+        .map_err(|err| db_fail(err, "delete_sources_commit"))?;
+    let _ = store::checkpoint(&session.conn);
+
+    for obj_id in orphaned_objects {
+        if let Some(relpath) = canonical_object_relpath(&obj_id) {
+            let _ = fs::remove_file(session.root.join(relpath));
+        }
+    }
+    Ok(deleted)
+}
+
 pub fn rotate_passphrase(req: RotatePassphraseRequest) -> Report {
     match rotate_passphrase_inner(req) {
         Ok(report) => report,

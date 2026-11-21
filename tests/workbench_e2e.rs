@@ -487,5 +487,52 @@ fn workbench_security_and_complete_end_to_end_user_workflow() {
         "raw demo license key leaked into vault.db"
     );
 
+    // 10. One-click clear-demo-pack removes ONLY demo items & orphaned object files, preserving all real user bills!
+    assert!(man_snap["vault"]["demo_count"].as_u64().unwrap() >= 10);
+    let (status, cleared_snap) = api_json(
+        addr,
+        "POST",
+        "/api/clear-demo-pack",
+        &token,
+        Some(json!({})),
+    );
+    assert_eq!(status, 200, "{cleared_snap}");
+    assert!(cleared_snap["removed_count"].as_u64().unwrap() >= 10);
+    assert_eq!(cleared_snap["vault"]["demo_count"], 0);
+    assert_eq!(cleared_snap["vault"]["source_count"], 5);
+    assert_eq!(
+        cleared_snap["vault"]["alerts"].as_array().unwrap().len(),
+        0,
+        "clearing demo pack must leave zero integrity alerts: {cleared_snap}"
+    );
+
+    // 11. Single-source delete removes a mistaken manual entry cleanly and passes full export+verify!
+    let created_sid = man_snap["created_source_id"].as_str().unwrap().to_string();
+    let (status, after_del) = api_json(
+        addr,
+        "POST",
+        "/api/sources/delete",
+        &token,
+        Some(json!({ "source_id": created_sid })),
+    );
+    assert_eq!(status, 200, "{after_del}");
+    assert_eq!(after_del["removed_count"], 1);
+    assert_eq!(after_del["vault"]["source_count"], 4);
+    assert_eq!(after_del["vault"]["alerts"].as_array().unwrap().len(), 0);
+
+    let post_del_export = tmp.path.join("exit-pack-after-clean");
+    let (status, exp2) = api_json(
+        addr,
+        "POST",
+        "/api/export/package",
+        &token,
+        Some(json!({
+            "out_dir": post_del_export.display().to_string(),
+            "acknowledge_plaintext": true
+        })),
+    );
+    assert_eq!(status, 200, "{exp2}");
+    assert_eq!(exp2["verified"], true, "{exp2}");
+
     server.stop();
 }
