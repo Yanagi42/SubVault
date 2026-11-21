@@ -15,13 +15,15 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::crypto::{AuthInput, ProtectionMode, VaultCipher};
 use crate::ids::hex_encode;
 use crate::model::{
-    honesty, unseen_db, Fail, Report, EXIT_INTEGRITY, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED,
+    apply_format_honesty, cipher_tamper_fail, honesty, unseen_db, Fail, Report, EXIT_INTEGRITY,
+    EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED,
 };
 
-pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>) -> Report {
-    let (facts, candidates, sources) = match read_snapshot(vault) {
+pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>, auth: AuthInput) -> Report {
+    let (facts, candidates, sources, version, protection) = match read_snapshot(vault, &auth) {
         Ok(rows) => rows,
         Err(report) => return report,
     };
@@ -45,12 +47,26 @@ pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>) -> Report 
         sources.len(),
         link.associated(),
         link.verified(),
+        version,
+        protection,
     )
 }
 
-fn read_snapshot(vault: &Path) -> Result<(Value, Value, Vec<SourceLine>), Report> {
-    let (read, version) = super::open_review_read(vault).map_err(|fail| fail.into_report())?;
-    let facts = match super::decide::read_facts(read.connection(), version, None, None) {
+#[allow(clippy::type_complexity)]
+fn read_snapshot(
+    vault: &Path,
+    auth: &AuthInput,
+) -> Result<(Value, Value, Vec<SourceLine>, i64, Option<ProtectionMode>), Report> {
+    let (read, version) =
+        super::open_review_read(vault, auth).map_err(|fail| fail.into_report())?;
+    let facts = match super::decide::read_facts(
+        read.connection(),
+        version,
+        None,
+        None,
+        read.cipher(),
+        read.protection(),
+    ) {
         Ok((code, body)) => {
             if code != EXIT_OK {
                 return Err(Report { code, body });
@@ -59,7 +75,13 @@ fn read_snapshot(vault: &Path) -> Result<(Value, Value, Vec<SourceLine>), Report
         }
         Err(fail) => return Err(tag_facts(fail.into_report())),
     };
-    let candidates = match super::fragment::read_candidates(vault, read.connection(), None) {
+    let candidates = match super::fragment::read_candidates(
+        vault,
+        read.connection(),
+        None,
+        read.cipher(),
+        read.protection(),
+    ) {
         Ok((code, body)) => {
             if code != EXIT_OK {
                 return Err(Report { code, body });
@@ -77,8 +99,9 @@ fn read_snapshot(vault: &Path) -> Result<(Value, Value, Vec<SourceLine>), Report
                 .into_report(),
         );
     }
-    let sources = sources_on(read.connection()).map_err(|fail| fail.into_report())?;
-    Ok((facts, candidates, sources))
+    let sources =
+        sources_on(read.connection(), read.cipher()).map_err(|fail| fail.into_report())?;
+    Ok((facts, candidates, sources, version, read.protection()))
 }
 
 fn tag_facts(mut report: Report) -> Report {
@@ -99,7 +122,7 @@ struct SourceLine {
     roles: Vec<String>,
 }
 
-fn sources_on(conn: &Connection) -> Result<Vec<SourceLine>, Fail> {
+fn sources_on(conn: &Connection, cipher: &VaultCipher) -> Result<Vec<SourceLine>, Fail> {
     let mut stmt = conn
         .prepare(
             "SELECT s.source_id, s.object_id, s.content_sha256, s.byte_length, s.media_type, IFNULL(v.role, '') FROM sources s LEFT JOIN source_versions v ON v.source_id = s.source_id ORDER BY s.source_id, v.source_version_id",
@@ -130,10 +153,13 @@ fn sources_on(conn: &Connection) -> Result<Vec<SourceLine>, Fail> {
             }
             continue;
         }
+        let plain_hash = cipher
+            .decrypt_field("sources", &row.0, "content_sha256", &row.2)
+            .map_err(|err| cipher_tamper_fail(err, "review_sources"))?;
         sources.push(SourceLine {
             source_id: row.0,
             object_id: row.1,
-            content_sha256: row.2,
+            content_sha256: plain_hash,
             byte_length: row.3,
             media_type: row.4,
             roles: if row.5.is_empty() {
@@ -592,14 +618,37 @@ fn render(
             }
         }
     }
-    let mut text = String::from(
+    let is_real = facts_body["synthetic_only"].as_bool() == Some(false);
+    let mut text = String::from(if is_real {
+        "\
+真实资料库只读审阅单（格式 6）
+这不是 Windows 界面。
+"
+    } else {
         "\
 合成开发审阅单
 这不是 Windows 界面。
-",
-    );
+"
+    });
     push_conclusion(&mut text, facts, sources, link);
-    text.push_str(
+    text.push_str(if is_real {
+        "\
+详单
+这是真实资料库（格式 6）的只读文字审阅单。桌面交互界面尚未完成。
+原件里的 HTML 只按文字抄出，不渲染，也不打开链接，也不取远程资源。
+控制字符、换行和双向控制写成 \\u{XXXX}。反斜杠写成 \\\\。
+这些信息不代表什么
+这些信息不代表什么：凭据写明、你修改（原文仍写X）、已撤销。
+凭据写明的金额不是已核到账。
+修改后的当前值不改原件。原文仍在库里。
+已撤销的决定仍留在记录里。
+候选不是事实。
+显示文本不是原件切片。
+提取尝试的 attempt_published 只是库里的尝试标记。这份单没有发布库。
+这份只读打开可能让 SQLite 碰到 -shm。它不改已提交的逻辑数据、原件字节和决定记录。它不证明目录里没有新文件。
+记录顺序 每个来源先写自己的事实（source_id、fact_id），再写该来源未成为事实的候选（ordinal）。决定按库内 rowid。recorded_at 是库里的整数，不是这份单编的时刻。
+"
+    } else {
         "\
 详单
 这是合成开发库的只读文字。它不是完成的产品。
@@ -615,12 +664,14 @@ fn render(
 提取尝试的 attempt_published 只是库里的尝试标记。这份单没有发布库。
 这份只读打开可能让 SQLite 碰到 -shm。它不改已提交的逻辑数据、原件字节和决定记录。它不证明目录里没有新文件。
 记录顺序 每个来源先写自己的事实（source_id、fact_id），再写该来源未成为事实的候选（ordinal）。决定按库内 rowid。recorded_at 是库里的整数，不是这份单编的时刻。
-",
-    );
+"
+    });
     if facts_body["slice"].as_str() == Some("T4-html") {
         text.push_str("格式 4 不收纯文本片段。这份单没有把纯文本塞进这个库。\n");
     } else if facts_body["slice"].as_str() == Some("T5-pdf") {
         text.push_str("格式 5 收录静态 PDF 与 HTML 原件，不收纯文本片段，也不做 OCR。\n");
+    } else if is_real {
+        text.push_str("格式 6 支持静态 PDF、HTML 与文本片段，不做 OCR。\n");
     }
     text.push_str("来源\n");
     if sources.is_empty() {
@@ -999,6 +1050,7 @@ fn disguised(ch: char) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reviewed(
     facts: &Value,
     out: &Path,
@@ -1007,6 +1059,8 @@ fn reviewed(
     source_count: usize,
     package_associated: bool,
     originals_verified: usize,
+    version: i64,
+    protection: Option<ProtectionMode>,
 ) -> Report {
     let mut body = honesty("Reviewed");
     if let Some(slice) = facts.get("slice") {
@@ -1025,6 +1079,7 @@ fn reviewed(
         "filesystem_note".into(),
         json!("只读打开可能让 SQLite 碰到 -shm。已提交的逻辑数据、原件字节和决定记录不因这次审阅改写。这不证明目录里没有新文件。"),
     );
+    apply_format_honesty(&mut body, version, protection);
     Report {
         code: EXIT_OK,
         body: Value::Object(body),

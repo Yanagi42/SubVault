@@ -7,11 +7,13 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::body::{self, StatedLine};
+use crate::crypto::{AuthInput, CryptoError, VaultCipher};
 use crate::ids::{self, canonical_object_relpath, hex_encode, is_command_id, is_display_name};
 use crate::journal::{self, Journal};
 use crate::model::{
-    db_fail, honesty, io_fail, unseen_db, Fail, Report, EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY,
-    EXIT_REJECTED, EXIT_USAGE, NOT_PRESERVED, PRESERVED,
+    apply_format_honesty, cipher_tamper_fail, db_fail, honesty, io_fail, unseen_db, Fail, Report,
+    EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_USAGE, NOT_PRESERVED,
+    PRESERVED,
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
@@ -39,6 +41,7 @@ pub struct HtmlRequest {
     pub command_id: String,
     pub source: PathBuf,
     pub batch_id: Option<String>,
+    pub auth: AuthInput,
     pub hooks: super::Hooks,
 }
 
@@ -54,7 +57,9 @@ pub fn submit_html(req: HtmlRequest) -> Report {
 
 fn as_html(mut report: Report) -> Report {
     if let Some(map) = report.body.as_object_mut() {
-        map.insert("slice".into(), json!("T4-html"));
+        if map.get("slice").and_then(Value::as_str) != Some("M4-real") {
+            map.insert("slice".into(), json!("T4-html"));
+        }
     }
     report
 }
@@ -73,40 +78,51 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
             return Err(Fail::new(EXIT_USAGE, "Usage", "bad_batch_id"));
         }
     }
-    let session = super::open_html_session(&req.vault)?;
-    if let Some(existing) = store::command(&session.conn, &req.command_id)
-        .map_err(|err| unseen_db(err, "command_lookup"))?
+    let session = super::open_html_session(&req.vault, &req.auth)?;
+    if let Some(existing) =
+        store::command_with_cipher(&session.conn, &req.command_id, &session.cipher)
+            .map_err(|err| unseen_db(err, "command_lookup"))?
     {
         return replay(&session, &req, &existing);
     }
     // A T3 receipt occupies this command id for every kind. Preservation is
     // not a second fact commit.
-    super::decide::reject_if_t3_command(&session.conn, &req.command_id)?;
+    super::decide::reject_if_t3_command(&session.conn, &req.command_id, &session.cipher)?;
     let bytes = read_html(&req.source)?;
     let text = std::str::from_utf8(&bytes).expect("read_html accepted utf-8");
     let hash = sha256_bytes(&bytes);
-    if let Some(source) =
-        store::source_by_hash(&session.conn, &hash).map_err(|err| db_fail(err, "source_lookup"))?
+    if let Some(source) = store::source_by_hash_with_cipher(
+        &session.conn,
+        session.vault_format,
+        &hash,
+        &session.cipher,
+    )
+    .map_err(|err| db_fail(err, "source_lookup"))?
     {
-        confirm_object(&session.root, &source)?;
+        confirm_object(&session.root, &source, &session.cipher)?;
         return persist_reuse(&session, &req, &source, &hash);
     }
-    let mut journal = start_journal(&session.root, &req)?;
+    let mut journal = start_journal(&session.root, &req, &session.cipher)?;
     let key = logical_key(&hash);
     journal.content_sha256 = Some(hash.clone());
     journal.byte_length = Some(bytes.len() as i64);
     journal.payload_fingerprint = Some(key.clone());
     journal.media_type = Some(MEDIA_TYPE.into());
-    journal::write(&session.root, &journal)?;
-    let object = match place_object(&session.root, &session.conn, &bytes, &hash, &mut journal) {
+    journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
+    let object = match place_object(&session, &bytes, &hash, &mut journal) {
         Ok(object) => object,
         Err(fail) => {
-            abort_journal(&session.root, &mut journal, "object_not_placed")?;
+            abort_journal(
+                &session.root,
+                &mut journal,
+                "object_not_placed",
+                &session.cipher,
+            )?;
             return Err(fail.extra("preservation", json!(NOT_PRESERVED)));
         }
     };
     journal.state = "object_ready".into();
-    journal::write(&session.root, &journal)?;
+    journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
     let prepared = extract(text);
     let committed = match commit(
         &session,
@@ -119,13 +135,18 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
     ) {
         Ok(body) => body,
         Err(fail) => {
-            let _ = abort_journal(&session.root, &mut journal, "commit_failed");
+            let _ = abort_journal(
+                &session.root,
+                &mut journal,
+                "commit_failed",
+                &session.cipher,
+            );
             return Err(fail.extra("preservation", json!(NOT_PRESERVED)));
         }
     };
     journal.state = "committed".into();
     journal.reason = None;
-    match journal::write(&session.root, &journal) {
+    match journal::write_with_cipher(&session.root, &journal, &session.cipher) {
         Ok(()) => Ok(committed),
         Err(fail) => {
             let mut body = committed;
@@ -183,7 +204,7 @@ fn read_html(path: &Path) -> Result<Vec<u8>, Fail> {
     Ok(bytes)
 }
 
-fn start_journal(root: &Path, req: &HtmlRequest) -> Result<Journal, Fail> {
+fn start_journal(root: &Path, req: &HtmlRequest, cipher: &VaultCipher) -> Result<Journal, Fail> {
     let display = req
         .source
         .file_name()
@@ -215,40 +236,60 @@ fn start_journal(root: &Path, req: &HtmlRequest) -> Result<Journal, Fail> {
         marker_value: None,
         source_id: None,
     };
-    journal::write(root, &journal)?;
+    journal::write_with_cipher(root, &journal, cipher)?;
     Ok(journal)
 }
 
-fn abort_journal(root: &Path, journal: &mut Journal, reason: &str) -> Result<(), Fail> {
+fn abort_journal(
+    root: &Path,
+    journal: &mut Journal,
+    reason: &str,
+    cipher: &VaultCipher,
+) -> Result<(), Fail> {
     journal.state = "aborted".into();
     journal.reason = Some(reason.into());
-    journal::write(root, journal)
+    journal::write_with_cipher(root, journal, cipher)
 }
 
 fn place_object(
-    root: &Path,
-    conn: &rusqlite::Connection,
+    session: &super::Session,
     bytes: &[u8],
     hash: &str,
     journal: &mut Journal,
 ) -> Result<ObjectRow, Fail> {
-    if let Some(object) =
-        store::object_by_hash(conn, hash).map_err(|err| db_fail(err, "object_lookup"))?
+    if let Some(object) = store::object_by_hash_with_cipher(
+        &session.conn,
+        session.vault_format,
+        hash,
+        &session.cipher,
+    )
+    .map_err(|err| db_fail(err, "object_lookup"))?
     {
-        confirm_hosted(root, &object, hash, bytes.len() as i64)?;
+        confirm_hosted(
+            &session.root,
+            &object,
+            hash,
+            bytes.len() as i64,
+            &session.cipher,
+        )?;
         journal.storage_reused = Some(true);
         journal.object_id = Some(object.object_id.clone());
         return Ok(object);
     }
     let object_id = ids::random_id("obj_").map_err(|err| io_fail(err, "random"))?;
-    let staging = journal::staging_path(root, &journal.command_id);
-    crate::fsutil::atomic_write(&staging, bytes).map_err(|err| io_fail(err, "write_staging"))?;
-    let dest = root.join("objects").join(&object_id);
+    let staging = journal::staging_path(&session.root, &journal.command_id);
+    let disk_bytes = session
+        .cipher
+        .encrypt_object_bytes(&object_id, bytes)
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_object"))?;
+    crate::fsutil::atomic_write(&staging, &disk_bytes)
+        .map_err(|err| io_fail(err, "write_staging"))?;
+    let dest = session.root.join("objects").join(&object_id);
     if let Err(err) = fs::hard_link(&staging, &dest) {
         return Err(io_fail(err, "publish_object"));
     }
     crate::platform::sync_file(&dest).map_err(|err| io_fail(err, "object_fsync"))?;
-    crate::fsutil::fsync_dir(dest.parent().unwrap_or(root))
+    crate::fsutil::fsync_dir(dest.parent().unwrap_or(&session.root))
         .map_err(|err| io_fail(err, "object_dir_fsync"))?;
     let _ = fs::remove_file(&staging);
     journal.storage_reused = Some(false);
@@ -264,25 +305,43 @@ fn place_object(
     })
 }
 
-fn confirm_object(root: &Path, source: &SourceRow) -> Result<(), Fail> {
+fn confirm_object(root: &Path, source: &SourceRow, cipher: &VaultCipher) -> Result<(), Fail> {
     let object = ObjectRow {
         object_id: source.object_id.clone(),
         content_sha256: source.content_sha256.clone(),
         byte_length: source.byte_length,
         relpath: canonical_object_relpath(&source.object_id).unwrap_or_default(),
     };
-    confirm_hosted(root, &object, &source.content_sha256, source.byte_length)
+    confirm_hosted(
+        root,
+        &object,
+        &source.content_sha256,
+        source.byte_length,
+        cipher,
+    )
 }
 
-fn confirm_hosted(root: &Path, object: &ObjectRow, hash: &str, len: i64) -> Result<(), Fail> {
+fn confirm_hosted(
+    root: &Path,
+    object: &ObjectRow,
+    hash: &str,
+    len: i64,
+    cipher: &VaultCipher,
+) -> Result<(), Fail> {
     let path = root.join("objects").join(&object.object_id);
-    let bytes = fs::read(&path).map_err(|err| {
-        Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_unreadable")
-            .extra("during", json!("hash_object"))
-            .extra("os_error", json!(err.to_string()))
-            .extra("new_effect", json!(false))
-    })?;
-    if sha256_bytes(&bytes) != hash || bytes.len() as i64 != len {
+    let (actual_hash, actual_len) = match cipher.verify_object_file(&object.object_id, &path) {
+        Ok(pair) => pair,
+        Err(CryptoError::Io(err)) => {
+            return Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_unreadable")
+                    .extra("during", json!("hash_object"))
+                    .extra("os_error", json!(err.to_string()))
+                    .extra("new_effect", json!(false)),
+            );
+        }
+        Err(err) => return Err(cipher_tamper_fail(err, "hash_object")),
+    };
+    if actual_hash != hash || actual_len as i64 != len {
         return Err(
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_mismatch")
                 .extra("new_effect", json!(false)),
@@ -298,7 +357,7 @@ fn persist_reuse(
     hash: &str,
 ) -> Result<Value, Fail> {
     let key = logical_key(hash);
-    let mut journal = start_journal(&session.root, req)?;
+    let mut journal = start_journal(&session.root, req, &session.cipher)?;
     journal.content_sha256 = Some(hash.to_string());
     journal.byte_length = Some(source.byte_length);
     journal.payload_fingerprint = Some(key.clone());
@@ -306,13 +365,13 @@ fn persist_reuse(
     journal.source_id = Some(source.source_id.clone());
     journal.storage_reused = Some(true);
     journal.media_type = Some(source.media_type.clone());
-    journal::write(&session.root, &journal)?;
+    journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
     let result = (|| -> Result<Value, Fail> {
         let tx = session
             .conn
             .unchecked_transaction()
             .map_err(|err| db_fail(err, "begin"))?;
-        if store::command(&tx, &req.command_id)
+        if store::command_with_cipher(&tx, &req.command_id, &session.cipher)
             .map_err(|err| db_fail(err, "command_recheck"))?
             .is_some()
         {
@@ -322,9 +381,10 @@ fn persist_reuse(
                     .extra("facts_created", json!(false)),
             );
         }
-        super::decide::reject_if_t3_command(&tx, &req.command_id)?;
+        super::decide::reject_if_t3_command(&tx, &req.command_id, &session.cipher)?;
         let current =
-            store::source_by_hash(&tx, hash).map_err(|err| db_fail(err, "source_recheck"))?;
+            store::source_by_hash_with_cipher(&tx, session.vault_format, hash, &session.cipher)
+                .map_err(|err| db_fail(err, "source_recheck"))?;
         let Some(current) = current else {
             return Err(
                 Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_missing")
@@ -344,7 +404,7 @@ fn persist_reuse(
                 .extra("new_effect", json!(false))
                 .extra("facts_created", json!(false))
         })?;
-        store::insert_occurrence(
+        store::insert_occurrence_with_cipher(
             &tx,
             &OccurrenceRow {
                 occurrence_id,
@@ -359,12 +419,13 @@ fn persist_reuse(
                 storage_reused: true,
                 recorded_at: super::now_ms(),
             },
+            &session.cipher,
         )
         .map_err(|err| db_fail(err, "insert_occurrence"))?;
-        let mut body = reuse_body(req, source, hash, &key);
+        let mut body = reuse_body(session, req, source, hash, &key);
         let encoded = serde_json::to_string(&body)
             .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
-        store::insert_command(
+        store::insert_command_with_cipher(
             &tx,
             &CommandRow {
                 command_id: req.command_id.clone(),
@@ -374,10 +435,11 @@ fn persist_reuse(
                 outcome: "AlreadyPreserved".into(),
             },
             super::now_ms(),
+            &session.cipher,
         )
         .map_err(|err| db_fail(err, "insert_command"))?;
         let canonical = html_canonical(hash, &key, "reused");
-        super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+        super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded, &session.cipher)?;
         tx.commit().map_err(|err| db_fail(err, "commit"))?;
         if let Some(map) = body.as_object_mut() {
             map.insert("db_committed".into(), json!(true));
@@ -388,7 +450,7 @@ fn persist_reuse(
         Ok(body) => {
             journal.state = "committed".into();
             journal.reason = None;
-            match journal::write(&session.root, &journal) {
+            match journal::write_with_cipher(&session.root, &journal, &session.cipher) {
                 Ok(()) => Ok(body),
                 Err(fail) => {
                     let mut body = body;
@@ -407,13 +469,24 @@ fn persist_reuse(
             }
         }
         Err(fail) => {
-            let _ = abort_journal(&session.root, &mut journal, "reuse_not_committed");
+            let _ = abort_journal(
+                &session.root,
+                &mut journal,
+                "reuse_not_committed",
+                &session.cipher,
+            );
             Err(fail.extra("facts_created", json!(false)))
         }
     }
 }
 
-fn reuse_body(req: &HtmlRequest, source: &SourceRow, hash: &str, key: &str) -> Value {
+fn reuse_body(
+    session: &super::Session,
+    req: &HtmlRequest,
+    source: &SourceRow,
+    hash: &str,
+    key: &str,
+) -> Value {
     let mut body = honesty("AlreadyPreserved");
     body.insert("new_effect".into(), json!(false));
     body.insert("facts_created".into(), json!(false));
@@ -427,6 +500,10 @@ fn reuse_body(req: &HtmlRequest, source: &SourceRow, hash: &str, key: &str) -> V
     body.insert("byte_length".into(), json!(source.byte_length));
     body.insert("media_type".into(), json!(source.media_type));
     body.insert("logical_key".into(), json!(key));
+    if session.vault_format >= 6 {
+        body.insert("slice".into(), json!("M4-real"));
+        apply_format_honesty(&mut body, session.vault_format, session.protection);
+    }
     Value::Object(body)
 }
 
@@ -465,7 +542,13 @@ fn replay(
                 .unwrap_or(0),
             relpath: String::new(),
         };
-        confirm_hosted(&session.root, &object, &hash, object.byte_length)?;
+        confirm_hosted(
+            &session.root,
+            &object,
+            &hash,
+            object.byte_length,
+            &session.cipher,
+        )?;
     }
     let Some(map) = body.as_object_mut() else {
         return Err(
@@ -509,15 +592,17 @@ fn commit(
         .conn
         .unchecked_transaction()
         .map_err(|err| db_fail(err, "begin"))?;
-    if store::object_by_hash(&tx, hash)
+    if store::object_by_hash_with_cipher(&tx, session.vault_format, hash, &session.cipher)
         .map_err(|err| db_fail(err, "object_recheck"))?
         .is_none()
     {
-        store::insert_object(&tx, object).map_err(|err| db_fail(err, "insert_object"))?;
+        store::insert_object_with_cipher(&tx, session.vault_format, object, &session.cipher)
+            .map_err(|err| db_fail(err, "insert_object"))?;
     }
     let source_id = ids::random_id("src_").map_err(|err| io_fail(err, "random"))?;
-    store::insert_source(
+    store::insert_source_with_cipher(
         &tx,
+        session.vault_format,
         &SourceRow {
             source_id: source_id.clone(),
             object_id: object.object_id.clone(),
@@ -526,13 +611,14 @@ fn commit(
             media_type: MEDIA_TYPE.into(),
             user_marker: None,
         },
+        &session.cipher,
     )
     .map_err(|err| db_fail(err, "insert_source"))?;
     let occurrence_id = journal
         .occurrence_id
         .clone()
         .ok_or_else(|| Fail::new(EXIT_RECOVERY, "RecoveryRequired", "occurrence_missing"))?;
-    store::insert_occurrence(
+    store::insert_occurrence_with_cipher(
         &tx,
         &OccurrenceRow {
             occurrence_id,
@@ -547,16 +633,26 @@ fn commit(
             storage_reused: journal.storage_reused.unwrap_or(false),
             recorded_at: super::now_ms(),
         },
+        &session.cipher,
     )
     .map_err(|err| db_fail(err, "insert_occurrence"))?;
     let source_version_id = ids::random_id("sv_").map_err(|err| io_fail(err, "random"))?;
+    let stored_sv_hash = session
+        .cipher
+        .encrypt_field(
+            "source_versions",
+            &source_version_id,
+            "content_sha256",
+            hash,
+        )
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_version"))?;
     tx.execute(
         "INSERT INTO source_versions(source_version_id, source_id, object_id, content_sha256, byte_length, media_type, role, eml) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
         params![
             source_version_id,
             source_id,
             object.object_id,
-            hash,
+            stored_sv_hash,
             object.byte_length,
             MEDIA_TYPE,
             ROLE
@@ -570,11 +666,12 @@ fn commit(
     } else {
         "succeeded"
     };
+    let stored_logical_key = session.cipher.dedup_key("logical_key", key);
     tx.execute(
         "INSERT INTO extraction_runs(run_id, logical_key, source_version_id, source_id, extractor, extractor_version, normalization, join_version, rules_version, config_json, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             run_id,
-            key,
+            stored_logical_key,
             source_version_id,
             source_id,
             EXTRACTOR,
@@ -588,6 +685,17 @@ fn commit(
     )
     .map_err(|err| db_fail(err, "insert_run"))?;
     let published = prepared.status != "unparsed";
+    let detail_plain =
+        json!({"extraction": prepared.status, "reason": prepared.reason}).to_string();
+    let detail_stored = session
+        .cipher
+        .encrypt_field(
+            "extraction_attempts",
+            &attempt_id,
+            "detail_json",
+            &detail_plain,
+        )
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_attempt"))?;
     tx.execute(
         "INSERT INTO extraction_attempts(attempt_id, run_id, attempt_no, command_id, status, published, detail_json) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)",
         params![
@@ -596,7 +704,7 @@ fn commit(
             req.command_id,
             run_status,
             if published { 1 } else { 0 },
-            json!({"extraction": prepared.status, "reason": prepared.reason}).to_string()
+            detail_stored
         ],
     )
     .map_err(|err| db_fail(err, "insert_attempt"))?;
@@ -605,6 +713,28 @@ fn commit(
         let candidate_id = ids::random_id("cand_").map_err(|err| io_fail(err, "random"))?;
         let value = hit_value(hit);
         let locator = hit_locator(&source_version_id, hash, hit);
+        let enc_excerpt = session
+            .cipher
+            .encrypt_field("candidates", &candidate_id, "excerpt", &hit.excerpt)
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+        let enc_value = session
+            .cipher
+            .encrypt_field(
+                "candidates",
+                &candidate_id,
+                "value_json",
+                &Value::Object(value).to_string(),
+            )
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+        let enc_locator = session
+            .cipher
+            .encrypt_field(
+                "candidates",
+                &candidate_id,
+                "locator_json",
+                &locator.to_string(),
+            )
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
         tx.execute(
             "INSERT INTO candidates(candidate_id, run_id, attempt_id, source_version_id, ordinal, kind, usable, excerpt, value_json, locator_json, adopted) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
             params![
@@ -615,9 +745,9 @@ fn commit(
                 ordinal as i64,
                 hit.kind,
                 if hit.usable { 1 } else { 0 },
-                hit.excerpt,
-                Value::Object(value).to_string(),
-                locator.to_string()
+                enc_excerpt,
+                enc_value,
+                enc_locator
             ],
         )
         .map_err(|err| db_fail(err, "insert_candidate"))?;
@@ -649,8 +779,10 @@ fn commit(
         &run_id,
         RULES_VERSION,
         &drafts,
+        &session.cipher,
     )?;
     let mut body = receipt(
+        session,
         req,
         journal,
         &source_id,
@@ -665,7 +797,7 @@ fn commit(
     );
     let encoded = serde_json::to_string(&body)
         .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
-    store::insert_command(
+    store::insert_command_with_cipher(
         &tx,
         &CommandRow {
             command_id: req.command_id.clone(),
@@ -675,10 +807,11 @@ fn commit(
             outcome: "Committed".into(),
         },
         super::now_ms(),
+        &session.cipher,
     )
     .map_err(|err| db_fail(err, "insert_command"))?;
     let canonical = html_canonical(hash, key, prepared.status);
-    super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+    super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded, &session.cipher)?;
     tx.commit().map_err(|err| db_fail(err, "commit"))?;
     body.as_object_mut()
         .map(|map| map.insert("db_committed".into(), json!(true)));
@@ -687,6 +820,7 @@ fn commit(
 
 #[allow(clippy::too_many_arguments)]
 fn receipt(
+    session: &super::Session,
     req: &HtmlRequest,
     journal: &Journal,
     source_id: &str,
@@ -750,6 +884,10 @@ fn receipt(
             }))
             .collect::<Vec<_>>()),
     );
+    if session.vault_format >= 6 {
+        body.insert("slice".into(), json!("M4-real"));
+        apply_format_honesty(&mut body, session.vault_format, session.protection);
+    }
     Value::Object(body)
 }
 

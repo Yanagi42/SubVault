@@ -4,12 +4,13 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde_json::{json, Map, Value};
 
 use crate::body;
+use crate::crypto::{AuthInput, ProtectionMode, VaultCipher};
 use crate::fsutil::atomic_write;
 use crate::ids::{self, is_command_id, is_prefixed_id};
 use crate::journal::{self, Journal, LabelMiss};
 use crate::model::{
-    db_fail, honesty, unseen_db, Fail, Report, EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY,
-    EXIT_REJECTED, EXIT_USAGE, EXIT_VERSION,
+    apply_format_honesty, cipher_tamper_fail, db_fail, honesty, unseen_db, Fail, Report,
+    EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_USAGE, EXIT_VERSION,
 };
 use crate::store;
 
@@ -49,6 +50,7 @@ pub(super) fn require_fact_tables(conn: &Connection) -> Result<(), Fail> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn adopt_statements(
     tx: &Transaction<'_>,
     command_id: &str,
@@ -57,6 +59,7 @@ pub(super) fn adopt_statements(
     run_id: &str,
     rule_version: &str,
     drafts: &[StatedDraft<'_>],
+    cipher: &VaultCipher,
 ) -> Result<Vec<Adopted>, Fail> {
     let recorded_at = super::now_ms();
     let mut adopted = Vec::new();
@@ -67,6 +70,12 @@ pub(super) fn adopt_statements(
         let decision_id =
             ids::random_id("dec_").map_err(|err| crate::model::io_fail(err, "random"))?;
         let value_json = Value::Object(value).to_string();
+        let stored_fact_value = cipher
+            .encrypt_field("facts", &fact_id, "value_json", &value_json)
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_fact"))?;
+        let stored_dec_value = cipher
+            .encrypt_field("decisions", &decision_id, "new_value_json", &value_json)
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_decision"))?;
         tx.execute(
             "INSERT INTO facts(fact_id, source_id, source_version_id, run_id, candidate_id, fact_type, value_json, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
             params![
@@ -76,7 +85,7 @@ pub(super) fn adopt_statements(
                 run_id,
                 draft.candidate_id,
                 draft.kind,
-                value_json
+                stored_fact_value
             ],
         )
         .map_err(|err| db_fail(err, "insert_fact"))?;
@@ -91,7 +100,7 @@ pub(super) fn adopt_statements(
                 RULE_ACTOR_ID,
                 recorded_at,
                 rule_version,
-                value_json
+                stored_dec_value
             ],
         )
         .map_err(|err| db_fail(err, "insert_decision"))?;
@@ -110,14 +119,21 @@ pub(super) fn insert_receipt(
     command_id: &str,
     canonical: &str,
     result_json: &str,
+    cipher: &VaultCipher,
 ) -> Result<(), Fail> {
+    let enc_canonical = cipher
+        .encrypt_field("t3_receipts", command_id, "canonical_payload", canonical)
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_t3_receipt"))?;
+    let enc_result = cipher
+        .encrypt_field("t3_receipts", command_id, "result_json", result_json)
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_t3_receipt"))?;
     tx.execute(
         "INSERT INTO t3_receipts(command_id, payload_version, canonical_payload, result_json, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             command_id,
             PAYLOAD_VERSION,
-            canonical,
-            result_json,
+            enc_canonical,
+            enc_result,
             super::now_ms()
         ],
     )
@@ -203,8 +219,13 @@ fn date_text(text: &str) -> bool {
             .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
 }
 
-pub fn query_facts(vault: &Path, source_id: Option<String>, fact_id: Option<String>) -> Report {
-    match query_inner(vault, source_id.as_deref(), fact_id.as_deref()) {
+pub fn query_facts(
+    vault: &Path,
+    source_id: Option<String>,
+    fact_id: Option<String>,
+    auth: AuthInput,
+) -> Report {
+    match query_inner(vault, source_id.as_deref(), fact_id.as_deref(), &auth) {
         Ok((code, body)) => Report { code, body },
         Err(fail) => tag(fail.into_report()),
     }
@@ -223,6 +244,7 @@ fn query_inner(
     vault: &Path,
     source_id: Option<&str>,
     fact_id: Option<&str>,
+    auth: &AuthInput,
 ) -> Result<(i32, Value), Fail> {
     if let Some(id) = source_id {
         if !is_prefixed_id(id, "src_") {
@@ -234,17 +256,9 @@ fn query_inner(
             return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
         }
     }
-    super::guard_vault(vault)?;
-    let version = super::inspect_version_readonly(vault)?;
+    let (conn, version, protection, cipher) = super::open_readonly_unlocked(vault, auth)?;
     refuse_without_facts(version)?;
-    let uri = super::wal_visible_uri(&vault.join("vault.db"))?;
-    let conn = Connection::open_with_flags(
-        &uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|err| unseen_db(err, "facts_open"))?;
-    super::accept_connection_format(&vault.join("vault.db"), &conn)?;
-    read_facts(&conn, version, source_id, fact_id)
+    read_facts(&conn, version, source_id, fact_id, &cipher, protection)
 }
 
 pub(super) fn read_facts(
@@ -252,6 +266,8 @@ pub(super) fn read_facts(
     version: i64,
     source_id: Option<&str>,
     fact_id: Option<&str>,
+    cipher: &VaultCipher,
+    protection: Option<ProtectionMode>,
 ) -> Result<(i32, Value), Fail> {
     refuse_without_facts(version)?;
     require_fact_tables(conn)?;
@@ -277,7 +293,10 @@ pub(super) fn read_facts(
     let mut facts = Vec::new();
     for row in rows {
         let row = row.map_err(|err| unseen_db(err, "facts"))?;
-        let value: Value = serde_json::from_str(&row.6).map_err(|_| {
+        let plain_value_json = cipher
+            .decrypt_field("facts", &row.0, "value_json", &row.6)
+            .map_err(|err| cipher_tamper_fail(err, "fact_value").extra("fact_id", json!(row.0)))?;
+        let value: Value = serde_json::from_str(&plain_value_json).map_err(|_| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_value_unreadable")
                 .extra("fact_id", json!(row.0))
                 .extra("new_effect", json!(false))
@@ -289,8 +308,8 @@ pub(super) fn read_facts(
                     .extra("new_effect", json!(false)),
             );
         }
-        let locator = candidate_anchor(conn, &row.4, &row.1)?;
-        let decisions = decision_history(conn, &row.0)?;
+        let locator = candidate_anchor(conn, &row.4, &row.1, cipher)?;
+        let decisions = decision_history(conn, &row.0, cipher)?;
         facts.push(json!({
             "fact_id": row.0,
             "source_id": row.1,
@@ -314,6 +333,7 @@ pub(super) fn read_facts(
     body.insert(
         "slice".into(),
         json!(match version {
+            6 => "M4-real",
             5 => "T5-pdf",
             4 => "T4-html",
             _ => "T3-facts",
@@ -322,10 +342,16 @@ pub(super) fn read_facts(
     body.insert("new_effect".into(), json!(false));
     body.insert("read_only".into(), json!(true));
     body.insert("facts".into(), Value::Array(facts));
+    apply_format_honesty(&mut body, version, protection);
     Ok((EXIT_OK, Value::Object(body)))
 }
 
-fn candidate_anchor(conn: &Connection, candidate_id: &str, source_id: &str) -> Result<Value, Fail> {
+fn candidate_anchor(
+    conn: &Connection,
+    candidate_id: &str,
+    source_id: &str,
+    cipher: &VaultCipher,
+) -> Result<Value, Fail> {
     let found = conn
         .query_row(
             "SELECT c.excerpt, c.locator_json, c.kind, sv.source_id FROM candidates c JOIN source_versions sv ON sv.source_version_id = c.source_version_id WHERE c.candidate_id = ?1",
@@ -341,7 +367,7 @@ fn candidate_anchor(conn: &Connection, candidate_id: &str, source_id: &str) -> R
         )
         .optional()
         .map_err(|err| unseen_db(err, "fact_anchor"))?;
-    let Some((excerpt, locator_json, kind, anchored_source)) = found else {
+    let Some((stored_excerpt, stored_locator_json, kind, anchored_source)) = found else {
         return Err(
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_anchor_missing")
                 .extra("candidate_id", json!(candidate_id))
@@ -355,6 +381,21 @@ fn candidate_anchor(conn: &Connection, candidate_id: &str, source_id: &str) -> R
                 .extra("new_effect", json!(false)),
         );
     }
+    let excerpt = cipher
+        .decrypt_field("candidates", candidate_id, "excerpt", &stored_excerpt)
+        .map_err(|err| {
+            cipher_tamper_fail(err, "fact_anchor").extra("candidate_id", json!(candidate_id))
+        })?;
+    let locator_json = cipher
+        .decrypt_field(
+            "candidates",
+            candidate_id,
+            "locator_json",
+            &stored_locator_json,
+        )
+        .map_err(|err| {
+            cipher_tamper_fail(err, "fact_anchor").extra("candidate_id", json!(candidate_id))
+        })?;
     let locator: Value = serde_json::from_str(&locator_json).map_err(|_| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "locator_unreadable")
             .extra("candidate_id", json!(candidate_id))
@@ -388,7 +429,11 @@ fn candidate_anchor(conn: &Connection, candidate_id: &str, source_id: &str) -> R
     Ok(anchor)
 }
 
-fn decision_history(conn: &Connection, fact_id: &str) -> Result<Vec<Value>, Fail> {
+fn decision_history(
+    conn: &Connection,
+    fact_id: &str,
+    cipher: &VaultCipher,
+) -> Result<Vec<Value>, Fail> {
     let mut stmt = conn
         .prepare(
             "SELECT decision_id, command_id, candidate_id, slot, kind, actor_kind, actor_id, recorded_at, rule_version, prior_value_json, new_value_json, target_decision_id FROM decisions WHERE fact_id = ?1 ORDER BY rowid",
@@ -415,8 +460,19 @@ fn decision_history(conn: &Connection, fact_id: &str) -> Result<Vec<Value>, Fail
     let mut out = Vec::new();
     for row in rows {
         let row = row.map_err(|err| unseen_db(err, "decisions"))?;
-        let prior = parse_optional_object(row.9.as_deref(), "prior_value_unreadable", &row.0)?;
-        let new_value = parse_object(&row.10, "new_value_unreadable", &row.0)?;
+        let plain_prior = cipher
+            .decrypt_opt_field("decisions", &row.0, "prior_value_json", row.9.as_deref())
+            .map_err(|err| {
+                cipher_tamper_fail(err, "decisions").extra("decision_id", json!(row.0))
+            })?;
+        let plain_new = cipher
+            .decrypt_field("decisions", &row.0, "new_value_json", &row.10)
+            .map_err(|err| {
+                cipher_tamper_fail(err, "decisions").extra("decision_id", json!(row.0))
+            })?;
+        let prior =
+            parse_optional_object(plain_prior.as_deref(), "prior_value_unreadable", &row.0)?;
+        let new_value = parse_object(&plain_new, "new_value_unreadable", &row.0)?;
         out.push(json!({
             "decision_id": row.0,
             "command_id": row.1,
@@ -499,6 +555,7 @@ pub struct CorrectRequest {
     pub expected_revision: String,
     pub amount_text: String,
     pub actor_id: String,
+    pub auth: AuthInput,
     pub hooks: super::Hooks,
 }
 
@@ -508,6 +565,7 @@ pub struct UndoRequest {
     pub decision_id: String,
     pub expected_revision: String,
     pub actor_id: String,
+    pub auth: AuthInput,
     pub hooks: super::Hooks,
 }
 
@@ -557,7 +615,7 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
         &actor_id,
     );
     require_decision_vault(&req.vault)?;
-    let session = super::open_session(&req.vault)?;
+    let session = super::open_session_with_auth(&req.vault, &req.auth)?;
     require_fact_tables(&session.conn)?;
     let mut hooks = super::HookRun::new(req.hooks);
     injected_receipt_read(&hooks)?;
@@ -566,7 +624,8 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
     }
     let hash = super::fingerprint(&[&canonical]);
     let mut journal = prepare_journal(&session, &req.command_id, &hash)?;
-    let fact = load_fact(&session.conn, &req.fact_id)?.ok_or_else(|| rejected("unknown_fact"))?;
+    let fact = load_fact(&session.conn, &req.fact_id, &session.cipher)?
+        .ok_or_else(|| rejected("unknown_fact"))?;
     if fact.fact_type != "stated_amount_paid" {
         return Err(rejected("not_amount_fact"));
     }
@@ -576,7 +635,7 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
     journal.state = "started".into();
     journal.payload_fingerprint = Some(hash);
     journal.reason = None;
-    super::write_journal(&session.root, &journal)?;
+    journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
     hooks.stop(
         "before_decision_commit",
         super::checkpoint_map(&req.command_id, 0, None, None, false, false),
@@ -591,11 +650,12 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
             super::checkpoint_map(&req.command_id, 0, None, None, false, false),
         )
         .map_err(decision_inject)?;
-    let fact = load_fact(&tx, &req.fact_id)?.ok_or_else(|| rejected("unknown_fact"))?;
+    let fact =
+        load_fact(&tx, &req.fact_id, &session.cipher)?.ok_or_else(|| rejected("unknown_fact"))?;
     if fact.revision != revision {
         return Err(rejected("revision_conflict"));
     }
-    if read_receipt(&tx, &req.command_id)?.is_ready() {
+    if read_receipt(&tx, &req.command_id, &session.cipher)?.is_ready() {
         return Err(rejected("command_race"));
     }
     let mut value = fact.value.clone();
@@ -614,17 +674,34 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
         Some(&fact.value_json),
         &new_json,
         None,
+        &session.cipher,
     )?;
+    let stored_fact_json = session
+        .cipher
+        .encrypt_field("facts", &fact.fact_id, "value_json", &new_json)
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_fact"))?;
     let updated = tx
         .execute(
             "UPDATE facts SET value_json = ?2, revision = ?3 WHERE fact_id = ?1 AND revision = ?4",
-            params![fact.fact_id, new_json, fact.revision + 1, fact.revision],
+            params![
+                fact.fact_id,
+                stored_fact_json,
+                fact.revision + 1,
+                fact.revision
+            ],
         )
         .map_err(|err| db_fail(err, "update_fact"))?;
     if updated != 1 {
         return Err(rejected("revision_conflict"));
     }
-    let mut body = decision_body("Committed", &req.command_id, &fact, fact.revision + 1);
+    let mut body = decision_body(
+        "Committed",
+        &req.command_id,
+        &fact,
+        fact.revision + 1,
+        session.vault_format,
+        session.protection,
+    );
     body.insert("decision_id".into(), json!(decision_id));
     body.insert("amount_text".into(), json!(req.amount_text));
     body.insert("currency".into(), json!("USD"));
@@ -635,7 +712,7 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
     let result = Value::Object(body);
     let encoded = serde_json::to_string(&result)
         .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
-    insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+    insert_receipt(&tx, &req.command_id, &canonical, &encoded, &session.cipher)?;
     hooks
         .inject(
             "db_commit",
@@ -651,6 +728,7 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
         result,
         tx,
         &hooks,
+        &session.cipher,
     )
 }
 
@@ -672,7 +750,7 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
     let actor_id = human_actor(&req.actor_id)?;
     let canonical = undo_canonical(&req.decision_id, &req.expected_revision, &actor_id);
     require_decision_vault(&req.vault)?;
-    let session = super::open_session(&req.vault)?;
+    let session = super::open_session_with_auth(&req.vault, &req.auth)?;
     require_fact_tables(&session.conn)?;
     let mut hooks = super::HookRun::new(req.hooks);
     injected_receipt_read(&hooks)?;
@@ -681,9 +759,9 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
     }
     let hash = super::fingerprint(&[&canonical]);
     let mut journal = prepare_journal(&session, &req.command_id, &hash)?;
-    let target = load_decision(&session.conn, &req.decision_id)?
+    let target = load_decision(&session.conn, &req.decision_id, &session.cipher)?
         .ok_or_else(|| rejected("unknown_decision"))?;
-    let fact = load_fact(&session.conn, &target.fact_id)?.ok_or_else(|| {
+    let fact = load_fact(&session.conn, &target.fact_id, &session.cipher)?.ok_or_else(|| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_missing")
             .extra("new_effect", json!(false))
     })?;
@@ -698,7 +776,7 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
     journal.state = "started".into();
     journal.payload_fingerprint = Some(hash);
     journal.reason = None;
-    super::write_journal(&session.root, &journal)?;
+    journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
     hooks.stop(
         "before_decision_commit",
         super::checkpoint_map(&req.command_id, 0, None, None, false, false),
@@ -713,9 +791,9 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
             super::checkpoint_map(&req.command_id, 0, None, None, false, false),
         )
         .map_err(decision_inject)?;
-    let target =
-        load_decision(&tx, &req.decision_id)?.ok_or_else(|| rejected("unknown_decision"))?;
-    let fact = load_fact(&tx, &target.fact_id)?.ok_or_else(|| {
+    let target = load_decision(&tx, &req.decision_id, &session.cipher)?
+        .ok_or_else(|| rejected("unknown_decision"))?;
+    let fact = load_fact(&tx, &target.fact_id, &session.cipher)?.ok_or_else(|| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_missing")
             .extra("new_effect", json!(false))
     })?;
@@ -727,7 +805,7 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
     {
         return Err(rejected("successor_conflict"));
     }
-    if read_receipt(&tx, &req.command_id)?.is_ready() {
+    if read_receipt(&tx, &req.command_id, &session.cipher)?.is_ready() {
         return Err(rejected("command_race"));
     }
     let restored = match &target.prior_value_json {
@@ -747,17 +825,34 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
         Some(&fact.value_json),
         &restored,
         Some(&target.decision_id),
+        &session.cipher,
     )?;
+    let stored_restored = session
+        .cipher
+        .encrypt_field("facts", &fact.fact_id, "value_json", &restored)
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_fact"))?;
     let updated = tx
         .execute(
             "UPDATE facts SET value_json = ?2, revision = ?3 WHERE fact_id = ?1 AND revision = ?4",
-            params![fact.fact_id, restored, fact.revision + 1, fact.revision],
+            params![
+                fact.fact_id,
+                stored_restored,
+                fact.revision + 1,
+                fact.revision
+            ],
         )
         .map_err(|err| db_fail(err, "update_fact"))?;
     if updated != 1 {
         return Err(rejected("revision_conflict"));
     }
-    let mut body = decision_body("Committed", &req.command_id, &fact, fact.revision + 1);
+    let mut body = decision_body(
+        "Committed",
+        &req.command_id,
+        &fact,
+        fact.revision + 1,
+        session.vault_format,
+        session.protection,
+    );
     body.insert("decision_id".into(), json!(decision_id));
     body.insert("target_decision_id".into(), json!(target.decision_id));
     body.insert("actor_kind".into(), json!("human"));
@@ -773,7 +868,7 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
     let result = Value::Object(body);
     let encoded = serde_json::to_string(&result)
         .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
-    insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+    insert_receipt(&tx, &req.command_id, &canonical, &encoded, &session.cipher)?;
     hooks
         .inject(
             "db_commit",
@@ -789,6 +884,7 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
         result,
         tx,
         &hooks,
+        &session.cipher,
     )
 }
 
@@ -896,7 +992,11 @@ impl ReceiptRead {
     }
 }
 
-fn read_receipt(conn: &Connection, command_id: &str) -> Result<ReceiptRead, Fail> {
+fn read_receipt(
+    conn: &Connection,
+    command_id: &str,
+    cipher: &VaultCipher,
+) -> Result<ReceiptRead, Fail> {
     let row = conn
         .query_row(
             "SELECT payload_version, canonical_payload, result_json FROM t3_receipts WHERE command_id = ?1",
@@ -916,12 +1016,28 @@ fn read_receipt(conn: &Connection, command_id: &str) -> Result<ReceiptRead, Fail
                 .extra("new_effect", json!(false))
                 .extra("decision_committed", json!(false))
         })?;
-    let Some((version, canonical, result_json)) = row else {
+    let Some((version, stored_canonical, stored_result_json)) = row else {
         return Ok(ReceiptRead::Absent);
     };
     if version != PAYLOAD_VERSION {
         return Ok(ReceiptRead::Unreadable);
     }
+    let canonical = cipher
+        .decrypt_field(
+            "t3_receipts",
+            command_id,
+            "canonical_payload",
+            &stored_canonical,
+        )
+        .map_err(|err| cipher_tamper_fail(err, "t3_receipt"))?;
+    let result_json = cipher
+        .decrypt_field(
+            "t3_receipts",
+            command_id,
+            "result_json",
+            &stored_result_json,
+        )
+        .map_err(|err| cipher_tamper_fail(err, "t3_receipt"))?;
     match serde_json::from_str::<Value>(&result_json) {
         Ok(Value::Object(_)) => Ok(ReceiptRead::Ready {
             canonical,
@@ -936,7 +1052,7 @@ fn take_committed(
     command_id: &str,
     canonical: &str,
 ) -> Result<Option<Value>, Fail> {
-    match read_receipt(&session.conn, command_id)? {
+    match read_receipt(&session.conn, command_id, &session.cipher)? {
         ReceiptRead::Unreadable => {
             Err(
                 Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unreadable")
@@ -945,7 +1061,7 @@ fn take_committed(
             )
         }
         ReceiptRead::Absent => {
-            if store::command(&session.conn, command_id)
+            if store::command_with_cipher(&session.conn, command_id, &session.cipher)
                 .map_err(|err| unseen_db(err, "command_lookup"))?
                 .is_some()
             {
@@ -973,7 +1089,9 @@ fn take_committed(
             };
             map.insert("outcome".into(), json!("AlreadyCommitted"));
             map.insert("new_effect".into(), json!(false));
-            if let Err(fail) = label_committed_if_present(&session.root, command_id) {
+            if let Err(fail) =
+                label_committed_if_present(&session.root, command_id, &session.cipher)
+            {
                 if fail.extra.get("during").and_then(Value::as_str) != Some("journal_write") {
                     return Err(fail);
                 }
@@ -985,12 +1103,16 @@ fn take_committed(
     }
 }
 
-fn label_committed_if_present(root: &Path, command_id: &str) -> Result<(), Fail> {
+fn label_committed_if_present(
+    root: &Path,
+    command_id: &str,
+    cipher: &VaultCipher,
+) -> Result<(), Fail> {
     let path = journal::path(root, command_id);
     if !path.exists() {
         return Ok(());
     }
-    let mut journal = journal::read_file(&path).map_err(|_| {
+    let mut journal = journal::read_file_with_cipher(&path, cipher).map_err(|_| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("new_effect", json!(false))
     })?;
@@ -1002,7 +1124,7 @@ fn label_committed_if_present(root: &Path, command_id: &str) -> Result<(), Fail>
     }
     journal.state = "committed".into();
     journal.reason = None;
-    super::write_journal(root, &journal)?;
+    journal::write_with_cipher(root, &journal, cipher)?;
     Ok(())
 }
 
@@ -1016,7 +1138,7 @@ fn prepare_journal(
     if !path.exists() {
         return Ok(fresh_journal(command_id));
     }
-    let journal = journal::read_file(&path).map_err(|_| {
+    let journal = journal::read_file_with_cipher(&path, &session.cipher).map_err(|_| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("new_effect", json!(false))
     })?;
@@ -1075,7 +1197,11 @@ struct FactHead {
     source_id: String,
 }
 
-fn load_fact(conn: &Connection, fact_id: &str) -> Result<Option<FactHead>, Fail> {
+fn load_fact(
+    conn: &Connection,
+    fact_id: &str,
+    cipher: &VaultCipher,
+) -> Result<Option<FactHead>, Fail> {
     let row = conn
         .query_row(
             "SELECT fact_id, fact_type, value_json, revision, candidate_id, source_id FROM facts WHERE fact_id = ?1",
@@ -1093,9 +1219,13 @@ fn load_fact(conn: &Connection, fact_id: &str) -> Result<Option<FactHead>, Fail>
         )
         .optional()
         .map_err(|err| unseen_db(err, "fact_lookup"))?;
-    let Some((fact_id, fact_type, value_json, revision, candidate_id, source_id)) = row else {
+    let Some((fact_id, fact_type, stored_value_json, revision, candidate_id, source_id)) = row
+    else {
         return Ok(None);
     };
+    let value_json = cipher
+        .decrypt_field("facts", &fact_id, "value_json", &stored_value_json)
+        .map_err(|err| cipher_tamper_fail(err, "fact_lookup").extra("fact_id", json!(fact_id)))?;
     let value: Value = serde_json::from_str(&value_json).map_err(|_| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_value_unreadable")
             .extra("fact_id", json!(fact_id))
@@ -1126,7 +1256,11 @@ struct DecisionHead {
     prior_value_json: Option<String>,
 }
 
-fn load_decision(conn: &Connection, decision_id: &str) -> Result<Option<DecisionHead>, Fail> {
+fn load_decision(
+    conn: &Connection,
+    decision_id: &str,
+    cipher: &VaultCipher,
+) -> Result<Option<DecisionHead>, Fail> {
     let row = conn
         .query_row(
             "SELECT decision_id, fact_id, new_value_json, prior_value_json FROM decisions WHERE decision_id = ?1",
@@ -1142,11 +1276,24 @@ fn load_decision(conn: &Connection, decision_id: &str) -> Result<Option<Decision
         )
         .optional()
         .map_err(|err| unseen_db(err, "decision_lookup"))?;
-    Ok(row.map(|row| DecisionHead {
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let new_value_json = cipher
+        .decrypt_field("decisions", &row.0, "new_value_json", &row.2)
+        .map_err(|err| {
+            cipher_tamper_fail(err, "decision_lookup").extra("decision_id", json!(row.0))
+        })?;
+    let prior_value_json = cipher
+        .decrypt_opt_field("decisions", &row.0, "prior_value_json", row.3.as_deref())
+        .map_err(|err| {
+            cipher_tamper_fail(err, "decision_lookup").extra("decision_id", json!(row.0))
+        })?;
+    Ok(Some(DecisionHead {
         decision_id: row.0,
         fact_id: row.1,
-        new_value_json: row.2,
-        prior_value_json: row.3,
+        new_value_json,
+        prior_value_json,
     }))
 }
 
@@ -1171,7 +1318,14 @@ fn insert_human(
     prior: Option<&str>,
     new_value: &str,
     target: Option<&str>,
+    cipher: &VaultCipher,
 ) -> Result<(), Fail> {
+    let enc_prior = cipher
+        .encrypt_opt_field("decisions", decision_id, "prior_value_json", prior)
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_decision"))?;
+    let enc_new = cipher
+        .encrypt_field("decisions", decision_id, "new_value_json", new_value)
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_decision"))?;
     tx.execute(
         "INSERT INTO decisions(decision_id, fact_id, command_id, candidate_id, slot, kind, actor_kind, actor_id, recorded_at, rule_version, prior_value_json, new_value_json, target_decision_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'human', ?7, ?8, NULL, ?9, ?10, ?11)",
         params![
@@ -1183,8 +1337,8 @@ fn insert_human(
             kind,
             actor_id,
             recorded_at,
-            prior,
-            new_value,
+            enc_prior,
+            enc_new,
             target
         ],
     )
@@ -1217,9 +1371,18 @@ fn decision_body(
     command_id: &str,
     fact: &FactHead,
     revision: i64,
+    vault_format: i64,
+    protection: Option<ProtectionMode>,
 ) -> Map<String, Value> {
     let mut body = honesty(outcome);
-    body.insert("slice".into(), json!("T3-facts"));
+    body.insert(
+        "slice".into(),
+        json!(if vault_format >= 6 {
+            "M4-real"
+        } else {
+            "T3-facts"
+        }),
+    );
     body.insert("command_id".into(), json!(command_id));
     body.insert("fact_id".into(), json!(fact.fact_id));
     body.insert("source_id".into(), json!(fact.source_id));
@@ -1232,6 +1395,7 @@ fn decision_body(
     body.insert("account_id".into(), Value::Null);
     body.insert("payload_version".into(), json!(PAYLOAD_VERSION));
     body.insert("rule_version".into(), Value::Null);
+    apply_format_honesty(&mut body, vault_format, protection);
     body
 }
 
@@ -1254,13 +1418,14 @@ fn conclude_commit(
     result: Value,
     tx: Transaction<'_>,
     hooks: &super::HookRun,
+    cipher: &VaultCipher,
 ) -> Result<Value, Fail> {
     match commit_probe(hooks)? {
         CommitProbe::None => match tx.commit() {
             Ok(()) => {
                 journal.state = "committed".into();
                 journal.reason = None;
-                finish_decision(root, journal, result)
+                finish_decision(root, journal, result, cipher)
             }
             Err(err) => settle_commit_error(
                 root,
@@ -1270,6 +1435,7 @@ fn conclude_commit(
                 canonical,
                 &err.to_string(),
                 false,
+                cipher,
             ),
         },
         CommitProbe::Absent => {
@@ -1282,6 +1448,7 @@ fn conclude_commit(
                 canonical,
                 SIMULATED_COMMIT_ERROR,
                 true,
+                cipher,
             )
         }
         CommitProbe::Visible => match tx.commit() {
@@ -1293,6 +1460,7 @@ fn conclude_commit(
                 canonical,
                 SIMULATED_COMMIT_ERROR,
                 true,
+                cipher,
             ),
             Err(err) => settle_commit_error(
                 root,
@@ -1302,6 +1470,7 @@ fn conclude_commit(
                 canonical,
                 &err.to_string(),
                 false,
+                cipher,
             ),
         },
         CommitProbe::Unreadable => match tx.commit() {
@@ -1315,6 +1484,7 @@ fn conclude_commit(
                     canonical,
                     SIMULATED_COMMIT_ERROR,
                     true,
+                    cipher,
                 )
             }
             Err(err) => settle_commit_error(
@@ -1325,6 +1495,7 @@ fn conclude_commit(
                 canonical,
                 &err.to_string(),
                 false,
+                cipher,
             ),
         },
         CommitProbe::Unseen => match tx.commit() {
@@ -1336,6 +1507,7 @@ fn conclude_commit(
                 canonical,
                 SIMULATED_COMMIT_ERROR,
                 true,
+                cipher,
             ),
             Err(err) => settle_commit_error(
                 root,
@@ -1345,6 +1517,7 @@ fn conclude_commit(
                 canonical,
                 &err.to_string(),
                 false,
+                cipher,
             ),
         },
     }
@@ -1381,6 +1554,7 @@ fn commit_probe(hooks: &super::HookRun) -> Result<CommitProbe, Fail> {
     Ok(probe)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle_commit_error(
     root: &Path,
     db: &Path,
@@ -1389,8 +1563,9 @@ fn settle_commit_error(
     canonical: &str,
     commit_error: &str,
     injected: bool,
+    cipher: &VaultCipher,
 ) -> Result<Value, Fail> {
-    let read = match read_t3_receipt_wal(db, command_id) {
+    let read = match read_t3_receipt_wal(db, command_id, cipher) {
         Ok(read) => read,
         Err(_) => return Err(receipt_unseen(commit_error, injected)),
     };
@@ -1414,13 +1589,17 @@ fn settle_commit_error(
             }
             journal.state = "committed".into();
             journal.reason = None;
-            finish_decision(root, journal, value)
+            finish_decision(root, journal, value, cipher)
         }
     }
 }
 
 /// Independent mode=ro connection. It can see a committed WAL frame and reads `t3_receipts` only.
-pub(super) fn read_t3_receipt_wal(db: &Path, command_id: &str) -> Result<ReceiptRead, Fail> {
+pub(super) fn read_t3_receipt_wal(
+    db: &Path,
+    command_id: &str,
+    cipher: &VaultCipher,
+) -> Result<ReceiptRead, Fail> {
     if !super::sqlite_header_ok(db).unwrap_or(false) {
         return Err(Fail::new(
             EXIT_RECOVERY,
@@ -1436,7 +1615,7 @@ pub(super) fn read_t3_receipt_wal(db: &Path, command_id: &str) -> Result<Receipt
     )
     .map_err(|_| Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unseen"))?;
     let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
-    read_receipt(&conn, command_id)
+    read_receipt(&conn, command_id, cipher)
 }
 
 fn accepted_stored_result(
@@ -1526,8 +1705,13 @@ fn visible_note(injected: bool) -> &'static str {
     }
 }
 
-fn finish_decision(root: &Path, journal: &Journal, mut result: Value) -> Result<Value, Fail> {
-    match super::write_journal(root, journal) {
+fn finish_decision(
+    root: &Path,
+    journal: &Journal,
+    mut result: Value,
+    cipher: &VaultCipher,
+) -> Result<Value, Fail> {
+    match journal::write_with_cipher(root, journal, cipher) {
         Ok(()) => Ok(result),
         Err(fail) => {
             if let Some(map) = result.as_object_mut() {
@@ -1546,8 +1730,9 @@ fn finish_decision(root: &Path, journal: &Journal, mut result: Value) -> Result<
 pub(super) fn reconcile_decision_journals(
     root: &Path,
     conn: &Connection,
+    cipher: &VaultCipher,
 ) -> Result<Vec<LabelMiss>, Fail> {
-    let found = journal::scan(root);
+    let found = journal::scan_with_cipher(root, cipher);
     if found.unlisted.is_some() {
         return Ok(Vec::new());
     }
@@ -1562,7 +1747,7 @@ pub(super) fn reconcile_decision_journals(
             continue;
         }
         if matches!(
-            read_receipt(conn, &journal.command_id)?,
+            read_receipt(conn, &journal.command_id, cipher)?,
             ReceiptRead::Unreadable
         ) {
             return Err(
@@ -1586,7 +1771,7 @@ pub(super) fn reconcile_decision_journals(
             );
         }
         let mut journal = journal;
-        match read_receipt(conn, &journal.command_id)? {
+        match read_receipt(conn, &journal.command_id, cipher)? {
             ReceiptRead::Unreadable => {
                 return Err(
                     Fail::new(EXIT_RECOVERY, "RecoveryRequired", "t3_receipt_unreadable")
@@ -1603,7 +1788,7 @@ pub(super) fn reconcile_decision_journals(
                 journal.reason = Some("uncommitted".into());
             }
         }
-        if let Err(fail) = super::write_journal(root, &journal) {
+        if let Err(fail) = journal::write_with_cipher(root, &journal, cipher) {
             misses.push(LabelMiss {
                 command_id: journal.command_id,
                 during: fail
@@ -1624,15 +1809,16 @@ pub(super) fn reconcile_decision_journals(
     Ok(misses)
 }
 
-/// Format 3 fragment journals follow the T3 receipt. A commands row is not that commit.
+/// Format 3 / 6 fragment journals follow the T3 receipt. A commands row is not that commit.
 pub(super) fn reconcile_fragment_journals(
     root: &Path,
     conn: &Connection,
+    cipher: &VaultCipher,
 ) -> Result<Vec<LabelMiss>, Fail> {
     if !store::table_exists(conn, "t3_receipts").map_err(|err| unseen_db(err, "t3_receipt"))? {
         return Ok(Vec::new());
     }
-    let found = journal::scan(root);
+    let found = journal::scan_with_cipher(root, cipher);
     if found.unlisted.is_some() {
         return Ok(Vec::new());
     }
@@ -1641,7 +1827,7 @@ pub(super) fn reconcile_fragment_journals(
             continue;
         }
         if matches!(
-            read_receipt(conn, &journal.command_id)?,
+            read_receipt(conn, &journal.command_id, cipher)?,
             ReceiptRead::Unreadable
         ) {
             return Err(
@@ -1657,7 +1843,7 @@ pub(super) fn reconcile_fragment_journals(
             continue;
         }
         if !matches!(
-            read_receipt(conn, &journal.command_id)?,
+            read_receipt(conn, &journal.command_id, cipher)?,
             ReceiptRead::Ready { .. }
         ) {
             continue;
@@ -1665,7 +1851,7 @@ pub(super) fn reconcile_fragment_journals(
         let mut journal = journal;
         journal.state = "committed".into();
         journal.reason = None;
-        if let Err(fail) = super::write_journal(root, &journal) {
+        if let Err(fail) = journal::write_with_cipher(root, &journal, cipher) {
             misses.push(LabelMiss {
                 command_id: journal.command_id,
                 during: fail
@@ -1686,11 +1872,15 @@ pub(super) fn reconcile_fragment_journals(
     Ok(misses)
 }
 
-pub(super) fn reject_if_t3_command(conn: &Connection, command_id: &str) -> Result<(), Fail> {
+pub(super) fn reject_if_t3_command(
+    conn: &Connection,
+    command_id: &str,
+    cipher: &VaultCipher,
+) -> Result<(), Fail> {
     if !store::table_exists(conn, "t3_receipts").map_err(|err| unseen_db(err, "t3_receipt"))? {
         return Ok(());
     }
-    match read_receipt(conn, command_id)? {
+    match read_receipt(conn, command_id, cipher)? {
         ReceiptRead::Absent => Ok(()),
         ReceiptRead::Unreadable => {
             Err(

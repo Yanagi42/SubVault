@@ -2,8 +2,10 @@ use std::path::PathBuf;
 
 use serde_json::json;
 
+use crate::crypto::{AuthInput, NewPassphraseInput, ProtectionMode};
 use crate::engine::{
-    self, CancelRequest, Hooks, ImportRequest, InjectAction, MarkerRequest, ReadRequest,
+    self, CancelRequest, Hooks, ImportRequest, InitRequest, InjectAction, MarkerRequest,
+    ReadRequest, RotatePassphraseRequest,
 };
 use crate::model::{Fail, Report, EXIT_USAGE};
 
@@ -25,6 +27,16 @@ struct Flags {
     witness: Option<PathBuf>,
     fragment: Option<PathBuf>,
     format: Option<u8>,
+    protection: Option<ProtectionMode>,
+    passphrase_file: Option<PathBuf>,
+    passphrase_stdin: bool,
+    recovery_key_file: Option<PathBuf>,
+    recovery_key_stdin: bool,
+    recovery_key_out: Option<PathBuf>,
+    new_passphrase_file: Option<PathBuf>,
+    new_passphrase_stdin: bool,
+    rotate_recovery_key: bool,
+    acknowledge_plaintext: Option<bool>,
     fact_id: Option<String>,
     decision_id: Option<String>,
     expected_revision: Option<String>,
@@ -32,6 +44,7 @@ struct Flags {
     actor_id: Option<String>,
     allow_partial: Option<bool>,
     package: Option<PathBuf>,
+    redact_terms: Vec<String>,
 }
 
 impl Flags {
@@ -54,6 +67,16 @@ impl Flags {
             witness: None,
             fragment: None,
             format: None,
+            protection: None,
+            passphrase_file: None,
+            passphrase_stdin: false,
+            recovery_key_file: None,
+            recovery_key_stdin: false,
+            recovery_key_out: None,
+            new_passphrase_file: None,
+            new_passphrase_stdin: false,
+            rotate_recovery_key: false,
+            acknowledge_plaintext: None,
             fact_id: None,
             decision_id: None,
             expected_revision: None,
@@ -61,6 +84,16 @@ impl Flags {
             actor_id: None,
             allow_partial: None,
             package: None,
+            redact_terms: Vec::new(),
+        }
+    }
+
+    fn auth(&self) -> AuthInput {
+        AuthInput {
+            passphrase_file: self.passphrase_file.clone(),
+            passphrase_stdin: self.passphrase_stdin,
+            recovery_key_file: self.recovery_key_file.clone(),
+            recovery_key_stdin: self.recovery_key_stdin,
         }
     }
 }
@@ -82,36 +115,81 @@ pub fn execute(args: Vec<String>) -> Report {
     if command == "verify-package" && (flags.stop_at.is_some() || flags.inject.is_some()) {
         return usage("verify_package_has_no_hook");
     }
+    if command == "redact" && (flags.stop_at.is_some() || flags.inject.is_some()) {
+        return usage("redact_has_no_hook");
+    }
     let hooks = match hooks_from(&flags) {
         Ok(hooks) => hooks,
         Err(fail) => return fail.into_report(),
     };
+    if !flags.redact_terms.is_empty() && command != "redact" {
+        return usage("redact_term_only_on_redact");
+    }
     if flags.format.is_some() && command != "init" {
         return usage("format_only_on_init");
+    }
+    if flags.protection.is_some() && command != "init" {
+        return usage("protection_only_on_init");
+    }
+    if flags.recovery_key_out.is_some() && command != "init" && command != "rotate-passphrase" {
+        return usage("recovery_key_out_only_on_init_or_rotate");
+    }
+    if (flags.new_passphrase_file.is_some()
+        || flags.new_passphrase_stdin
+        || flags.rotate_recovery_key)
+        && command != "rotate-passphrase"
+    {
+        return usage("rotate_flags_only_on_rotate_passphrase");
     }
     if flags.allow_partial.is_some() && command != "export" {
         return usage("allow_partial_only_on_export");
     }
+    if flags.acknowledge_plaintext.is_some() && command != "export" {
+        return usage("acknowledge_plaintext_only_on_export");
+    }
     if flags.package.is_some() && command != "review" && command != "verify-package" {
         return usage("package_only_on_review");
     }
+    let auth = flags.auth();
     match command.as_str() {
         "init" => {
             let Some(vault) = flags.vault else {
                 return usage("vault_required");
             };
-            engine::init_vault(&vault, flags.format.unwrap_or(1), hooks)
+            engine::init_vault(InitRequest {
+                vault,
+                format: flags.format.unwrap_or(1),
+                protection: flags.protection,
+                auth,
+                recovery_key_out: flags.recovery_key_out,
+                hooks,
+            })
+        }
+        "rotate-passphrase" => {
+            let Some(vault) = flags.vault else {
+                return usage("vault_required");
+            };
+            engine::rotate_passphrase(RotatePassphraseRequest {
+                vault,
+                auth,
+                new_passphrase: NewPassphraseInput {
+                    file: flags.new_passphrase_file,
+                    stdin: flags.new_passphrase_stdin,
+                },
+                rotate_recovery_key: flags.rotate_recovery_key,
+                recovery_key_out: flags.recovery_key_out,
+            })
         }
         "open" | "verify" | "recover" => {
             let Some(vault) = flags.vault else {
                 return usage("vault_required");
             };
             if command == "recover" {
-                engine::recover_vault(&vault)
+                engine::recover_vault(&vault, auth)
             } else if command == "verify" {
-                engine::verify_vault(&vault)
+                engine::verify_vault(&vault, auth)
             } else {
-                engine::open_vault(&vault)
+                engine::open_vault(&vault, auth)
             }
         }
         "hold" => {
@@ -136,6 +214,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 media_type,
                 source,
                 display_name: flags.display_name,
+                auth,
                 hooks,
             })
         }
@@ -149,6 +228,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 vault,
                 source_id,
                 out,
+                auth,
             })
         }
         "marker" => {
@@ -162,6 +242,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 command_id,
                 source_id,
                 value,
+                auth,
                 hooks,
             })
         }
@@ -179,6 +260,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 command_id,
                 source,
                 batch_id: flags.batch_id,
+                auth,
                 hooks,
             })
         }
@@ -196,6 +278,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 command_id,
                 source,
                 batch_id: flags.batch_id,
+                auth,
                 hooks,
             })
         }
@@ -210,6 +293,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 command_id,
                 fragment,
                 batch_id: flags.batch_id,
+                auth,
                 hooks,
             })
         }
@@ -217,25 +301,38 @@ pub fn execute(args: Vec<String>) -> Report {
             let Some(vault) = flags.vault else {
                 return usage("vault_required");
             };
-            engine::query_candidates(&vault, flags.source_id)
+            engine::query_candidates(&vault, flags.source_id, auth)
         }
         "facts" => {
             let Some(vault) = flags.vault else {
                 return usage("vault_required");
             };
-            engine::query_facts(&vault, flags.source_id, flags.fact_id)
+            engine::query_facts(&vault, flags.source_id, flags.fact_id, auth)
         }
         "review" => {
             let (Some(vault), Some(out)) = (flags.vault, flags.out) else {
                 return usage("review_required_flags");
             };
-            engine::review_sheet(&vault, &out, flags.package.as_deref())
+            engine::review_sheet(&vault, &out, flags.package.as_deref(), auth)
         }
         "verify-package" => {
             let Some(package) = flags.package else {
                 return usage("verify_package_required_flags");
             };
             crate::verify_package::verify_package(&package)
+        }
+        "redact" => {
+            let Some(out) = flags.out else {
+                return usage("redact_required_flags");
+            };
+            engine::redact_template(engine::RedactRequest {
+                source: flags.source,
+                vault: flags.vault,
+                source_id: flags.source_id,
+                out,
+                redact_terms: flags.redact_terms,
+                auth,
+            })
         }
         "export" => {
             let (Some(vault), Some(out)) = (flags.vault, flags.out) else {
@@ -245,6 +342,8 @@ pub fn execute(args: Vec<String>) -> Report {
                 vault,
                 out,
                 allow_partial: flags.allow_partial.unwrap_or(false),
+                acknowledge_plaintext: flags.acknowledge_plaintext.unwrap_or(false),
+                auth,
                 hooks,
             })
         }
@@ -274,6 +373,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 expected_revision,
                 amount_text,
                 actor_id,
+                auth,
                 hooks,
             })
         }
@@ -300,6 +400,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 decision_id,
                 expected_revision,
                 actor_id,
+                auth,
                 hooks,
             })
         }
@@ -314,6 +415,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 command_id,
                 generation,
                 kind: flags.kind.unwrap_or_else(|| "preservation".into()),
+                auth,
             })
         }
         _ => usage("unknown_command"),
@@ -326,6 +428,45 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
     let mut index = 1;
     while index < args.len() {
         let flag = args[index].as_str();
+        match flag {
+            "--passphrase-stdin" => {
+                flags.passphrase_stdin = true;
+                index += 1;
+                continue;
+            }
+            "--recovery-key-stdin" => {
+                flags.recovery_key_stdin = true;
+                index += 1;
+                continue;
+            }
+            "--new-passphrase-stdin" => {
+                flags.new_passphrase_stdin = true;
+                index += 1;
+                continue;
+            }
+            "--rotate-recovery-key" => {
+                flags.rotate_recovery_key = true;
+                index += 1;
+                continue;
+            }
+            "--passphrase" | "--recovery-key" | "--new-passphrase" => {
+                return Err(
+                    Fail::new(EXIT_USAGE, "Usage", "passphrase_cli_arg_forbidden")
+                        .extra("flag", json!(flag)),
+                );
+            }
+            _ if flag.starts_with("--passphrase=")
+                || flag.starts_with("--recovery-key=")
+                || flag.starts_with("--new-passphrase=") =>
+            {
+                let name = flag.split('=').next().unwrap_or(flag);
+                return Err(
+                    Fail::new(EXIT_USAGE, "Usage", "passphrase_cli_arg_forbidden")
+                        .extra("flag", json!(name)),
+                );
+            }
+            _ => {}
+        }
         let value = args.get(index + 1).cloned().ok_or_else(|| {
             Fail::new(EXIT_USAGE, "Usage", "missing_flag_value").extra("flag", json!(flag))
         })?;
@@ -358,6 +499,23 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
             "--amount-text" => flags.amount_text = Some(value),
             "--actor-id" => flags.actor_id = Some(value),
             "--package" => flags.package = Some(PathBuf::from(value)),
+            "--redact-term" => flags.redact_terms.push(value),
+            "--passphrase-file" => flags.passphrase_file = Some(PathBuf::from(value)),
+            "--recovery-key-file" => flags.recovery_key_file = Some(PathBuf::from(value)),
+            "--recovery-key-out" => flags.recovery_key_out = Some(PathBuf::from(value)),
+            "--new-passphrase-file" => flags.new_passphrase_file = Some(PathBuf::from(value)),
+            "--protection" => {
+                flags.protection = Some(
+                    ProtectionMode::from_flag(&value)
+                        .ok_or_else(|| Fail::new(EXIT_USAGE, "Usage", "bad_protection"))?,
+                );
+            }
+            "--acknowledge-plaintext" => {
+                if value != "yes" {
+                    return Err(Fail::new(EXIT_USAGE, "Usage", "bad_acknowledge_plaintext"));
+                }
+                flags.acknowledge_plaintext = Some(true);
+            }
             "--allow-partial" => {
                 if value != "yes" {
                     return Err(Fail::new(EXIT_USAGE, "Usage", "bad_allow_partial"));
@@ -371,6 +529,7 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
                     "3" => 3,
                     "4" => 4,
                     "5" => 5,
+                    "6" => 6,
                     _ => return Err(Fail::new(EXIT_USAGE, "Usage", "bad_format")),
                 });
             }

@@ -11,16 +11,17 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::crypto::{AuthInput, CryptoError, ProtectionMode, VaultCipher};
 use crate::facts;
 use crate::fsutil::{self, sha256_file};
 use crate::ids::{self, canonical_object_relpath};
 use crate::model::{
-    honesty, unseen_db, Fail, Report, EXIT_FAULT_MISSED, EXIT_INTEGRITY, EXIT_RECOVERY,
-    EXIT_REJECTED,
+    cipher_tamper_fail, honesty, unseen_db, Fail, Report, EXIT_FAULT_MISSED, EXIT_INTEGRITY,
+    EXIT_RECOVERY, EXIT_REJECTED,
 };
 use crate::store::{self, ObjectRow, OccurrenceRow, SourceRow};
 
-use super::{validate_hook_names, Hooks, InjectAction, Place};
+use super::{validate_hook_names, Hooks, InjectAction, Place, VaultBannerKind};
 
 const PACKAGE_VERSION: &str = "offline-exit-1";
 const EXPORT_INJECTS: &[&str] = &["export_write", "export_dir_fsync"];
@@ -29,6 +30,8 @@ pub struct ExportRequest {
     pub vault: PathBuf,
     pub out: PathBuf,
     pub allow_partial: bool,
+    pub acknowledge_plaintext: bool,
+    pub auth: AuthInput,
     pub hooks: Hooks,
 }
 
@@ -54,7 +57,7 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
     if let Some(fail) = place_error(place) {
         return Err(early(&req.hooks, fail));
     }
-    let loaded = match read_locked(&req.vault) {
+    let loaded = match read_locked(&req.vault, &req.auth, req.acknowledge_plaintext) {
         Ok(loaded) => loaded,
         Err(fail) => return Err(early(&req.hooks, fail)),
     };
@@ -121,6 +124,8 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
         &snapshot_id,
         completeness,
         loaded.vault_format,
+        loaded.protection,
+        req.acknowledge_plaintext,
         &files,
         &loaded.defects,
         &loaded.counts,
@@ -220,6 +225,16 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
     }
 }
 
+fn export_protection_label(vault_format: i64, protection: Option<ProtectionMode>) -> &'static str {
+    if vault_format < 6 {
+        return "undecided";
+    }
+    match protection {
+        Some(ProtectionMode::Passphrase) => "plaintext_exit_from_passphrase_aead_v1",
+        Some(ProtectionMode::OsDisk) | None => "plaintext_exit_from_os_disk_assumed",
+    }
+}
+
 fn published_body(
     req: &ExportRequest,
     completeness: &str,
@@ -235,7 +250,20 @@ fn published_body(
     body.insert("completeness".into(), json!(completeness));
     body.insert("snapshot_id".into(), json!(snapshot_id));
     body.insert("vault_format".into(), json!(loaded.vault_format));
-    body.insert("protection".into(), json!("undecided"));
+    body.insert(
+        "protection".into(),
+        json!(export_protection_label(
+            loaded.vault_format,
+            loaded.protection
+        )),
+    );
+    if loaded.vault_format >= 6 {
+        body.insert("synthetic_only".into(), json!(false));
+        body.insert(
+            "plaintext_acknowledged".into(),
+            json!(req.acknowledge_plaintext),
+        );
+    }
     body.insert("allow_partial".into(), json!(req.allow_partial));
     body.insert("output".into(), json!(req.out.display().to_string()));
     body.insert("output_written".into(), json!(true));
@@ -385,25 +413,43 @@ struct CopyItem {
     bytes: Vec<u8>,
 }
 
-fn read_locked(vault: &Path) -> Result<Loaded, Fail> {
+fn read_locked(
+    vault: &Path,
+    auth: &AuthInput,
+    acknowledge_plaintext: bool,
+) -> Result<Loaded, Fail> {
     let _lock = crate::lockfile::VaultLock::try_acquire(&vault.join("writer.lock"))
         .map_err(|err| crate::model::unseen_io(err, "lock"))?
         .ok_or_else(|| {
             Fail::new(crate::model::EXIT_LOCKED, "Locked", "writer_busy")
                 .extra("created_new_vault", json!(false))
         })?;
+    let banner = super::inspect_vault_banner(vault)?;
     let uri = super::wal_visible_uri(&vault.join("vault.db"))?;
     let conn = Connection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|err| read_err(err, "export_open"))?;
-    super::accept_connection_format(&vault.join("vault.db"), &conn)?;
-    load_snapshot(&conn, vault)
+    let version =
+        super::accept_connection_format_with_banner(&vault.join("vault.db"), &conn, banner)?;
+    let protection = match banner {
+        VaultBannerKind::Synthetic => None,
+        VaultBannerKind::Production(mode) => Some(mode),
+    };
+    let cipher = super::unlock_cipher(&conn, version, protection, auth)?;
+    if version >= 6 && protection == Some(ProtectionMode::Passphrase) && !acknowledge_plaintext {
+        return Err(rejected("plaintext_export_ack_required")
+            .extra("vault_format", json!(version))
+            .extra("protection", json!(crate::crypto::PROTECTION_PASSPHRASE))
+            .extra("synthetic_only", json!(false)));
+    }
+    load_snapshot(&conn, vault, protection, acknowledge_plaintext, &cipher)
 }
 
 struct Loaded {
     vault_format: i64,
+    protection: Option<ProtectionMode>,
     records: Value,
     csv: Option<Vec<u8>>,
     copies: Vec<CopyItem>,
@@ -412,37 +458,53 @@ struct Loaded {
     blocking: Option<Fail>,
 }
 
-fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
+fn load_snapshot(
+    conn: &Connection,
+    root: &Path,
+    protection: Option<ProtectionMode>,
+    acknowledge_plaintext: bool,
+    cipher: &VaultCipher,
+) -> Result<Loaded, Fail> {
     let vault_format = store::user_version(conn).map_err(|err| read_err(err, "user_version"))?;
-    let sources = store::list_sources(conn).map_err(|err| read_err(err, "list_sources"))?;
-    let occurrences =
-        store::list_occurrences(conn).map_err(|err| read_err(err, "list_occurrences"))?;
-    let objects = store::list_objects(conn).map_err(|err| read_err(err, "list_objects"))?;
+    let sources = store::list_sources_with_cipher(conn, cipher)
+        .map_err(|err| read_err(err, "list_sources"))?;
+    let occurrences = store::list_occurrences_with_cipher(conn, cipher)
+        .map_err(|err| read_err(err, "list_occurrences"))?;
+    let objects = store::list_objects_with_cipher(conn, cipher)
+        .map_err(|err| read_err(err, "list_objects"))?;
     let has_body = store::table_exists(conn, "source_versions")
         .map_err(|err| read_err(err, "source_versions"))?;
     let has_facts = store::table_exists(conn, "facts").map_err(|err| read_err(err, "facts"))?;
     if has_facts && !has_body {
-        return Ok(blocked(vault_format, recovery("reference_broken")));
+        return Ok(blocked(
+            vault_format,
+            protection,
+            recovery("reference_broken"),
+        ));
     }
     let versions = if has_body {
-        Some(load_versions(conn)?)
+        Some(load_versions(conn, cipher)?)
     } else if store::table_exists(conn, "candidates").map_err(|err| read_err(err, "candidates"))? {
-        return Ok(blocked(vault_format, recovery("reference_broken")));
+        return Ok(blocked(
+            vault_format,
+            protection,
+            recovery("reference_broken"),
+        ));
     } else {
         None
     };
     let facts = if has_facts {
-        Some(load_facts(conn)?)
+        Some(load_facts(conn, cipher)?)
     } else {
         None
     };
     let decisions = if has_facts {
-        Some(load_decisions(conn)?)
+        Some(load_decisions(conn, cipher)?)
     } else {
         None
     };
     let candidates = if has_body {
-        Some(load_candidates(conn)?)
+        Some(load_candidates(conn, cipher)?)
     } else {
         None
     };
@@ -450,13 +512,18 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
     let mut object_ids = BTreeSet::new();
     for row in &objects {
         if !object_ids.insert(row.object_id.clone()) {
-            return Ok(blocked(vault_format, recovery("reference_broken")));
+            return Ok(blocked(
+                vault_format,
+                protection,
+                recovery("reference_broken"),
+            ));
         }
     }
     for source in &sources {
         let Some(object) = objects.iter().find(|row| row.object_id == source.object_id) else {
             return Ok(blocked(
                 vault_format,
+                protection,
                 recovery("reference_broken").extra("source_id", json!(source.source_id)),
             ));
         };
@@ -465,6 +532,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
         {
             return Ok(blocked(
                 vault_format,
+                protection,
                 recovery("reference_broken").extra("source_id", json!(source.source_id)),
             ));
         }
@@ -476,6 +544,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
         {
             return Ok(blocked(
                 vault_format,
+                protection,
                 recovery("reference_broken")
                     .extra("occurrence_id", json!(occurrence.occurrence_id)),
             ));
@@ -489,6 +558,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
             else {
                 return Ok(blocked(
                     vault_format,
+                    protection,
                     recovery("reference_broken")
                         .extra("source_version_id", json!(version.source_version_id)),
                 ));
@@ -499,6 +569,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
             {
                 return Ok(blocked(
                     vault_format,
+                    protection,
                     recovery("reference_broken")
                         .extra("source_version_id", json!(version.source_version_id)),
                 ));
@@ -513,6 +584,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
             }) else {
                 return Ok(blocked(
                     vault_format,
+                    protection,
                     recovery("reference_broken")
                         .extra("candidate_id", json!(candidate.candidate_id)),
                 ));
@@ -521,6 +593,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
             {
                 return Ok(blocked(
                     vault_format,
+                    protection,
                     recovery("reference_broken")
                         .extra("candidate_id", json!(candidate.candidate_id)),
                 ));
@@ -534,7 +607,11 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
     });
     if let Some(facts) = &facts {
         let Some(candidates) = &candidates else {
-            return Ok(blocked(vault_format, recovery("reference_broken")));
+            return Ok(blocked(
+                vault_format,
+                protection,
+                recovery("reference_broken"),
+            ));
         };
         for fact in facts {
             let Some(candidate) = candidates
@@ -543,6 +620,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
             else {
                 return Ok(blocked(
                     vault_format,
+                    protection,
                     recovery("reference_broken").extra("fact_id", json!(fact.fact_id)),
                 ));
             };
@@ -551,6 +629,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
             {
                 return Ok(blocked(
                     vault_format,
+                    protection,
                     recovery("reference_broken").extra("fact_id", json!(fact.fact_id)),
                 ));
             }
@@ -558,10 +637,18 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
     }
     if let Some(decisions) = &decisions {
         let Some(facts) = &facts else {
-            return Ok(blocked(vault_format, recovery("reference_broken")));
+            return Ok(blocked(
+                vault_format,
+                protection,
+                recovery("reference_broken"),
+            ));
         };
         let Some(candidates) = &candidates else {
-            return Ok(blocked(vault_format, recovery("reference_broken")));
+            return Ok(blocked(
+                vault_format,
+                protection,
+                recovery("reference_broken"),
+            ));
         };
         for decision in decisions {
             if !facts.iter().any(|row| row.fact_id == decision.fact_id)
@@ -571,12 +658,13 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
             {
                 return Ok(blocked(
                     vault_format,
+                    protection,
                     recovery("reference_broken").extra("decision_id", json!(decision.decision_id)),
                 ));
             }
         }
         if let Err(fail) = check_chains(facts, decisions) {
-            return Ok(blocked(vault_format, fail));
+            return Ok(blocked(vault_format, protection, fail));
         }
     }
 
@@ -585,7 +673,7 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
     let mut object_json = Vec::new();
     let mut blocking = None;
     for row in &objects {
-        match classify_object(root, row) {
+        match classify_object(root, row, cipher) {
             ObjectCopy::Block(fail) => {
                 blocking = Some(fail);
                 break;
@@ -728,24 +816,37 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
         "facts": count_value(facts.as_ref().map(|rows| rows.len())),
         "decisions": count_value(decisions.as_ref().map(|rows| rows.len()))
     });
-    let records = json!({
-        "package_version": PACKAGE_VERSION,
-        "vault_format": vault_format,
-        "protection": "undecided",
-        "security_complete": false,
-        "synthetic_only": true,
-        "live_directory_copy": false,
-        "field_notes": field_notes(vault_format),
-        "sources": source_json(&sources),
-        "occurrences": occurrence_json(&occurrences),
-        "objects": object_json,
-        "source_versions": array_or_null(versions.map(|rows| rows.into_iter().map(|row| row.json()).collect())),
-        "candidates": array_or_null(candidate_json),
-        "facts": array_or_null(fact_json),
-        "decisions": array_or_null(decision_json)
-    });
+    let mut records_map = Map::new();
+    records_map.insert("package_version".into(), json!(PACKAGE_VERSION));
+    records_map.insert("vault_format".into(), json!(vault_format));
+    records_map.insert(
+        "protection".into(),
+        json!(export_protection_label(vault_format, protection)),
+    );
+    records_map.insert("security_complete".into(), json!(false));
+    records_map.insert("synthetic_only".into(), json!(vault_format < 6));
+    if vault_format >= 6 {
+        records_map.insert(
+            "plaintext_acknowledged".into(),
+            json!(acknowledge_plaintext),
+        );
+    }
+    records_map.insert("live_directory_copy".into(), json!(false));
+    records_map.insert("field_notes".into(), field_notes(vault_format, protection));
+    records_map.insert("sources".into(), json!(source_json(&sources)));
+    records_map.insert("occurrences".into(), json!(occurrence_json(&occurrences)));
+    records_map.insert("objects".into(), json!(object_json));
+    records_map.insert(
+        "source_versions".into(),
+        array_or_null(versions.map(|rows| rows.into_iter().map(|row| row.json()).collect())),
+    );
+    records_map.insert("candidates".into(), array_or_null(candidate_json));
+    records_map.insert("facts".into(), array_or_null(fact_json));
+    records_map.insert("decisions".into(), array_or_null(decision_json));
+    let records = Value::Object(records_map);
     Ok(Loaded {
         vault_format,
+        protection,
         records,
         csv,
         copies,
@@ -755,9 +856,10 @@ fn load_snapshot(conn: &Connection, root: &Path) -> Result<Loaded, Fail> {
     })
 }
 
-fn blocked(vault_format: i64, blocking: Fail) -> Loaded {
+fn blocked(vault_format: i64, protection: Option<ProtectionMode>, blocking: Fail) -> Loaded {
     Loaded {
         vault_format,
+        protection,
         records: Value::Null,
         csv: None,
         copies: Vec::new(),
@@ -779,13 +881,14 @@ enum ObjectCopy {
     Block(Fail),
 }
 
-fn classify_object(root: &Path, row: &ObjectRow) -> ObjectCopy {
-    let facts = facts::object_facts(
+fn classify_object(root: &Path, row: &ObjectRow, cipher: &VaultCipher) -> ObjectCopy {
+    let facts = facts::object_facts_with_cipher(
         root,
         &row.object_id,
         Some(&row.relpath),
         &row.content_sha256,
         row.byte_length,
+        cipher,
     );
     if facts.id_rejected {
         return ObjectCopy::Block(
@@ -797,6 +900,13 @@ fn classify_object(root: &Path, row: &ObjectRow) -> ObjectCopy {
             recovery("object_unreadable")
                 .extra("object_id", json!(row.object_id))
                 .extra("os_error", json!(message)),
+        );
+    }
+    if let Some(detail) = facts.auth_error {
+        return ObjectCopy::Block(
+            recovery("ciphertext_auth_failed")
+                .extra("object_id", json!(row.object_id))
+                .extra("detail", json!(detail)),
         );
     }
     let package_path = format!("originals/{}", row.object_id);
@@ -820,13 +930,19 @@ fn classify_object(root: &Path, row: &ObjectRow) -> ObjectCopy {
             recovery("object_id_rejected").extra("object_id", json!(row.object_id)),
         );
     };
-    let bytes = match fs::read(root.join(relpath)) {
+    let bytes = match cipher.decrypt_object_to_vec(&row.object_id, &root.join(relpath)) {
         Ok(bytes) => bytes,
-        Err(err) => {
+        Err(CryptoError::Io(err)) => {
             return ObjectCopy::Block(
                 recovery("object_unreadable")
                     .extra("object_id", json!(row.object_id))
                     .extra("os_error", json!(err.to_string())),
+            );
+        }
+        Err(err) => {
+            return ObjectCopy::Block(
+                cipher_tamper_fail(err, "export_read_object")
+                    .extra("object_id", json!(row.object_id)),
             );
         }
     };
@@ -911,7 +1027,7 @@ struct DecisionRow {
     target: Option<String>,
 }
 
-fn load_versions(conn: &Connection) -> Result<Vec<VersionRow>, Fail> {
+fn load_versions(conn: &Connection, cipher: &VaultCipher) -> Result<Vec<VersionRow>, Fail> {
     let mut stmt = conn
         .prepare(
             "SELECT source_version_id, source_id, object_id, content_sha256, byte_length, media_type, role, eml FROM source_versions ORDER BY source_version_id",
@@ -933,17 +1049,28 @@ fn load_versions(conn: &Connection) -> Result<Vec<VersionRow>, Fail> {
         .map_err(|err| read_err(err, "source_versions"))?;
     let mut out = Vec::new();
     for row in rows {
-        let row = row.map_err(|err| read_err(err, "source_versions"))?;
+        let mut row = row.map_err(|err| read_err(err, "source_versions"))?;
         if row.eml != 0 {
             return Err(recovery("reference_broken")
                 .extra("source_version_id", json!(row.source_version_id)));
         }
+        row.content_sha256 = cipher
+            .decrypt_field(
+                "source_versions",
+                &row.source_version_id,
+                "content_sha256",
+                &row.content_sha256,
+            )
+            .map_err(|err| {
+                cipher_tamper_fail(err, "source_versions")
+                    .extra("source_version_id", json!(row.source_version_id))
+            })?;
         out.push(row);
     }
     Ok(out)
 }
 
-fn load_candidates(conn: &Connection) -> Result<Vec<CandidateRow>, Fail> {
+fn load_candidates(conn: &Connection, cipher: &VaultCipher) -> Result<Vec<CandidateRow>, Fail> {
     let joined: i64 = conn
         .query_row(
             "SELECT count(*) FROM candidates c JOIN source_versions sv ON sv.source_version_id = c.source_version_id",
@@ -987,6 +1114,21 @@ fn load_candidates(conn: &Connection) -> Result<Vec<CandidateRow>, Fail> {
         if row.10 != 0 || (row.6 != 0 && row.6 != 1) {
             return Err(recovery("reference_broken").extra("candidate_id", json!(row.0)));
         }
+        let plain_excerpt = cipher
+            .decrypt_field("candidates", &row.0, "excerpt", &row.7)
+            .map_err(|err| {
+                cipher_tamper_fail(err, "candidates").extra("candidate_id", json!(row.0))
+            })?;
+        let plain_value = cipher
+            .decrypt_field("candidates", &row.0, "value_json", &row.8)
+            .map_err(|err| {
+                cipher_tamper_fail(err, "candidates").extra("candidate_id", json!(row.0))
+            })?;
+        let plain_locator = cipher
+            .decrypt_field("candidates", &row.0, "locator_json", &row.9)
+            .map_err(|err| {
+                cipher_tamper_fail(err, "candidates").extra("candidate_id", json!(row.0))
+            })?;
         out.push(CandidateRow {
             candidate_id: row.0.clone(),
             run_id: row.1,
@@ -995,10 +1137,10 @@ fn load_candidates(conn: &Connection) -> Result<Vec<CandidateRow>, Fail> {
             ordinal: row.4,
             kind: row.5,
             usable: row.6 == 1,
-            excerpt: row.7,
-            value: json_object(&row.8, "candidate_value_unreadable")
+            excerpt: plain_excerpt,
+            value: json_object(&plain_value, "candidate_value_unreadable")
                 .map_err(|fail| fail.extra("candidate_id", json!(row.0)))?,
-            locator: json_object(&row.9, "locator_unreadable")
+            locator: json_object(&plain_locator, "locator_unreadable")
                 .map_err(|fail| fail.extra("candidate_id", json!(row.0)))?,
             adopted: false,
             source_id: row.11,
@@ -1008,7 +1150,7 @@ fn load_candidates(conn: &Connection) -> Result<Vec<CandidateRow>, Fail> {
     Ok(out)
 }
 
-fn load_facts(conn: &Connection) -> Result<Vec<FactRow>, Fail> {
+fn load_facts(conn: &Connection, cipher: &VaultCipher) -> Result<Vec<FactRow>, Fail> {
     let mut stmt = conn
         .prepare(
             "SELECT fact_id, source_id, source_version_id, run_id, candidate_id, fact_type, value_json, revision FROM facts ORDER BY source_id, fact_id",
@@ -1031,6 +1173,9 @@ fn load_facts(conn: &Connection) -> Result<Vec<FactRow>, Fail> {
     let mut out = Vec::new();
     for row in rows {
         let row = row.map_err(|err| read_err(err, "facts"))?;
+        let plain_value = cipher
+            .decrypt_field("facts", &row.0, "value_json", &row.6)
+            .map_err(|err| cipher_tamper_fail(err, "facts").extra("fact_id", json!(row.0)))?;
         out.push(FactRow {
             fact_id: row.0.clone(),
             source_id: row.1,
@@ -1038,7 +1183,7 @@ fn load_facts(conn: &Connection) -> Result<Vec<FactRow>, Fail> {
             run_id: row.3,
             candidate_id: row.4,
             fact_type: row.5,
-            value: json_object(&row.6, "fact_value_unreadable")
+            value: json_object(&plain_value, "fact_value_unreadable")
                 .map_err(|fail| fail.extra("fact_id", json!(row.0)))?,
             revision: row.7,
         });
@@ -1046,7 +1191,7 @@ fn load_facts(conn: &Connection) -> Result<Vec<FactRow>, Fail> {
     Ok(out)
 }
 
-fn load_decisions(conn: &Connection) -> Result<Vec<DecisionRow>, Fail> {
+fn load_decisions(conn: &Connection, cipher: &VaultCipher) -> Result<Vec<DecisionRow>, Fail> {
     let mut stmt = conn
         .prepare(
             "SELECT decision_id, fact_id, command_id, candidate_id, slot, kind, actor_kind, actor_id, recorded_at, rule_version, prior_value_json, new_value_json, target_decision_id FROM decisions ORDER BY fact_id, rowid",
@@ -1074,6 +1219,16 @@ fn load_decisions(conn: &Connection) -> Result<Vec<DecisionRow>, Fail> {
     let mut out = Vec::new();
     for row in rows {
         let row = row.map_err(|err| read_err(err, "decisions"))?;
+        let plain_prior = cipher
+            .decrypt_opt_field("decisions", &row.0, "prior_value_json", row.10.as_deref())
+            .map_err(|err| {
+                cipher_tamper_fail(err, "decisions").extra("decision_id", json!(row.0))
+            })?;
+        let plain_new = cipher
+            .decrypt_field("decisions", &row.0, "new_value_json", &row.11)
+            .map_err(|err| {
+                cipher_tamper_fail(err, "decisions").extra("decision_id", json!(row.0))
+            })?;
         out.push(DecisionRow {
             decision_id: row.0.clone(),
             fact_id: row.1,
@@ -1085,9 +1240,9 @@ fn load_decisions(conn: &Connection) -> Result<Vec<DecisionRow>, Fail> {
             actor_id: row.7,
             recorded_at: row.8,
             rule_version: row.9,
-            prior: json_optional(&row.10, "prior_value_unreadable")
+            prior: json_optional(&plain_prior, "prior_value_unreadable")
                 .map_err(|fail| fail.extra("decision_id", json!(row.0)))?,
-            new_value: json_object(&row.11, "new_value_unreadable")
+            new_value: json_object(&plain_new, "new_value_unreadable")
                 .map_err(|fail| fail.extra("decision_id", json!(row.0)))?,
             target: row.12,
         });
@@ -1256,20 +1411,32 @@ fn occurrence_json(rows: &[OccurrenceRow]) -> Vec<Value> {
         .collect()
 }
 
-fn field_notes(vault_format: i64) -> Value {
+fn field_notes(vault_format: i64, protection: Option<ProtectionMode>) -> Value {
+    let protection_note = if vault_format >= 6 {
+        match protection {
+            Some(ProtectionMode::Passphrase) => {
+                "这是从口令加密真实资料库（格式 6，passphrase_aead_v1）经用户显式确认导出的明文离线退出包。包内记录与原件均为明文，请妥善保管。"
+            }
+            Some(ProtectionMode::OsDisk) | None => {
+                "这是从真实资料库（格式 6，os_disk_assumed）导出的明文离线退出包。请勿存放于未加密或不受信任的介质。"
+            }
+        }
+    } else {
+        "保护方式未定。这是合成库的明文副本，不是获准的真实资料出口。"
+    };
     let mut notes = json!({
         "stated_amount_paid": "来源载明的已付金额，不是已核到账。",
         "stated_service_period": "来源载明的服务期。没有观察日，当前状态保持未知。",
         "candidate": "候选不是事实。没有被事实引用的候选仍留在包内。",
-        "protection": "保护方式未定。这是合成库的明文副本，不是获准的真实资料出口。",
+        "protection": protection_note,
         "paths": "包内原件只用 originals/ 下的相对路径。出现记录里的外部路径只是当时的取得记录。"
     });
-    if vault_format == 4 || vault_format == 5 {
+    if vault_format == 4 || vault_format == 5 || vault_format >= 6 {
         notes["html_original"] = json!(
             "包内 HTML 只作为文本保存和展示。程序不执行它，不连接网络，也不自动加载其中的外部引用。"
         );
     }
-    if vault_format == 5 {
+    if vault_format == 5 || vault_format >= 6 {
         notes["pdf_original"] = json!(
             "包内 PDF 原样保存原始字节。文本提取只读取静态 PDF 内容流，不做 OCR，也不解密加密文档。"
         );
@@ -1277,10 +1444,13 @@ fn field_notes(vault_format: i64) -> Value {
     notes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn manifest_value(
     snapshot_id: &str,
     completeness: &str,
     vault_format: i64,
+    protection: Option<ProtectionMode>,
+    acknowledge_plaintext: bool,
     files: &[Written],
     missing: &[Value],
     counts: &Value,
@@ -1300,19 +1470,28 @@ fn manifest_value(
             entry
         })
         .collect();
-    json!({
-        "package_version": PACKAGE_VERSION,
-        "snapshot_id": snapshot_id,
-        "completeness": completeness,
-        "vault_format": vault_format,
-        "protection": "undecided",
-        "security_complete": false,
-        "synthetic_only": true,
-        "live_directory_copy": false,
-        "files": listed,
-        "missing": missing,
-        "counts": counts
-    })
+    let mut map = Map::new();
+    map.insert("package_version".into(), json!(PACKAGE_VERSION));
+    map.insert("snapshot_id".into(), json!(snapshot_id));
+    map.insert("completeness".into(), json!(completeness));
+    map.insert("vault_format".into(), json!(vault_format));
+    map.insert(
+        "protection".into(),
+        json!(export_protection_label(vault_format, protection)),
+    );
+    map.insert("security_complete".into(), json!(false));
+    map.insert("synthetic_only".into(), json!(vault_format < 6));
+    if vault_format >= 6 {
+        map.insert(
+            "plaintext_acknowledged".into(),
+            json!(acknowledge_plaintext),
+        );
+    }
+    map.insert("live_directory_copy".into(), json!(false));
+    map.insert("files".into(), Value::Array(listed));
+    map.insert("missing".into(), Value::Array(missing.to_vec()));
+    map.insert("counts".into(), counts.clone());
+    Value::Object(map)
 }
 
 fn verify_tree(root: &Path, files: &[Written]) -> Result<(), String> {
@@ -1586,6 +1765,7 @@ mod published_sync_static {
     fn loaded() -> Loaded {
         Loaded {
             vault_format: 1,
+            protection: None,
             records: json!({}),
             csv: None,
             copies: Vec::new(),
@@ -1600,6 +1780,8 @@ mod published_sync_static {
             vault: PathBuf::from("/vault"),
             out: PathBuf::from("/requested/pkg"),
             allow_partial: false,
+            acknowledge_plaintext: false,
+            auth: AuthInput::default(),
             hooks: Hooks {
                 stop_at: None,
                 checkpoint: None,

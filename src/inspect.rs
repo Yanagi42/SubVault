@@ -4,23 +4,32 @@ use std::path::Path;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
+use crate::crypto::{CryptoError, ProtectionMode, VaultCipher};
 use crate::facts;
-use crate::fsutil::sha256_file;
 use crate::ids::is_prefixed_id;
 use crate::journal;
 use crate::model::{
-    capabilities, honesty, platform_limits, unseen_db, Fail, Report, EXIT_INTEGRITY, EXIT_OK,
-    EXIT_RECOVERY, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE, PRESERVED,
+    apply_format_honesty, capabilities_for, honesty, platform_limits, unseen_db, Fail, Report,
+    EXIT_INTEGRITY, EXIT_OK, EXIT_RECOVERY, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE, PRESERVED,
 };
 use crate::store;
 
-pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Report, Fail> {
-    let sources = store::list_sources(conn).map_err(|err| unseen_db(err, "list_sources"))?;
-    let objects = store::list_objects(conn).map_err(|err| unseen_db(err, "list_objects"))?;
-    let occurrences =
-        store::list_occurrences(conn).map_err(|err| unseen_db(err, "list_occurrences"))?;
-    let commands = store::list_commands(conn).map_err(|err| unseen_db(err, "list_commands"))?;
-    let journals = journal::scan(root);
+pub(crate) fn report(
+    root: &Path,
+    conn: &Connection,
+    magic: i64,
+    cipher: &VaultCipher,
+    protection: Option<ProtectionMode>,
+) -> Result<Report, Fail> {
+    let sources = store::list_sources_with_cipher(conn, cipher)
+        .map_err(|err| unseen_db(err, "list_sources"))?;
+    let objects = store::list_objects_with_cipher(conn, cipher)
+        .map_err(|err| unseen_db(err, "list_objects"))?;
+    let occurrences = store::list_occurrences_with_cipher(conn, cipher)
+        .map_err(|err| unseen_db(err, "list_occurrences"))?;
+    let commands = store::list_commands_with_cipher(conn, cipher)
+        .map_err(|err| unseen_db(err, "list_commands"))?;
+    let journals = journal::scan_with_cipher(root, cipher);
     let mut alerts = Vec::new();
     if let Some(message) = &journals.unlisted {
         alerts.push(json!({
@@ -80,7 +89,7 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
                         }
                         if !db_object_ids.contains(name.as_str()) {
                             let path = object_dir.join(&name);
-                            match sha256_file(&path) {
+                            match cipher.verify_object_file(&name, &path) {
                                 Ok((hash, len)) => {
                                     unreferenced.push(json!({
                                         "object_id": name,
@@ -90,12 +99,20 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
                                         "object_relpath": format!("objects/{name}")
                                     }));
                                 }
-                                Err(err) => {
+                                Err(CryptoError::Io(err)) => {
                                     alerts.push(json!({
                                         "code": "orphan_unreadable",
                                         "name": name,
                                         "during": "hash_orphan",
                                         "os_error": err.to_string(),
+                                    }));
+                                }
+                                Err(err) => {
+                                    alerts.push(json!({
+                                        "code": "orphan_ciphertext_invalid",
+                                        "name": name,
+                                        "during": "hash_orphan",
+                                        "detail": err.to_string(),
                                     }));
                                 }
                             }
@@ -110,12 +127,13 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
         let stored = objects
             .iter()
             .find(|object| object.object_id == source.object_id);
-        let facts = facts::object_facts(
+        let facts = facts::object_facts_with_cipher(
             root,
             &source.object_id,
             stored.map(|object| object.relpath.as_str()),
             &source.content_sha256,
             source.byte_length,
+            cipher,
         );
         let relpath = facts.canonical_relpath.clone().unwrap_or_default();
         // preservation stays the stored verdict only when this call hashed the
@@ -147,6 +165,14 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
             if !facts.id_rejected && facts.missing {
                 alerts.push(json!({"code": "object_missing", "source_id": source.source_id, "object_id": source.object_id}));
                 dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "object_missing"}));
+            } else if !facts.id_rejected && facts.auth_error.is_some() {
+                alerts.push(json!({
+                    "code": "ciphertext_auth_failed",
+                    "source_id": source.source_id,
+                    "object_id": source.object_id,
+                    "detail": facts.auth_error,
+                }));
+                dangling.push(json!({"source_id": source.source_id, "object_id": source.object_id, "reason": "ciphertext_auth_failed"}));
             } else if !facts.id_rejected && (!facts.hash_matches || !facts.length_matches) {
                 alerts.push(json!({
                     "code": "hash_mismatch",
@@ -245,16 +271,33 @@ pub(crate) fn report(root: &Path, conn: &Connection, magic: i64) -> Result<Repor
     } else {
         json!(vault_id)
     };
+    let vault_format = store::user_version(conn).map_err(|err| unseen_db(err, "user_version"))?;
     let mut body = honesty(outcome);
     body.insert("vault_id".into(), vault_id_json);
-    body.insert("disposable".into(), json!(true));
-    body.insert("protection".into(), json!("unanswered_synthetic_plaintext"));
-    body.insert("primary_input".into(), json!("unanswered"));
-    let vault_format = store::user_version(conn).map_err(|err| unseen_db(err, "user_version"))?;
+    body.insert("disposable".into(), json!(vault_format < 6));
+    body.insert(
+        "protection".into(),
+        json!(if vault_format >= 6 {
+            protection
+                .map(ProtectionMode::as_meta)
+                .unwrap_or(crate::crypto::PROTECTION_OS_DISK)
+        } else {
+            crate::crypto::PROTECTION_SYNTHETIC
+        }),
+    );
+    body.insert(
+        "primary_input".into(),
+        json!(if vault_format >= 6 {
+            "local_static_files"
+        } else {
+            "unanswered"
+        }),
+    );
     body.insert("schema_version".into(), json!(1));
     body.insert("vault_format".into(), json!(vault_format));
-    body.insert("capabilities".into(), capabilities());
+    body.insert("capabilities".into(), capabilities_for(vault_format));
     body.insert("platform_limits".into(), platform_limits(Some(magic)));
+    apply_format_honesty(&mut body, vault_format, protection);
     body.insert("has_incomplete".into(), json!(!incomplete.is_empty()));
     body.insert("sources".into(), Value::Array(source_json));
     body.insert(

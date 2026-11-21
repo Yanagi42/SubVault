@@ -296,6 +296,12 @@ pub fn verify_package(package: &Path) -> Report {
     body.insert("snapshot_id".into(), json!(snapshot_id));
     body.insert("completeness".into(), json!(completeness));
     body.insert("vault_format".into(), json!(vault_format));
+    if let Some(protection) = manifest.get("protection").cloned() {
+        body.insert("protection".into(), protection);
+    }
+    if let Some(synthetic) = manifest.get("synthetic_only").cloned() {
+        body.insert("synthetic_only".into(), synthetic);
+    }
     body.insert("verified_files".into(), json!(verified_map.len()));
     body.insert("verified_originals".into(), json!(verified_originals));
     body.insert("facts_csv_checked".into(), json!(facts_csv_checked));

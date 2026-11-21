@@ -1,5 +1,6 @@
 mod body;
 mod cli;
+mod crypto;
 mod engine;
 mod facts;
 mod file_identity;

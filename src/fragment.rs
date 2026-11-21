@@ -7,22 +7,24 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::body::{self, Draft, ExtractError, InputError};
+use crate::crypto::{AuthInput, ProtectionMode, VaultCipher};
 use crate::ids::{
     self, canonical_object_relpath, hex_encode, is_command_id, is_display_name, is_prefixed_id,
 };
 use crate::journal::{self, Journal};
 use crate::model::{
-    db_fail, honesty, io_fail, unseen_db, Fail, Report, EXIT_FAULT_MISSED, EXIT_INTEGRITY,
-    EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_USAGE, EXIT_VERSION,
-    NOT_PRESERVED, PRESERVED,
+    apply_format_honesty, cipher_tamper_fail, db_fail, honesty, io_fail, unseen_db, Fail, Report,
+    EXIT_FAULT_MISSED, EXIT_INTEGRITY, EXIT_NOT_PRESERVED, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED,
+    EXIT_USAGE, EXIT_VERSION, NOT_PRESERVED, PRESERVED,
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
 use super::{
-    already_committed, checkpoint_map, confirm_source_bytes, find_orphan_with_hash,
-    finish_after_commit, hosted_facts_ok, now_ms, open_session, read_committed,
-    require_hosted_object, take_cancel, validate_hook_names, write_control, write_journal,
-    CancelRequest, HookRun, Hooks, RECOGNIZED_INJECTS,
+    already_committed, checkpoint_map, confirm_source_bytes, find_orphan_with_hash_with_cipher,
+    finish_after_commit, hosted_facts_ok, now_ms, open_session_with_auth,
+    read_committed_with_cipher, require_hosted_object_with_cipher, take_cancel,
+    validate_hook_names, write_control, CancelRequest, HookRun, Hooks, VaultBannerKind,
+    RECOGNIZED_INJECTS,
 };
 
 const STOPS: &[&str] = &[
@@ -45,6 +47,7 @@ pub struct FragmentRequest {
     pub command_id: String,
     pub fragment: PathBuf,
     pub batch_id: Option<String>,
+    pub auth: AuthInput,
     pub hooks: Hooks,
 }
 
@@ -58,8 +61,8 @@ pub fn submit_fragment(req: FragmentRequest) -> Report {
     }
 }
 
-pub fn query_candidates(vault: &Path, source_id: Option<String>) -> Report {
-    match query_inner(vault, source_id.as_deref()) {
+pub fn query_candidates(vault: &Path, source_id: Option<String>, auth: AuthInput) -> Report {
+    match query_inner(vault, source_id.as_deref(), &auth) {
         Ok(body) => as_body_slice(Report {
             code: body.0,
             body: body.1,
@@ -72,7 +75,7 @@ fn require_body_format(vault: &Path) -> Result<(), Fail> {
     super::guard_vault(vault)?;
     match super::accept_wal_format(&vault.join("vault.db"))? {
         1 => Err(needs_upgrade()),
-        2 | 3 => Ok(()),
+        2 | 3 | 6 => Ok(()),
         4 => Err(Fail::new(
             EXIT_VERSION,
             "VersionUnsupported",
@@ -108,7 +111,11 @@ fn needs_upgrade() -> Fail {
 fn as_body_slice(mut report: Report) -> Report {
     if let Some(map) = report.body.as_object_mut() {
         let slice = map.get("slice").and_then(|value| value.as_str());
-        if slice != Some("T3-facts") && slice != Some("T4-html") && slice != Some("T5-pdf") {
+        if slice != Some("T3-facts")
+            && slice != Some("T4-html")
+            && slice != Some("T5-pdf")
+            && slice != Some("M4-real")
+        {
             map.insert("slice".into(), json!("T2a-body"));
         }
     }
@@ -132,15 +139,20 @@ pub fn cancel_fragment(req: CancelRequest) -> Result<Report, Fail> {
         return cancel_while_busy(&req);
     };
     let _lock = lock;
-    super::guard_vault(&req.vault)?;
-    match super::accept_wal_format(&req.vault.join("vault.db")) {
+    let (_, banner) = super::vault_shape(&req.vault)?;
+    let version = match super::accept_wal_format_with_banner(&req.vault.join("vault.db"), banner) {
         Ok(1) => return Err(needs_upgrade().extra("cancel_applied", json!(false))),
-        Ok(_) => {}
+        Ok(version) => version,
         Err(fail) => return Err(fail.extra("cancel_applied", json!(false))),
-    }
+    };
     let conn = super::open_writer(&req.vault)?;
-    if let Some(existing) =
-        store::command(&conn, &req.command_id).map_err(|err| unseen_db(err, "command_lookup"))?
+    let protection = match banner {
+        VaultBannerKind::Synthetic => None,
+        VaultBannerKind::Production(mode) => Some(mode),
+    };
+    let cipher = super::unlock_cipher(&conn, version, protection, &req.auth)?;
+    if let Some(existing) = store::command_with_cipher(&conn, &req.command_id, &cipher)
+        .map_err(|err| unseen_db(err, "command_lookup"))?
     {
         let mut body = already_committed(&existing)?;
         if let Some(map) = body.as_object_mut() {
@@ -156,7 +168,7 @@ pub fn cancel_fragment(req: CancelRequest) -> Result<Report, Fail> {
     if !path.exists() {
         return Err(refused("unknown_command").extra("cancel_applied", json!(false)));
     }
-    let mut journal = journal::read_file(&path).map_err(|_| {
+    let mut journal = journal::read_file_with_cipher(&path, &cipher).map_err(|_| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
@@ -166,13 +178,13 @@ pub fn cancel_fragment(req: CancelRequest) -> Result<Report, Fail> {
     if journal.generation != req.generation {
         return Err(refused("generation_mismatch").extra("cancel_applied", json!(false)));
     }
-    let preserved = source_is_preserved(&conn, journal.source_id.as_deref())?;
+    let preserved = source_is_preserved(&conn, journal.source_id.as_deref(), &cipher)?;
     if let Some(attempt) = running_attempt(&conn, &req.command_id)? {
-        set_attempt(&conn, &attempt, "cancelled", 0, "cancelled")?;
+        set_attempt(&conn, &attempt, "cancelled", 0, "cancelled", &cipher)?;
     }
     journal.state = "aborted".into();
     journal.reason = Some("cancelled".into());
-    write_journal(&req.vault, &journal)?;
+    journal::write_with_cipher(&req.vault, &journal, &cipher)?;
     let _ = fs::remove_file(req.vault.join("control").join(&req.command_id));
     Ok(Report {
         code: EXIT_OK,
@@ -231,26 +243,27 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
             ),
         );
     }
-    let session = open_session(&req.vault)?;
+    let session = open_session_with_auth(&req.vault, &req.auth)?;
     let mut hooks = HookRun::new(req.hooks.clone());
-    if let Some(existing) = store::command(&session.conn, &req.command_id)
-        .map_err(|err| unseen_db(err, "command_lookup"))?
+    if let Some(existing) =
+        store::command_with_cipher(&session.conn, &req.command_id, &session.cipher)
+            .map_err(|err| unseen_db(err, "command_lookup"))?
     {
         if req.hooks.stop_at.is_some() || req.hooks.inject_point.is_some() {
             return Err(missed("command_already_committed"));
         }
         return replay_command(&session, &req, &existing);
     }
-    super::decide::reject_if_t3_command(&session.conn, &req.command_id)?;
+    super::decide::reject_if_t3_command(&session.conn, &req.command_id, &session.cipher)?;
     let format = store::user_version(&session.conn).map_err(|err| db_fail(err, "user_version"))?;
-    if format == 3 {
+    if format == 3 || format == 6 {
         super::decide::require_fact_tables(&session.conn)?;
     }
     hooks.stop(
         "before_journal",
         checkpoint_map(&req.command_id, 0, Some(stat_len), None, false, false),
     )?;
-    let mut journal = load_journal(&session.root, &req)?;
+    let mut journal = load_journal(&session.root, &req, &session.cipher)?;
     hooks.stop(
         "before_copy",
         checkpoint_map(&req.command_id, 0, Some(stat_len), None, false, false),
@@ -267,17 +280,27 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
     let text = match body::prepare(&bytes) {
         Ok(text) => text.to_string(),
         Err(InputError::InvalidUtf8 { bytes_read }) => {
-            abort_journal(&session.root, &mut journal, "invalid_utf8")?;
+            abort_journal(&session.root, &mut journal, "invalid_utf8", &session.cipher)?;
             return Err(refused("invalid_utf8")
                 .extra("bytes_read", json!(bytes_read))
                 .extra("preservation", json!(NOT_PRESERVED)));
         }
         Err(InputError::Empty) => {
-            abort_journal(&session.root, &mut journal, "empty_fragment")?;
+            abort_journal(
+                &session.root,
+                &mut journal,
+                "empty_fragment",
+                &session.cipher,
+            )?;
             return Err(refused("empty_fragment").extra("bytes_read", json!(0)));
         }
         Err(InputError::OverBudget { stat_size }) => {
-            abort_journal(&session.root, &mut journal, "over_input_budget")?;
+            abort_journal(
+                &session.root,
+                &mut journal,
+                "over_input_budget",
+                &session.cipher,
+            )?;
             return Err(refused("over_input_budget")
                 .extra("bytes_read", json!(0))
                 .extra("stat_size", json!(stat_size)));
@@ -290,16 +313,26 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
     journal.byte_length = Some(bytes.len() as i64);
     journal.payload_fingerprint = Some(key.clone());
     journal.media_type = Some(body::MEDIA_TYPE.into());
-    write_journal(&session.root, &journal)?;
+    journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
 
-    if let Some(source) =
-        store::source_by_hash(&session.conn, &hash).map_err(|err| db_fail(err, "source_lookup"))?
+    if let Some(source) = store::source_by_hash_with_cipher(
+        &session.conn,
+        session.vault_format,
+        &hash,
+        &session.cipher,
+    )
+    .map_err(|err| db_fail(err, "source_lookup"))?
     {
         confirm_source_bytes(&session, &source, &req.command_id)?;
         if source.media_type != body::MEDIA_TYPE
             || version_for(&session.conn, &source.source_id)?.is_none()
         {
-            abort_journal(&session.root, &mut journal, "not_a_submitted_fragment")?;
+            abort_journal(
+                &session.root,
+                &mut journal,
+                "not_a_submitted_fragment",
+                &session.cipher,
+            )?;
             return Err(refused("not_a_submitted_fragment")
                 .extra("preservation", json!(PRESERVED))
                 .extra("object_intact", json!(true))
@@ -309,8 +342,8 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
         }
     }
 
-    let object = place_object(&session.root, &session.conn, &bytes, &hash, &mut journal)?;
-    let opened = open_attempt(&session.conn, &req, &journal, &object, &hash, &key)?;
+    let object = place_object(&session, &bytes, &hash, &mut journal)?;
+    let opened = open_attempt(&session, &req, &journal, &object, &hash, &key)?;
     // open_attempt has committed the source row. Every return from here on,
     // including the object_ready journal write, uses that boundary. Failures
     // before this line, including body_schema, stay outside it.
@@ -333,7 +366,7 @@ fn submit_inner(req: FragmentRequest) -> Result<Value, Fail> {
             ),
         )
         .map_err(&bound)?;
-    write_journal(&session.root, &journal).map_err(&bound)?;
+    journal::write_with_cipher(&session.root, &journal, &session.cipher).map_err(&bound)?;
     continue_after_source(
         &session,
         &req,
@@ -365,17 +398,9 @@ fn continue_after_source(
         if req.hooks.stop_at.is_some() {
             return Err(missed("run_already_succeeded"));
         }
-        let receipt = publish_replay(
-            &session.root,
-            &session.conn,
-            req,
-            journal,
-            opened,
-            hash,
-            hooks,
-        )?;
+        let receipt = publish_replay(session, req, journal, opened, hash, hooks)?;
         hook_reached(hooks)?;
-        return finish_journal(&session.root, journal, receipt);
+        return finish_journal(&session.root, journal, receipt, &session.cipher);
     }
 
     let drafts = match body::extract(text) {
@@ -399,11 +424,18 @@ fn continue_after_source(
                 ExtractError::OverLine => "over_line",
                 ExtractError::TooMany => "too_many_candidates",
             };
-            set_attempt(&session.conn, &opened.attempt_id, "failed", 0, reason)?;
+            set_attempt(
+                &session.conn,
+                &opened.attempt_id,
+                "failed",
+                0,
+                reason,
+                &session.cipher,
+            )?;
             set_run_status(&session.conn, &opened.run_id, "failed")?;
             journal.state = "aborted".into();
             journal.reason = Some(reason.into());
-            write_journal(&session.root, journal)?;
+            journal::write_with_cipher(&session.root, journal, &session.cipher)?;
             return Err(refused(reason)
                 .extra("preservation", json!(PRESERVED))
                 .extra("object_intact", json!(true))
@@ -442,6 +474,7 @@ fn continue_after_source(
             "cancelled",
             0,
             "cancelled",
+            &session.cipher,
         )?;
         set_run_status(&session.conn, &opened.run_id, "cancelled")?;
         return finish_cancel(session, journal, Some(opened));
@@ -452,7 +485,7 @@ fn continue_after_source(
         Err(fail) => return Err(note_status_writes(session, journal, opened, fail)),
     };
     hook_reached(hooks)?;
-    finish_journal(&session.root, journal, receipt)
+    finish_journal(&session.root, journal, receipt, &session.cipher)
 }
 
 /// The source row survived. This call's error does not relabel it.
@@ -497,6 +530,7 @@ fn note_status_writes(
         "failed",
         0,
         fail.reason.as_str(),
+        &session.cipher,
     );
     let run = set_run_status(&session.conn, &opened.run_id, "failed");
     if attempt.is_err() {
@@ -508,7 +542,7 @@ fn note_status_writes(
     if attempt.is_ok() && run.is_ok() {
         journal.state = "aborted".into();
         journal.reason = Some(fail.reason.clone());
-        if write_journal(&session.root, journal).is_err() {
+        if journal::write_with_cipher(&session.root, journal, &session.cipher).is_err() {
             fail = fail.extra("journal_update", json!("failed"));
         }
     }
@@ -536,19 +570,27 @@ struct Opened {
 }
 
 fn open_attempt(
-    conn: &Connection,
+    session: &super::Session,
     req: &FragmentRequest,
     journal: &Journal,
     object: &ObjectRow,
     hash: &str,
     key: &str,
 ) -> Result<Opened, Fail> {
-    let tx = conn
+    let tx = session
+        .conn
         .unchecked_transaction()
         .map_err(|err| db_fail(err, "begin"))?;
-    let source = ensure_source(&tx, journal, object, hash)?;
-    let version = ensure_version(&tx, &source, hash)?;
-    let existing = run_by_key(&tx, key)?;
+    let source = ensure_source(
+        &tx,
+        session.vault_format,
+        journal,
+        object,
+        hash,
+        &session.cipher,
+    )?;
+    let version = ensure_version(&tx, &source, hash, &session.cipher)?;
+    let existing = run_by_key(&tx, key, &session.cipher)?;
     let opened = if let Some(run) = existing {
         if run.status == "succeeded" {
             let ids = candidate_ids(&tx, &run.run_id)?;
@@ -563,7 +605,7 @@ fn open_attempt(
                 candidate_ids: ids,
             }
         } else {
-            insert_occurrence_if_absent(&tx, req, journal, &source)?;
+            insert_occurrence_if_absent(&tx, req, journal, &source, &session.cipher)?;
             tx.execute(
                 "UPDATE extraction_attempts SET status = 'abandoned', published = 0 WHERE run_id = ?1 AND status = 'running'",
                 [&run.run_id],
@@ -578,6 +620,7 @@ fn open_attempt(
                 attempt_no,
                 &req.command_id,
                 "running",
+                &session.cipher,
             )?;
             tx.execute(
                 "UPDATE extraction_runs SET status = 'open' WHERE run_id = ?1",
@@ -596,14 +639,15 @@ fn open_attempt(
             }
         }
     } else {
-        insert_occurrence_if_absent(&tx, req, journal, &source)?;
+        insert_occurrence_if_absent(&tx, req, journal, &source, &session.cipher)?;
         let run_id = ids::random_id("run_").map_err(|err| io_fail(err, "random"))?;
         let attempt_id = ids::random_id("att_").map_err(|err| io_fail(err, "random"))?;
+        let stored_key = session.cipher.dedup_key("logical_key", key);
         tx.execute(
             "INSERT INTO extraction_runs(run_id, logical_key, source_version_id, source_id, extractor, extractor_version, normalization, join_version, rules_version, config_json, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'open')",
             params![
                 run_id,
-                key,
+                stored_key,
                 version,
                 source.source_id,
                 body::EXTRACTOR,
@@ -615,7 +659,15 @@ fn open_attempt(
             ],
         )
         .map_err(|err| db_fail(err, "insert_run"))?;
-        insert_attempt(&tx, &attempt_id, &run_id, 1, &req.command_id, "running")?;
+        insert_attempt(
+            &tx,
+            &attempt_id,
+            &run_id,
+            1,
+            &req.command_id,
+            "running",
+            &session.cipher,
+        )?;
         Opened {
             source_id: source.source_id,
             source_version_id: version,
@@ -640,7 +692,7 @@ fn publish(
     drafts: &[Draft],
     hooks: &mut HookRun,
 ) -> Result<Value, Fail> {
-    let source = store::source_by_id(&session.conn, &opened.source_id)
+    let source = store::source_by_id_with_cipher(&session.conn, &opened.source_id, &session.cipher)
         .map_err(|err| db_fail(err, "source_lookup"))?
         .ok_or_else(|| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_row_missing")
@@ -670,7 +722,7 @@ fn publish(
             .extra("late", json!(true))
             .extra("source_id", json!(opened.source_id)));
     }
-    if store::command(&tx, &req.command_id)
+    if store::command_with_cipher(&tx, &req.command_id, &session.cipher)
         .map_err(|err| db_fail(err, "command_recheck"))?
         .is_some()
     {
@@ -680,6 +732,28 @@ fn publish(
     for (ordinal, draft) in drafts.iter().enumerate() {
         let candidate_id = ids::random_id("cand_").map_err(|err| io_fail(err, "random"))?;
         let locator = locator_json(&opened.source_version_id, hash, draft);
+        let enc_excerpt = session
+            .cipher
+            .encrypt_field("candidates", &candidate_id, "excerpt", &draft.excerpt)
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+        let enc_value = session
+            .cipher
+            .encrypt_field(
+                "candidates",
+                &candidate_id,
+                "value_json",
+                &Value::Object(draft.value.clone()).to_string(),
+            )
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+        let enc_locator = session
+            .cipher
+            .encrypt_field(
+                "candidates",
+                &candidate_id,
+                "locator_json",
+                &locator.to_string(),
+            )
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
         tx.execute(
             "INSERT INTO candidates(candidate_id, run_id, attempt_id, source_version_id, ordinal, kind, usable, excerpt, value_json, locator_json, adopted) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
             params![
@@ -690,16 +764,17 @@ fn publish(
                 ordinal as i64,
                 draft.kind,
                 if draft.usable { 1 } else { 0 },
-                draft.excerpt,
-                Value::Object(draft.value.clone()).to_string(),
-                locator.to_string()
+                enc_excerpt,
+                enc_value,
+                enc_locator
             ],
         )
         .map_err(|err| db_fail(err, "insert_candidate"))?;
         ids.push(candidate_id);
     }
     let format = store::user_version(&tx).map_err(|err| db_fail(err, "user_version"))?;
-    let adopted = if format == 3 {
+    let adopt_facts = format == 3 || format == 6;
+    let adopted = if adopt_facts {
         let stated: Vec<super::decide::StatedDraft<'_>> = ids
             .iter()
             .zip(drafts.iter())
@@ -721,13 +796,23 @@ fn publish(
             &opened.run_id,
             body::RULES_VERSION,
             &stated,
+            &session.cipher,
         )?
     } else {
         Vec::new()
     };
+    let enc_detail = session
+        .cipher
+        .encrypt_field(
+            "extraction_attempts",
+            &opened.attempt_id,
+            "detail_json",
+            &json!({"reason": "published"}).to_string(),
+        )
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_attempt"))?;
     tx.execute(
         "UPDATE extraction_attempts SET status = 'succeeded', published = 1, detail_json = ?2 WHERE attempt_id = ?1 AND status = 'running'",
-        params![opened.attempt_id, json!({"reason": "published"}).to_string()],
+        params![opened.attempt_id, enc_detail],
     )
     .map_err(|err| db_fail(err, "finish_attempt"))?;
     tx.execute(
@@ -736,8 +821,14 @@ fn publish(
     )
     .map_err(|err| db_fail(err, "finish_run"))?;
     let mut receipt = success_receipt(req, journal, opened, hash, &ids, true);
-    if format == 3 {
-        attach_stated(&mut receipt, &adopted, true);
+    if adopt_facts {
+        attach_stated(
+            &mut receipt,
+            &adopted,
+            true,
+            session.vault_format,
+            session.protection,
+        );
     }
     hooks.inject(
         "result_encode",
@@ -752,7 +843,7 @@ fn publish(
     )?;
     let encoded = serde_json::to_string(&receipt)
         .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
-    store::insert_command(
+    store::insert_command_with_cipher(
         &tx,
         &CommandRow {
             command_id: req.command_id.clone(),
@@ -762,15 +853,16 @@ fn publish(
             outcome: "Committed".into(),
         },
         now_ms(),
+        &session.cipher,
     )
     .map_err(|err| db_fail(err, "insert_command"))?;
-    let t3_canonical = if format == 3 {
+    let t3_canonical = if adopt_facts {
         let key = journal.payload_fingerprint.clone().ok_or_else(|| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "logical_key_missing")
                 .extra("new_effect", json!(false))
         })?;
         let canonical = super::decide::fragment_canonical(hash, &key, "created");
-        super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+        super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded, &session.cipher)?;
         Some(canonical)
     } else {
         None
@@ -800,6 +892,7 @@ fn publish(
             receipt,
             tx,
             hooks,
+            &session.cipher,
         );
     }
     match tx.commit() {
@@ -813,8 +906,7 @@ fn publish(
 }
 
 fn publish_replay(
-    root: &Path,
-    conn: &Connection,
+    session: &super::Session,
     req: &FragmentRequest,
     journal: &Journal,
     opened: &Opened,
@@ -832,13 +924,21 @@ fn publish_replay(
             true,
         ),
     )?;
-    let format = store::user_version(conn).map_err(|err| db_fail(err, "user_version"))?;
-    let tx = conn
+    let format = store::user_version(&session.conn).map_err(|err| db_fail(err, "user_version"))?;
+    let adopt_facts = format == 3 || format == 6;
+    let tx = session
+        .conn
         .unchecked_transaction()
         .map_err(|err| db_fail(err, "begin"))?;
     let mut receipt = success_receipt(req, journal, opened, hash, &opened.candidate_ids, false);
-    if format == 3 {
-        attach_stated(&mut receipt, &[], false);
+    if adopt_facts {
+        attach_stated(
+            &mut receipt,
+            &[],
+            false,
+            session.vault_format,
+            session.protection,
+        );
     }
     let mut replay = receipt.clone();
     if let Some(map) = replay.as_object_mut() {
@@ -859,7 +959,7 @@ fn publish_replay(
     )?;
     let encoded = serde_json::to_string(&replay)
         .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
-    store::insert_command(
+    store::insert_command_with_cipher(
         &tx,
         &CommandRow {
             command_id: req.command_id.clone(),
@@ -869,22 +969,23 @@ fn publish_replay(
             outcome: "AlreadyPublished".into(),
         },
         now_ms(),
+        &session.cipher,
     )
     .map_err(|err| db_fail(err, "insert_command"))?;
-    let t3_canonical = if format == 3 {
+    let t3_canonical = if adopt_facts {
         let key = journal.payload_fingerprint.clone().ok_or_else(|| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "logical_key_missing")
                 .extra("new_effect", json!(false))
         })?;
         let canonical = super::decide::fragment_canonical(hash, &key, "already");
-        super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded)?;
+        super::decide::insert_receipt(&tx, &req.command_id, &canonical, &encoded, &session.cipher)?;
         Some(canonical)
     } else {
         None
     };
     if let Some(canonical) = t3_canonical {
         return settle_v3_commit(
-            root,
+            &session.root,
             &req.command_id,
             &canonical,
             hash,
@@ -894,6 +995,7 @@ fn publish_replay(
             replay,
             tx,
             hooks,
+            &session.cipher,
         );
     }
     tx.commit().map_err(|err| db_fail(err, "replay_commit"))?;
@@ -913,7 +1015,7 @@ enum V3Absent {
     Replay,
 }
 
-/// Format 3 only. The receipt read uses `t3_receipts`, not `commands`.
+/// Format 3 / 6. The receipt read uses `t3_receipts`, not `commands`.
 #[allow(clippy::too_many_arguments)]
 fn settle_v3_commit(
     root: &Path,
@@ -926,6 +1028,7 @@ fn settle_v3_commit(
     receipt: Value,
     tx: Transaction<'_>,
     hooks: &mut HookRun,
+    cipher: &VaultCipher,
 ) -> Result<Value, Fail> {
     let db = root.join("vault.db");
     match take_v3_commit_probe(hooks)? {
@@ -941,6 +1044,7 @@ fn settle_v3_commit(
                 absent,
                 &err.to_string(),
                 false,
+                cipher,
             ),
         },
         V3Probe::Absent => {
@@ -955,6 +1059,7 @@ fn settle_v3_commit(
                 absent,
                 super::decide::SIMULATED_COMMIT_ERROR,
                 true,
+                cipher,
             )
         }
         V3Probe::Visible => match tx.commit() {
@@ -968,6 +1073,7 @@ fn settle_v3_commit(
                 absent,
                 super::decide::SIMULATED_COMMIT_ERROR,
                 true,
+                cipher,
             ),
             Err(err) => classify_v3_commit(
                 &db,
@@ -979,6 +1085,7 @@ fn settle_v3_commit(
                 absent,
                 &err.to_string(),
                 false,
+                cipher,
             ),
         },
         V3Probe::Unreadable => match tx.commit() {
@@ -994,6 +1101,7 @@ fn settle_v3_commit(
                     absent,
                     super::decide::SIMULATED_COMMIT_ERROR,
                     true,
+                    cipher,
                 )
             }
             Err(err) => classify_v3_commit(
@@ -1006,6 +1114,7 @@ fn settle_v3_commit(
                 absent,
                 &err.to_string(),
                 false,
+                cipher,
             ),
         },
         V3Probe::Unseen => match tx.commit() {
@@ -1019,6 +1128,7 @@ fn settle_v3_commit(
                 absent,
                 super::decide::SIMULATED_COMMIT_ERROR,
                 true,
+                cipher,
             ),
             Err(err) => classify_v3_commit(
                 &db,
@@ -1030,6 +1140,7 @@ fn settle_v3_commit(
                 absent,
                 &err.to_string(),
                 false,
+                cipher,
             ),
         },
     }
@@ -1078,8 +1189,9 @@ fn classify_v3_commit(
     absent: V3Absent,
     commit_error: &str,
     injected: bool,
+    cipher: &VaultCipher,
 ) -> Result<Value, Fail> {
-    let read = match super::decide::read_t3_receipt_wal(db, command_id) {
+    let read = match super::decide::read_t3_receipt_wal(db, command_id, cipher) {
         Ok(read) => read,
         Err(_) => {
             return Err(fragment_receipt_unseen(
@@ -1167,7 +1279,10 @@ fn accepted_fragment_result(
     if map.get("candidates_published") != Some(&Value::Bool(true)) {
         return None;
     }
-    if map.get("slice").and_then(Value::as_str) != Some("T3-facts") {
+    if !matches!(
+        map.get("slice").and_then(Value::as_str),
+        Some("T3-facts" | "M4-real")
+    ) {
         return None;
     }
     let facts_published = map.get("facts_published").and_then(Value::as_bool)?;
@@ -1285,36 +1400,38 @@ fn success_receipt(
     Value::Object(body)
 }
 
-fn query_inner(vault: &Path, source_id: Option<&str>) -> Result<(i32, Value), Fail> {
+fn query_inner(
+    vault: &Path,
+    source_id: Option<&str>,
+    auth: &AuthInput,
+) -> Result<(i32, Value), Fail> {
     if let Some(id) = source_id {
         if !is_prefixed_id(id, "src_") {
             return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
         }
     }
-    super::guard_vault(vault)?;
-    let uri = super::wal_visible_uri(&vault.join("vault.db"))?;
-    let conn = Connection::open_with_flags(
-        &uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|err| unseen_db(err, "candidates_open"))?;
-    super::accept_connection_format(&vault.join("vault.db"), &conn)?;
-    read_candidates(vault, &conn, source_id)
+    let (conn, _version, protection, cipher) = super::open_readonly_unlocked(vault, auth)?;
+    read_candidates(vault, &conn, source_id, &cipher, protection)
 }
 
 pub(super) fn read_candidates(
     vault: &Path,
     conn: &Connection,
     source_id: Option<&str>,
+    cipher: &VaultCipher,
+    protection: Option<ProtectionMode>,
 ) -> Result<(i32, Value), Fail> {
     let schema = store::meta(conn, "body_schema").map_err(|err| unseen_db(err, "body_schema"))?;
     let html_schema =
         store::meta(conn, "html_body_schema").map_err(|err| unseen_db(err, "html_body_schema"))?;
     let pdf_schema =
         store::meta(conn, "pdf_body_schema").map_err(|err| unseen_db(err, "pdf_body_schema"))?;
+    let real_schema =
+        store::meta(conn, "real_body_schema").map_err(|err| unseen_db(err, "real_body_schema"))?;
     let html = schema.is_none() && html_schema.as_deref() == Some(store::HTML_BODY_SCHEMA);
     let pdf = schema.is_none() && pdf_schema.as_deref() == Some(store::PDF_BODY_SCHEMA);
-    if schema.is_none() && !html && !pdf {
+    let real = schema.is_none() && real_schema.as_deref() == Some(store::REAL_BODY_SCHEMA);
+    if schema.is_none() && !html && !pdf && !real {
         let mut body = body_outcome("Candidates");
         body.insert("new_effect".into(), json!(false));
         body.insert("body_schema".into(), Value::Null);
@@ -1323,7 +1440,7 @@ pub(super) fn read_candidates(
         body.insert("read_only".into(), json!(true));
         return Ok((EXIT_OK, Value::Object(body)));
     }
-    if !html && !pdf && schema.as_deref() != Some(store::BODY_SCHEMA) {
+    if !html && !pdf && !real && schema.as_deref() != Some(store::BODY_SCHEMA) {
         return Err(refused("body_schema_unsupported").extra("new_effect", json!(false)));
     }
     for name in store::BODY_TABLES {
@@ -1336,7 +1453,7 @@ pub(super) fn read_candidates(
     }
     let mut stmt = conn
         .prepare(
-            "SELECT c.candidate_id, c.run_id, c.attempt_id, c.ordinal, c.kind, c.usable, c.excerpt, c.value_json, c.locator_json, c.adopted, sv.source_id, sv.object_id, sv.content_sha256, sv.byte_length, sv.role, sv.eml, r.status FROM candidates c JOIN source_versions sv ON sv.source_version_id = c.source_version_id JOIN extraction_runs r ON r.run_id = c.run_id WHERE (?1 IS NULL OR sv.source_id = ?1) ORDER BY sv.source_id, c.ordinal",
+            "SELECT c.candidate_id, c.run_id, c.attempt_id, c.ordinal, c.kind, c.usable, c.excerpt, c.value_json, c.locator_json, c.adopted, sv.source_id, sv.object_id, sv.content_sha256, sv.byte_length, sv.role, sv.eml, r.status, sv.source_version_id FROM candidates c JOIN source_versions sv ON sv.source_version_id = c.source_version_id JOIN extraction_runs r ON r.run_id = c.run_id WHERE (?1 IS NULL OR sv.source_id = ?1) ORDER BY sv.source_id, c.ordinal",
         )
         .map_err(|err| unseen_db(err, "candidates"))?;
     let rows = stmt
@@ -1359,6 +1476,7 @@ pub(super) fn read_candidates(
                 row.get::<_, String>(14)?,
                 row.get::<_, i64>(15)?,
                 row.get::<_, String>(16)?,
+                row.get::<_, String>(17)?,
             ))
         })
         .map_err(|err| unseen_db(err, "candidates"))?;
@@ -1368,25 +1486,40 @@ pub(super) fn read_candidates(
     let mut seen = std::collections::BTreeMap::<String, bool>::new();
     for row in rows {
         let row = row.map_err(|err| unseen_db(err, "candidates"))?;
+        let plain_sv_hash = cipher
+            .decrypt_field("source_versions", &row.17, "content_sha256", &row.12)
+            .map_err(|err| {
+                cipher_tamper_fail(err, "candidates").extra("source_version_id", json!(row.17))
+            })?;
         let object_id = row.11.clone();
         let intact = if let Some(flag) = seen.get(&object_id) {
             *flag
         } else {
-            let facts = crate::facts::object_facts(
+            let facts = crate::facts::object_facts_with_cipher(
                 vault,
                 &object_id,
                 Some(&format!("objects/{object_id}")),
-                &row.12,
+                &plain_sv_hash,
                 row.13,
+                cipher,
             );
             let ok = hosted_facts_ok(&facts).is_ok();
             if !ok {
                 damaged = facts.missing
+                    || facts.auth_error.is_some()
                     || !facts.hash_matches
                     || !facts.length_matches
                     || facts.id_rejected;
                 alerts.push(json!({
-                    "code": if facts.io_error.is_some() { "object_unreadable" } else if facts.missing { "object_missing" } else { "hash_mismatch" },
+                    "code": if facts.io_error.is_some() {
+                        "object_unreadable"
+                    } else if facts.missing {
+                        "object_missing"
+                    } else if facts.auth_error.is_some() {
+                        "ciphertext_auth_failed"
+                    } else {
+                        "hash_mismatch"
+                    },
                     "source_id": row.10,
                     "object_id": object_id,
                 }));
@@ -1397,7 +1530,22 @@ pub(super) fn read_candidates(
         if !intact {
             continue;
         }
-        let value = match serde_json::from_str::<Value>(&row.7) {
+        let plain_excerpt = cipher
+            .decrypt_field("candidates", &row.0, "excerpt", &row.6)
+            .map_err(|err| {
+                cipher_tamper_fail(err, "candidates").extra("candidate_id", json!(row.0))
+            })?;
+        let plain_value_str = cipher
+            .decrypt_field("candidates", &row.0, "value_json", &row.7)
+            .map_err(|err| {
+                cipher_tamper_fail(err, "candidates").extra("candidate_id", json!(row.0))
+            })?;
+        let plain_locator_str = cipher
+            .decrypt_field("candidates", &row.0, "locator_json", &row.8)
+            .map_err(|err| {
+                cipher_tamper_fail(err, "candidates").extra("candidate_id", json!(row.0))
+            })?;
+        let value = match serde_json::from_str::<Value>(&plain_value_str) {
             Ok(value) => Some(value),
             Err(_) => {
                 damaged = true;
@@ -1409,7 +1557,7 @@ pub(super) fn read_candidates(
                 None
             }
         };
-        let locator = match serde_json::from_str::<Value>(&row.8) {
+        let locator = match serde_json::from_str::<Value>(&plain_locator_str) {
             Ok(value) => Some(value),
             Err(_) => {
                 damaged = true;
@@ -1431,13 +1579,13 @@ pub(super) fn read_candidates(
             "ordinal": row.3,
             "kind": row.4,
             "usable": row.5 == 1,
-            "excerpt": row.6,
+            "excerpt": plain_excerpt,
             "value": value,
             "locator": locator,
             "adopted": row.9 == 1,
             "source_id": row.10,
             "object_id": row.11,
-            "content_sha256": row.12,
+            "content_sha256": plain_sv_hash,
             "role": row.14,
             "eml": if row.15 == 0 { Value::Null } else { json!(true) },
             "run_status": row.16,
@@ -1458,11 +1606,16 @@ pub(super) fn read_candidates(
         candidates.push(item);
     }
     drop(stmt);
-    let runs = list_runs(conn, source_id, &mut alerts, &mut damaged)?;
+    let runs = list_runs(conn, source_id, cipher, &mut alerts, &mut damaged)?;
     let mut body = body_outcome("Candidates");
     body.insert("new_effect".into(), json!(false));
     body.insert("read_only".into(), json!(true));
-    if pdf {
+    if real {
+        body.insert("slice".into(), json!("M4-real"));
+        body.insert("body_schema".into(), Value::Null);
+        body.insert("real_body_schema".into(), json!(store::REAL_BODY_SCHEMA));
+        apply_format_honesty(&mut body, 6, protection);
+    } else if pdf {
         body.insert("slice".into(), json!("T5-pdf"));
         body.insert("body_schema".into(), Value::Null);
         body.insert("pdf_body_schema".into(), json!(store::PDF_BODY_SCHEMA));
@@ -1490,6 +1643,7 @@ pub(super) fn read_candidates(
 fn list_runs(
     conn: &Connection,
     source_id: Option<&str>,
+    cipher: &VaultCipher,
     alerts: &mut Vec<Value>,
     damaged: &mut bool,
 ) -> Result<Value, Fail> {
@@ -1518,7 +1672,7 @@ fn list_runs(
     let mut runs = Vec::new();
     for row in rows {
         let row = row.map_err(|err| unseen_db(err, "runs"))?;
-        let attempts = list_attempts(conn, &row.0, alerts, damaged)?;
+        let attempts = list_attempts(conn, &row.0, cipher, alerts, damaged)?;
         let mut run = json!({
             "run_id": row.0,
             "logical_key": row.1,
@@ -1555,6 +1709,7 @@ fn list_runs(
 fn list_attempts(
     conn: &Connection,
     run_id: &str,
+    cipher: &VaultCipher,
     alerts: &mut Vec<Value>,
     damaged: &mut bool,
 ) -> Result<Value, Fail> {
@@ -1578,6 +1733,9 @@ fn list_attempts(
     let mut out = Vec::new();
     for row in rows {
         let row = row.map_err(|err| unseen_db(err, "attempts"))?;
+        let plain_detail = cipher
+            .decrypt_field("extraction_attempts", &row.0, "detail_json", &row.5)
+            .map_err(|err| cipher_tamper_fail(err, "attempts").extra("attempt_id", json!(row.0)))?;
         let mut attempt = json!({
             "attempt_id": row.0,
             "attempt_no": row.1,
@@ -1585,7 +1743,7 @@ fn list_attempts(
             "status": row.3,
             "published": row.4 == 1
         });
-        match serde_json::from_str::<Value>(&row.5) {
+        match serde_json::from_str::<Value>(&plain_detail) {
             Ok(detail) => {
                 attempt
                     .as_object_mut()
@@ -1607,6 +1765,24 @@ fn list_attempts(
 }
 
 fn ensure_schema(conn: &Connection, hooks: &mut HookRun) -> Result<(), Fail> {
+    if store::meta(conn, "real_body_schema")
+        .map_err(|err| db_fail(err, "body_schema"))?
+        .as_deref()
+        == Some(store::REAL_BODY_SCHEMA)
+    {
+        if hooks.hooks.inject_point.as_deref() == Some("body_schema") {
+            return Err(missed("body_schema"));
+        }
+        for name in store::BODY_TABLES {
+            if !store::table_exists(conn, name).map_err(|err| db_fail(err, "body_schema"))? {
+                return Err(
+                    Fail::new(EXIT_RECOVERY, "RecoveryRequired", "body_schema_mismatch")
+                        .extra("new_effect", json!(false)),
+                );
+            }
+        }
+        return Ok(());
+    }
     let current = store::meta(conn, "body_schema").map_err(|err| db_fail(err, "body_schema"))?;
     match current.as_deref() {
         Some(store::BODY_SCHEMA) => {
@@ -1705,21 +1881,33 @@ fn read_capped(path: &Path, stat_len: u64) -> Result<Vec<u8>, Fail> {
 }
 
 fn place_object(
-    root: &Path,
-    conn: &Connection,
+    session: &super::Session,
     bytes: &[u8],
     hash: &str,
     journal: &mut Journal,
 ) -> Result<ObjectRow, Fail> {
-    if let Some(object) =
-        store::object_by_hash(conn, hash).map_err(|err| db_fail(err, "object_lookup"))?
+    if let Some(object) = store::object_by_hash_with_cipher(
+        &session.conn,
+        session.vault_format,
+        hash,
+        &session.cipher,
+    )
+    .map_err(|err| db_fail(err, "object_lookup"))?
     {
-        require_hosted_object(root, &object, hash, bytes.len() as i64)?;
+        require_hosted_object_with_cipher(
+            &session.root,
+            &object,
+            hash,
+            bytes.len() as i64,
+            &session.cipher,
+        )?;
         journal.storage_reused = Some(true);
         journal.object_id = Some(object.object_id.clone());
         return Ok(object);
     }
-    if let Some(orphan) = find_orphan_with_hash(root, conn, hash)? {
+    if let Some(orphan) =
+        find_orphan_with_hash_with_cipher(&session.root, &session.conn, hash, &session.cipher)?
+    {
         journal.storage_reused = Some(true);
         journal.object_id = Some(orphan.clone());
         return Ok(ObjectRow {
@@ -1734,15 +1922,20 @@ fn place_object(
         .clone()
         .filter(|id| is_prefixed_id(id, "obj_"))
         .unwrap_or_default();
-    if object_id.is_empty() || root.join("objects").join(&object_id).exists() {
+    if object_id.is_empty() || session.root.join("objects").join(&object_id).exists() {
         object_id = ids::random_id("obj_").map_err(|err| io_fail(err, "random"))?;
     }
-    let staging = journal::staging_path(root, &journal.command_id);
-    crate::fsutil::atomic_write(&staging, bytes).map_err(|err| io_fail(err, "write_staging"))?;
-    let dest = root.join("objects").join(&object_id);
+    let staging = journal::staging_path(&session.root, &journal.command_id);
+    let disk_bytes = session
+        .cipher
+        .encrypt_object_bytes(&object_id, bytes)
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_object"))?;
+    crate::fsutil::atomic_write(&staging, &disk_bytes)
+        .map_err(|err| io_fail(err, "write_staging"))?;
+    let dest = session.root.join("objects").join(&object_id);
     fs::hard_link(&staging, &dest).map_err(|err| io_fail(err, "publish_object"))?;
     crate::platform::sync_file(&dest).map_err(|err| io_fail(err, "object_fsync"))?;
-    crate::fsutil::fsync_dir(dest.parent().unwrap_or(root))
+    crate::fsutil::fsync_dir(dest.parent().unwrap_or(&session.root))
         .map_err(|err| io_fail(err, "object_dir_fsync"))?;
     let _ = fs::remove_file(&staging);
     journal.storage_reused = Some(false);
@@ -1758,29 +1951,33 @@ fn place_object(
 
 fn ensure_source(
     tx: &rusqlite::Transaction<'_>,
+    vault_format: i64,
     journal: &Journal,
     object: &ObjectRow,
     hash: &str,
+    cipher: &VaultCipher,
 ) -> Result<SourceRow, Fail> {
-    if let Some(source) =
-        store::source_by_hash(tx, hash).map_err(|err| db_fail(err, "source_lookup"))?
+    if let Some(source) = store::source_by_hash_with_cipher(tx, vault_format, hash, cipher)
+        .map_err(|err| db_fail(err, "source_lookup"))?
     {
         return Ok(source);
     }
-    if store::object_by_hash(tx, hash)
+    if store::object_by_hash_with_cipher(tx, vault_format, hash, cipher)
         .map_err(|err| db_fail(err, "object_recheck"))?
         .is_none()
     {
         let relpath =
             canonical_object_relpath(&object.object_id).ok_or_else(|| refused("bad_object_id"))?;
-        store::insert_object(
+        store::insert_object_with_cipher(
             tx,
+            vault_format,
             &ObjectRow {
                 object_id: object.object_id.clone(),
                 content_sha256: hash.into(),
                 byte_length: object.byte_length,
                 relpath,
             },
+            cipher,
         )
         .map_err(|err| db_fail(err, "insert_object"))?;
     }
@@ -1802,7 +1999,8 @@ fn ensure_source(
         media_type: body::MEDIA_TYPE.into(),
         user_marker: None,
     };
-    store::insert_source(tx, &source).map_err(|err| db_fail(err, "insert_source"))?;
+    store::insert_source_with_cipher(tx, vault_format, &source, cipher)
+        .map_err(|err| db_fail(err, "insert_source"))?;
     Ok(source)
 }
 
@@ -1810,14 +2008,18 @@ fn ensure_version(
     tx: &rusqlite::Transaction<'_>,
     source: &SourceRow,
     hash: &str,
+    cipher: &VaultCipher,
 ) -> Result<String, Fail> {
     if let Some(id) = version_for(tx, &source.source_id)? {
         return Ok(id);
     }
     let id = ids::random_id("sv_").map_err(|err| io_fail(err, "random"))?;
+    let stored_hash = cipher
+        .encrypt_field("source_versions", &id, "content_sha256", hash)
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_version"))?;
     tx.execute(
         "INSERT INTO source_versions(source_version_id, source_id, object_id, content_sha256, byte_length, media_type, role, eml) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
-        params![id, source.source_id, source.object_id, hash, source.byte_length, body::MEDIA_TYPE, body::ROLE],
+        params![id, source.source_id, source.object_id, stored_hash, source.byte_length, body::MEDIA_TYPE, body::ROLE],
     )
     .map_err(|err| db_fail(err, "insert_source_version"))?;
     Ok(id)
@@ -1838,6 +2040,7 @@ fn insert_occurrence_if_absent(
     req: &FragmentRequest,
     journal: &Journal,
     source: &SourceRow,
+    cipher: &VaultCipher,
 ) -> Result<(), Fail> {
     if occurrence_exists(tx, &req.command_id)? {
         return Ok(());
@@ -1846,7 +2049,7 @@ fn insert_occurrence_if_absent(
         .occurrence_id
         .clone()
         .ok_or_else(|| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "missing_occurrence_id"))?;
-    store::insert_occurrence(
+    store::insert_occurrence_with_cipher(
         tx,
         &OccurrenceRow {
             occurrence_id,
@@ -1861,6 +2064,7 @@ fn insert_occurrence_if_absent(
             storage_reused: journal.storage_reused.unwrap_or(false),
             recorded_at: now_ms(),
         },
+        cipher,
     )
     .map_err(|err| db_fail(err, "insert_occurrence"))?;
     Ok(())
@@ -1882,10 +2086,11 @@ struct RunRow {
     status: String,
 }
 
-fn run_by_key(conn: &Connection, key: &str) -> Result<Option<RunRow>, Fail> {
+fn run_by_key(conn: &Connection, key: &str, cipher: &VaultCipher) -> Result<Option<RunRow>, Fail> {
+    let stored_key = cipher.dedup_key("logical_key", key);
     conn.query_row(
         "SELECT run_id, status FROM extraction_runs WHERE logical_key = ?1",
-        [key],
+        [stored_key],
         |row| {
             Ok(RunRow {
                 run_id: row.get(0)?,
@@ -1915,10 +2120,14 @@ fn insert_attempt(
     attempt_no: i64,
     command_id: &str,
     status: &str,
+    cipher: &VaultCipher,
 ) -> Result<(), Fail> {
+    let enc_detail = cipher
+        .encrypt_field("extraction_attempts", attempt_id, "detail_json", "{}")
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_attempt"))?;
     conn.execute(
-        "INSERT INTO extraction_attempts(attempt_id, run_id, attempt_no, command_id, status, published, detail_json) VALUES (?1, ?2, ?3, ?4, ?5, 0, '{}')",
-        params![attempt_id, run_id, attempt_no, command_id, status],
+        "INSERT INTO extraction_attempts(attempt_id, run_id, attempt_no, command_id, status, published, detail_json) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+        params![attempt_id, run_id, attempt_no, command_id, status, enc_detail],
     )
     .map_err(|err| db_fail(err, "insert_attempt"))?;
     Ok(())
@@ -1956,13 +2165,22 @@ fn set_attempt(
     status: &str,
     published: i64,
     reason: &str,
+    cipher: &VaultCipher,
 ) -> Result<(), Fail> {
+    let enc_detail = cipher
+        .encrypt_field(
+            "extraction_attempts",
+            attempt_id,
+            "detail_json",
+            &json!({"reason": reason}).to_string(),
+        )
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_attempt"))?;
     let tx = conn
         .unchecked_transaction()
         .map_err(|err| db_fail(err, "begin"))?;
     tx.execute(
         "UPDATE extraction_attempts SET status = ?2, published = ?3, detail_json = ?4 WHERE attempt_id = ?1",
-        params![attempt_id, status, published, json!({"reason": reason}).to_string()],
+        params![attempt_id, status, published, enc_detail],
     )
     .map_err(|err| db_fail(err, "update_attempt"))?;
     tx.commit().map_err(|err| db_fail(err, "update_attempt"))?;
@@ -1992,19 +2210,23 @@ fn running_attempt(conn: &Connection, command_id: &str) -> Result<Option<String>
     .map_err(|err| db_fail(err, "attempt_lookup"))
 }
 
-fn source_is_preserved(conn: &Connection, source_id: Option<&str>) -> Result<bool, Fail> {
+fn source_is_preserved(
+    conn: &Connection,
+    source_id: Option<&str>,
+    cipher: &VaultCipher,
+) -> Result<bool, Fail> {
     let Some(source_id) = source_id else {
         return Ok(false);
     };
-    let found =
-        store::source_by_id(conn, source_id).map_err(|err| unseen_db(err, "source_lookup"))?;
+    let found = store::source_by_id_with_cipher(conn, source_id, cipher)
+        .map_err(|err| unseen_db(err, "source_lookup"))?;
     Ok(found.is_some())
 }
 
-fn load_journal(root: &Path, req: &FragmentRequest) -> Result<Journal, Fail> {
+fn load_journal(root: &Path, req: &FragmentRequest, cipher: &VaultCipher) -> Result<Journal, Fail> {
     let path = journal::path(root, &req.command_id);
     if path.exists() {
-        let journal = journal::read_file(&path).map_err(|_| {
+        let journal = journal::read_file_with_cipher(&path, cipher).map_err(|_| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
                 .extra("command_id", json!(req.command_id))
         })?;
@@ -2044,7 +2266,7 @@ fn load_journal(root: &Path, req: &FragmentRequest) -> Result<Journal, Fail> {
         marker_value: None,
         source_id: None,
     };
-    write_journal(root, &journal)?;
+    journal::write_with_cipher(root, &journal, cipher)?;
     Ok(journal)
 }
 
@@ -2070,7 +2292,7 @@ fn replay_command(
         .get("source_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if let Some(source) = store::source_by_id(&session.conn, source_id)
+    if let Some(source) = store::source_by_id_with_cipher(&session.conn, source_id, &session.cipher)
         .map_err(|err| unseen_db(err, "source_lookup"))?
     {
         confirm_source_bytes(session, &source, &req.command_id)?;
@@ -2136,9 +2358,9 @@ fn finish_cancel(
 ) -> Result<Value, Fail> {
     journal.state = "aborted".into();
     journal.reason = Some("cancelled".into());
-    write_journal(&session.root, journal)?;
-    let preserved =
-        opened.is_some() || source_is_preserved(&session.conn, journal.source_id.as_deref())?;
+    journal::write_with_cipher(&session.root, journal, &session.cipher)?;
+    let preserved = opened.is_some()
+        || source_is_preserved(&session.conn, journal.source_id.as_deref(), &session.cipher)?;
     let mut body = cancel_body(
         "Late",
         &journal.command_id,
@@ -2156,22 +2378,33 @@ fn finish_cancel(
     Ok(Value::Object(body))
 }
 
-fn abort_journal(root: &Path, journal: &mut Journal, reason: &str) -> Result<(), Fail> {
+fn abort_journal(
+    root: &Path,
+    journal: &mut Journal,
+    reason: &str,
+    cipher: &VaultCipher,
+) -> Result<(), Fail> {
     journal.state = "aborted".into();
     journal.reason = Some(reason.into());
-    write_journal(root, journal)
+    journal::write_with_cipher(root, journal, cipher)
 }
 
-fn finish_journal(root: &Path, journal: &mut Journal, receipt: Value) -> Result<Value, Fail> {
+fn finish_journal(
+    root: &Path,
+    journal: &mut Journal,
+    receipt: Value,
+    cipher: &VaultCipher,
+) -> Result<Value, Fail> {
     finish_after_commit(receipt, || {
         journal.state = "committed".into();
         journal.reason = None;
-        write_journal(root, journal)
+        journal::write_with_cipher(root, journal, cipher)
     })
 }
 
 fn cancel_while_busy(req: &CancelRequest) -> Result<Report, Fail> {
-    if let Some(row) = read_committed(&req.vault, &req.command_id)? {
+    let (_, _, _, cipher) = super::open_readonly_unlocked(&req.vault, &req.auth)?;
+    if let Some(row) = read_committed_with_cipher(&req.vault, &req.command_id, &cipher)? {
         let mut body = already_committed(&row)?;
         if let Some(map) = body.as_object_mut() {
             map.insert("cancel_applied".into(), json!(false));
@@ -2185,7 +2418,7 @@ fn cancel_while_busy(req: &CancelRequest) -> Result<Report, Fail> {
     if !path.exists() {
         return Err(refused("unknown_command").extra("cancel_applied", json!(false)));
     }
-    let journal = journal::read_file(&path).map_err(|_| {
+    let journal = journal::read_file_with_cipher(&path, &cipher).map_err(|_| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
@@ -2237,11 +2470,24 @@ fn cancel_body(
     body
 }
 
-fn attach_stated(receipt: &mut Value, adopted: &[super::decide::Adopted], published: bool) {
+fn attach_stated(
+    receipt: &mut Value,
+    adopted: &[super::decide::Adopted],
+    published: bool,
+    vault_format: i64,
+    protection: Option<ProtectionMode>,
+) {
     let Some(map) = receipt.as_object_mut() else {
         return;
     };
-    map.insert("slice".into(), json!("T3-facts"));
+    map.insert(
+        "slice".into(),
+        json!(if vault_format >= 6 {
+            "M4-real"
+        } else {
+            "T3-facts"
+        }),
+    );
     map.insert("facts_published".into(), json!(published));
     map.insert(
         "fact_ids".into(),
@@ -2275,6 +2521,7 @@ fn attach_stated(receipt: &mut Value, adopted: &[super::decide::Adopted], publis
     map.insert("time_status".into(), json!("unknown"));
     map.insert("current_status".into(), json!("unknown"));
     map.insert("payment_verified".into(), json!(false));
+    apply_format_honesty(map, vault_format, protection);
 }
 
 fn body_outcome(outcome: &str) -> Map<String, Value> {

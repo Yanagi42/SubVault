@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
 
+use crate::crypto::VaultCipher;
 use crate::fsutil::atomic_write;
 use crate::ids::{is_command_id, is_lower_hex, is_prefixed_id};
 use crate::model::{io_fail, unseen_db, Fail, EXIT_NOT_PRESERVED};
@@ -138,6 +139,7 @@ fn accept(journal: &Journal) -> Result<(), ()> {
         && journal.kind != "fragment"
         && journal.kind != "decision"
         && journal.kind != "html"
+        && journal.kind != "pdf"
     {
         return Err(());
     }
@@ -181,15 +183,28 @@ pub(crate) fn staging_path(root: &Path, command_id: &str) -> PathBuf {
     root.join("staging").join(format!("{command_id}.partial"))
 }
 
-pub(crate) fn write(root: &Path, journal: &Journal) -> Result<(), Fail> {
-    let bytes = serde_json::to_vec_pretty(&journal.to_value())
+pub(crate) fn write_with_cipher(
+    root: &Path,
+    journal: &Journal,
+    cipher: &VaultCipher,
+) -> Result<(), Fail> {
+    let plain = serde_json::to_vec_pretty(&journal.to_value())
         .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "journal_encode"))?;
+    let bytes = cipher
+        .encrypt_journal(&journal.command_id, &plain)
+        .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "journal_encrypt"))?;
     atomic_write(&path(root, &journal.command_id), &bytes)
         .map_err(|err| io_fail(err, "journal_write"))
 }
 
-pub(crate) fn read_file(path: &Path) -> Result<Journal, ()> {
-    let bytes = fs::read(path).map_err(|_| ())?;
+pub(crate) fn read_file_with_cipher(path: &Path, cipher: &VaultCipher) -> Result<Journal, ()> {
+    let raw = fs::read(path).map_err(|_| ())?;
+    let command_id = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".json"))
+        .ok_or(())?;
+    let bytes = cipher.decrypt_journal(command_id, &raw).map_err(|_| ())?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
     let journal = Journal::from_value(&value)?;
     accept(&journal)?;
@@ -216,7 +231,7 @@ pub(crate) struct Reconcile {
     pub journal_unlisted: Option<String>,
 }
 
-pub(crate) fn scan(root: &Path) -> Scan {
+pub(crate) fn scan_with_cipher(root: &Path, cipher: &VaultCipher) -> Scan {
     let mut scan = Scan {
         valid: Vec::new(),
         invalid: Vec::new(),
@@ -261,7 +276,7 @@ pub(crate) fn scan(root: &Path) -> Scan {
             scan.unexpected.push(name);
             continue;
         }
-        match read_file(&dir.join(&name)) {
+        match read_file_with_cipher(&dir.join(&name), cipher) {
             Ok(journal) if journal.command_id == command_id => scan.valid.push(journal),
             _ => scan.invalid.push(name),
         }
@@ -278,8 +293,12 @@ pub(crate) struct LabelMiss {
 /// Rewrite a journal label only when that command row is already committed.
 /// A failed rewrite is returned to the caller. It is not a verdict that the
 /// committed row or its hosted bytes were lost.
-pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<Reconcile, Fail> {
-    let found = scan(root);
+pub(crate) fn reconcile_with_cipher(
+    root: &Path,
+    conn: &Connection,
+    cipher: &VaultCipher,
+) -> Result<Reconcile, Fail> {
+    let found = scan_with_cipher(root, cipher);
     if found.unlisted.is_some() {
         return Ok(Reconcile {
             misses: Vec::new(),
@@ -296,14 +315,14 @@ pub(crate) fn reconcile(root: &Path, conn: &Connection) -> Result<Reconcile, Fai
         if t3 && journal.kind == "fragment" {
             continue;
         }
-        if store::command(conn, &journal.command_id)
+        if store::command_with_cipher(conn, &journal.command_id, cipher)
             .map_err(|err| unseen_db(err, "reconcile"))?
             .is_some()
         {
             let mut journal = journal;
             journal.state = "committed".into();
             journal.reason = None;
-            if let Err(fail) = write(root, &journal) {
+            if let Err(fail) = write_with_cipher(root, &journal, cipher) {
                 missed.push(LabelMiss {
                     command_id: journal.command_id,
                     during: fail

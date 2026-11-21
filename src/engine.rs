@@ -8,6 +8,10 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::crypto::{
+    self, AuthInput, Credential, CredentialError, CryptoError, NewPassphraseInput, ProtectionMode,
+    VaultCipher, VaultKeys,
+};
 use crate::facts::{self, ObjectFacts};
 use crate::fsutil::{
     self, atomic_write, filesystem_magic, network_filesystem, sha256_file, MAX_OBJECT_BYTES,
@@ -16,19 +20,18 @@ use crate::ids::{
     self, canonical_object_relpath, hex_encode, is_command_id, is_display_name, is_media_type,
     is_prefixed_id,
 };
-use crate::journal::{
-    self, path as journal_path, read_file as read_journal_file, staging_path,
-    write as write_journal, Journal,
-};
+use crate::journal::{self, path as journal_path, staging_path, Journal};
 #[cfg(target_os = "linux")]
 use crate::lockfile::sigstop;
 use crate::lockfile::{self, VaultLock, LOCK_TEXT};
 use crate::model::{
-    capabilities, db_fail, honesty, io_fail, platform_limits, unseen_db, unseen_io, Fail, Report,
-    EXIT_DAMAGED, EXIT_FAULT_MISSED, EXIT_INTEGRITY, EXIT_LOCKED, EXIT_NOT_PRESERVED,
-    EXIT_NOT_SYNTHETIC, EXIT_NOT_VAULT, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_STOP_MISSED,
-    EXIT_UNCERTAIN, EXIT_UNSUPPORTED_FS, EXIT_USAGE, EXIT_VERSION, NOT_ARRANGED, NOT_PRESERVED,
-    NOT_SEARCHABLE, PRESERVED, VAULT_BANNER,
+    apply_format_honesty, capabilities, capabilities_for, db_fail, honesty, io_fail,
+    platform_limits, unseen_db, unseen_io, Fail, Report, EXIT_AUTH, EXIT_DAMAGED,
+    EXIT_FAULT_MISSED, EXIT_INTEGRITY, EXIT_LOCKED, EXIT_NOT_PRESERVED, EXIT_NOT_SYNTHETIC,
+    EXIT_NOT_VAULT, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_STOP_MISSED, EXIT_UNCERTAIN,
+    EXIT_UNSUPPORTED_FS, EXIT_USAGE, EXIT_VERSION, NOT_ARRANGED, NOT_PRESERVED, NOT_SEARCHABLE,
+    PRESERVED, PRODUCTION_BANNER_FILE, PRODUCTION_BANNER_OS_DISK, PRODUCTION_BANNER_PASSPHRASE,
+    SYNTHETIC_BANNER_FILE, VAULT_BANNER,
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
@@ -42,6 +45,8 @@ mod fragment;
 mod html;
 #[path = "pdf.rs"]
 mod pdf;
+#[path = "redact.rs"]
+mod redact;
 #[path = "review.rs"]
 mod review;
 
@@ -50,6 +55,7 @@ pub use export::{export_copy, ExportRequest};
 pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
 pub use html::{submit_html, HtmlRequest};
 pub use pdf::{submit_pdf, PdfRequest};
+pub use redact::{redact_template, RedactRequest};
 pub use review::review_sheet;
 
 const IMPORT_STOPS: &[&str] = &[
@@ -227,11 +233,38 @@ fn action_name(action: InjectAction) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VaultBannerKind {
+    Synthetic,
+    Production(ProtectionMode),
+}
+
 struct Session {
     root: PathBuf,
     conn: Connection,
     _lock: VaultLock,
     magic: i64,
+    #[allow(dead_code)]
+    vault_format: i64,
+    protection: Option<ProtectionMode>,
+    cipher: VaultCipher,
+}
+
+pub struct InitRequest {
+    pub vault: PathBuf,
+    pub format: u8,
+    pub protection: Option<ProtectionMode>,
+    pub auth: AuthInput,
+    pub recovery_key_out: Option<PathBuf>,
+    pub hooks: Hooks,
+}
+
+pub struct RotatePassphraseRequest {
+    pub vault: PathBuf,
+    pub auth: AuthInput,
+    pub new_passphrase: NewPassphraseInput,
+    pub rotate_recovery_key: bool,
+    pub recovery_key_out: Option<PathBuf>,
 }
 
 struct Phase {
@@ -249,9 +282,10 @@ pub fn help_report() -> Report {
         json!([
             "help",
             "version",
-            "init --vault PATH [--format 1|2|3|4|5]",
-            "open --vault PATH",
-            "verify --vault PATH",
+            "init --vault PATH [--format 1|2|3|4|5|6] [--protection passphrase|os-disk] [--passphrase-file PATH|--passphrase-stdin] [--recovery-key-out PATH]",
+            "rotate-passphrase --vault PATH [--passphrase-file PATH|--recovery-key-file PATH] --new-passphrase-file PATH [--rotate-recovery-key] [--recovery-key-out PATH]",
+            "open --vault PATH [--passphrase-file PATH|--recovery-key-file PATH]",
+            "verify --vault PATH [--passphrase-file PATH|--recovery-key-file PATH]",
             "import --vault PATH --command-id ID --media-type TYPE --source PATH [--batch-id ID] [--display-name NAME]",
             "read --vault PATH --source-id ID --out PATH",
             "marker --vault PATH --command-id ID --source-id ID --value TEXT",
@@ -261,8 +295,9 @@ pub fn help_report() -> Report {
             "candidates --vault PATH [--source-id ID]",
             "facts --vault PATH [--source-id ID] [--fact-id ID]",
             "review --vault PATH --out PATH [--package PATH]",
-            "export --vault PATH --out PATH [--allow-partial yes]",
+            "export --vault PATH --out PATH [--allow-partial yes] [--acknowledge-plaintext yes]",
             "verify-package --package PATH",
+            "redact (--source PATH | --vault PATH --source-id ID) --out PATH [--redact-term STR]...",
             "correct --vault PATH --command-id ID --fact-id ID --expected-revision N --amount-text TEXT --actor-id ID",
             "undo --vault PATH --command-id ID --decision-id ID --expected-revision N --actor-id ID",
             "cancel --vault PATH --command-id ID --generation N [--kind preservation|fragment|extraction]",
@@ -278,7 +313,8 @@ pub fn help_report() -> Report {
         "exit_codes".into(),
         json!({
             "20": EXIT_STOP_MISSED,
-            "21": EXIT_UNCERTAIN
+            "21": EXIT_UNCERTAIN,
+            "22": EXIT_AUTH
         }),
     );
     Report {
@@ -291,7 +327,7 @@ pub fn version_report() -> Report {
     let mut body = honesty("Version");
     body.insert("git_sha".into(), json!(env!("SUBVAULT_GIT_SHA")));
     body.insert("vault_format".into(), json!(1));
-    body.insert("supported_vault_formats".into(), json!([1, 2, 3, 4, 5]));
+    body.insert("supported_vault_formats".into(), json!([1, 2, 3, 4, 5, 6]));
     body.insert("capabilities".into(), capabilities());
     body.insert("platform_limits".into(), platform_limits(None));
     Report {
@@ -300,14 +336,19 @@ pub fn version_report() -> Report {
     }
 }
 
-pub fn init_vault(path: &Path, format: u8, hooks: Hooks) -> Report {
-    match init_inner(path, format, hooks) {
+pub fn init_vault(req: InitRequest) -> Report {
+    match init_inner(req) {
         Ok(report) => report,
         Err(fail) => note_uncommitted(fail).into_report(),
     }
 }
 
-fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
+fn init_inner(req: InitRequest) -> Result<Report, Fail> {
+    let path = req.vault.as_path();
+    let format = req.format;
+    let hooks = req.hooks;
+    let protection = req.protection;
+    let recovery_key_out = req.recovery_key_out;
     // A trailing slash makes this lstat follow the final symlink. A dangling
     // name then looks missing, and a loop or file fails the stat itself.
     // The directory entry is the same name with those slashes removed.
@@ -334,6 +375,18 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
         return Err(unsupported_fs(magic));
     }
     if format == 1 {
+        if protection.is_some() {
+            return Err(
+                Fail::new(EXIT_USAGE, "Usage", "protection_requires_format_6")
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
+        if recovery_key_out.is_some() {
+            return Err(
+                Fail::new(EXIT_USAGE, "Usage", "recovery_key_out_requires_passphrase")
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
         let stop = hooks.stop_at.as_deref();
         let point = hooks.inject_point.as_deref();
         let stop_ok = match stop {
@@ -353,6 +406,38 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             );
         }
     } else if format == 2 || format == 3 || format == 4 || format == 5 {
+        if protection.is_some() {
+            return Err(
+                Fail::new(EXIT_USAGE, "Usage", "protection_requires_format_6")
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
+        if recovery_key_out.is_some() {
+            return Err(
+                Fail::new(EXIT_USAGE, "Usage", "recovery_key_out_requires_passphrase")
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
+        validate_hook_names(
+            hooks.stop_at.as_deref(),
+            hooks.inject_point.as_deref(),
+            INIT_STOPS,
+            INIT_INJECTS,
+            INIT_INJECTS,
+        )?;
+    } else if format == 6 {
+        let Some(mode) = protection else {
+            return Err(
+                Fail::new(EXIT_USAGE, "Usage", "protection_required_for_format_6")
+                    .extra("created_new_vault", json!(false)),
+            );
+        };
+        if mode == ProtectionMode::OsDisk && recovery_key_out.is_some() {
+            return Err(
+                Fail::new(EXIT_USAGE, "Usage", "recovery_key_out_requires_passphrase")
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
         validate_hook_names(
             hooks.stop_at.as_deref(),
             hooks.inject_point.as_deref(),
@@ -365,15 +450,41 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             Fail::new(EXIT_USAGE, "Usage", "bad_format").extra("created_new_vault", json!(false))
         );
     }
+
+    let passphrase = if format == 6 && protection == Some(ProtectionMode::Passphrase) {
+        let secret = map_cred_err(req.auth.resolve_passphrase_only())?.ok_or_else(|| {
+            Fail::new(EXIT_AUTH, "KeyRequired", "passphrase_required")
+                .extra("created_new_vault", json!(false))
+                .extra("vault_format", json!(6))
+                .extra("protection", json!(crypto::PROTECTION_PASSPHRASE))
+                .extra("synthetic_only", json!(false))
+        })?;
+        Some(secret)
+    } else {
+        None
+    };
+
+    if let Some(ref key_out) = recovery_key_out {
+        validate_new_key_out_before_init(path, key_out)?;
+    }
+
     let scratch = parent.join(format!(
         ".subvault-init-{}",
         ids::random_id("tmp").map_err(|err| io_fail(err, "random"))?
     ));
     fs::create_dir(&scratch).map_err(|err| io_fail(err, "init_dir"))?;
     let mut hooks = HookRun::new(hooks);
-    let built = (|| -> Result<String, Fail> {
-        fs::write(scratch.join("SYNTHETIC_ONLY"), VAULT_BANNER)
-            .map_err(|err| io_fail(err, "banner"))?;
+    let built = (|| -> Result<(String, Option<zeroize::Zeroizing<String>>), Fail> {
+        let (banner_file, banner_text) = if format == 6 {
+            let text = match protection.unwrap() {
+                ProtectionMode::Passphrase => PRODUCTION_BANNER_PASSPHRASE,
+                ProtectionMode::OsDisk => PRODUCTION_BANNER_OS_DISK,
+            };
+            (PRODUCTION_BANNER_FILE, text)
+        } else {
+            (SYNTHETIC_BANNER_FILE, VAULT_BANNER)
+        };
+        fs::write(scratch.join(banner_file), banner_text).map_err(|err| io_fail(err, "banner"))?;
         for dir in ["objects", "staging", "journal", "control"] {
             fs::create_dir(scratch.join(dir)).map_err(|err| io_fail(err, "init_dir"))?;
         }
@@ -383,57 +494,86 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             Connection::open(scratch.join("vault.db")).map_err(|err| db_fail(err, "init_open"))?;
         store::configure(&conn).map_err(|err| db_fail(err, "init_pragma"))?;
         let vault_id = ids::random_id("vlt_").map_err(|err| io_fail(err, "random"))?;
-        store::init_schema(&conn, &vault_id).map_err(|err| db_fail(err, "init_schema"))?;
-        if format != 1 {
-            let format_text = format.to_string();
-            conn.execute_batch(&format!("PRAGMA user_version = {format};"))
-                .map_err(|err| db_fail(err, "init_version"))?;
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('vault_format', ?1)",
-                [&format_text],
-            )
-            .map_err(|err| db_fail(err, "init_version"))?;
-            if format == 3 {
-                conn.execute_batch(store::BODY_DDL)
-                    .map_err(|err| db_fail(err, "init_schema"))?;
-                conn.execute(
-                    "INSERT INTO meta(key, value) VALUES ('body_schema', ?1)",
-                    [store::BODY_SCHEMA],
-                )
+        let mut recovery_key_text = None;
+        if format == 6 {
+            let mode = protection.unwrap();
+            store::init_real_schema(&conn, &vault_id, mode)
                 .map_err(|err| db_fail(err, "init_schema"))?;
-                conn.execute_batch(store::FACT_DDL)
-                    .map_err(|err| db_fail(err, "init_schema"))?;
-            }
-            if format == 4 {
-                conn.execute_batch(store::HTML_DDL)
-                    .map_err(|err| db_fail(err, "init_schema"))?;
-                conn.execute(
-                    "INSERT INTO meta(key, value) VALUES ('html_body_schema', ?1)",
-                    [store::HTML_BODY_SCHEMA],
+            if mode == ProtectionMode::Passphrase {
+                let dek = crypto::generate_dek().map_err(crypto_init_fail)?;
+                let (rec_raw, rec_str) =
+                    crypto::generate_recovery_key().map_err(crypto_init_fail)?;
+                let now = now_ms();
+                let pass_slot = crypto::wrap_dek_with_passphrase(
+                    &vault_id,
+                    &dek,
+                    passphrase.as_ref().expect("passphrase checked"),
+                    now,
                 )
-                .map_err(|err| db_fail(err, "init_schema"))?;
-                conn.execute_batch(store::FACT_DDL)
-                    .map_err(|err| db_fail(err, "init_schema"))?;
-            }
-            if format == 5 {
-                conn.execute_batch(store::PDF_DDL)
-                    .map_err(|err| db_fail(err, "init_schema"))?;
-                conn.execute(
-                    "INSERT INTO meta(key, value) VALUES ('pdf_body_schema', ?1)",
-                    [store::PDF_BODY_SCHEMA],
-                )
-                .map_err(|err| db_fail(err, "init_schema"))?;
-                conn.execute_batch(store::FACT_DDL)
-                    .map_err(|err| db_fail(err, "init_schema"))?;
+                .map_err(crypto_init_fail)?;
+                let rec_slot = crypto::wrap_dek_with_recovery(&vault_id, &dek, &rec_raw, now)
+                    .map_err(crypto_init_fail)?;
+                store::upsert_keyslot(&conn, &pass_slot)
+                    .map_err(|err| db_fail(err, "init_keyslot"))?;
+                store::upsert_keyslot(&conn, &rec_slot)
+                    .map_err(|err| db_fail(err, "init_keyslot"))?;
+                recovery_key_text = Some(rec_str);
             }
             hooks.stop("version_set", init_point(false, format))?;
             hooks.inject("version_checkpoint", init_point(false, format))?;
+        } else {
+            store::init_schema(&conn, &vault_id).map_err(|err| db_fail(err, "init_schema"))?;
+            if format != 1 {
+                let format_text = format.to_string();
+                conn.execute_batch(&format!("PRAGMA user_version = {format};"))
+                    .map_err(|err| db_fail(err, "init_version"))?;
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES ('vault_format', ?1)",
+                    [&format_text],
+                )
+                .map_err(|err| db_fail(err, "init_version"))?;
+                if format == 3 {
+                    conn.execute_batch(store::BODY_DDL)
+                        .map_err(|err| db_fail(err, "init_schema"))?;
+                    conn.execute(
+                        "INSERT INTO meta(key, value) VALUES ('body_schema', ?1)",
+                        [store::BODY_SCHEMA],
+                    )
+                    .map_err(|err| db_fail(err, "init_schema"))?;
+                    conn.execute_batch(store::FACT_DDL)
+                        .map_err(|err| db_fail(err, "init_schema"))?;
+                }
+                if format == 4 {
+                    conn.execute_batch(store::HTML_DDL)
+                        .map_err(|err| db_fail(err, "init_schema"))?;
+                    conn.execute(
+                        "INSERT INTO meta(key, value) VALUES ('html_body_schema', ?1)",
+                        [store::HTML_BODY_SCHEMA],
+                    )
+                    .map_err(|err| db_fail(err, "init_schema"))?;
+                    conn.execute_batch(store::FACT_DDL)
+                        .map_err(|err| db_fail(err, "init_schema"))?;
+                }
+                if format == 5 {
+                    conn.execute_batch(store::PDF_DDL)
+                        .map_err(|err| db_fail(err, "init_schema"))?;
+                    conn.execute(
+                        "INSERT INTO meta(key, value) VALUES ('pdf_body_schema', ?1)",
+                        [store::PDF_BODY_SCHEMA],
+                    )
+                    .map_err(|err| db_fail(err, "init_schema"))?;
+                    conn.execute_batch(store::FACT_DDL)
+                        .map_err(|err| db_fail(err, "init_schema"))?;
+                }
+                hooks.stop("version_set", init_point(false, format))?;
+                hooks.inject("version_checkpoint", init_point(false, format))?;
+            }
         }
-        seal_init_stage(&mut hooks, &scratch, conn, format, &vault_id)?;
-        Ok(vault_id)
+        seal_init_stage(&mut hooks, &scratch, conn, format, &vault_id, protection)?;
+        Ok((vault_id, recovery_key_text))
     })();
-    let vault_id = match built {
-        Ok(id) => id,
+    let (vault_id, recovery_key_text) = match built {
+        Ok(pair) => pair,
         Err(fail) => {
             return Err(finish_init_scratch(
                 &scratch,
@@ -466,9 +606,26 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             fail.extra("created_new_vault", json!(false)),
         ));
     }
+    let mut wrote_key_out = false;
+    if let (Some(ref key_out), Some(ref key_text)) = (&recovery_key_out, &recovery_key_text) {
+        if let Err(fail) = write_recovery_key_file(key_out, key_text) {
+            return Err(finish_init_scratch(
+                &scratch,
+                fail.extra("created_new_vault", json!(false)),
+            ));
+        }
+        wrote_key_out = true;
+    }
     let published = match publish_init_dir(&scratch, path) {
         Ok(dir) => dir,
-        Err(fail) => return Err(finish_init_scratch(&scratch, fail)),
+        Err(fail) => {
+            if wrote_key_out {
+                if let Some(ref key_out) = recovery_key_out {
+                    let _ = fs::remove_file(key_out);
+                }
+            }
+            return Err(finish_init_scratch(&scratch, fail));
+        }
     };
     // Rename has succeeded. Later returns are published receipts. Dropping
     // `published` only closes the handle; it does not sync.
@@ -476,7 +633,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     published.checkpoint_identity(&mut point);
     if let Err(fail) = hooks.stop("before_parent_sync", point) {
         return Ok(report_published_init(
-            fail, &vault_id, format, magic, path, false,
+            fail, &vault_id, format, protection, magic, path, false,
         ));
     }
     // Explicit sync of the same file renameat2 used. Release it after the
@@ -487,6 +644,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             io_fail(err, "publish_dir_fsync"),
             &vault_id,
             format,
+            protection,
             magic,
             path,
             false,
@@ -497,7 +655,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
         Ok(value) => value,
         Err(fail) => {
             return Ok(report_published_init(
-                fail, &vault_id, format, magic, path, true,
+                fail, &vault_id, format, protection, magic, path, true,
             ));
         }
     };
@@ -509,6 +667,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
                     .extra("injected", json!(true)),
                 &vault_id,
                 format,
+                protection,
                 magic,
                 path,
                 true,
@@ -518,6 +677,7 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
             directory_witness("publish_dir_fsync", action),
             &vault_id,
             format,
+            protection,
             magic,
             path,
             true,
@@ -527,9 +687,16 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
     // write stays published. directory_durable=false means final durability
     // is unconfirmed. It does not rewrite that Ok.
     match hooks.stop("after_publish", init_point(true, format)) {
-        Ok(()) => Ok(init_ready(&vault_id, format, magic)),
+        Ok(()) => Ok(init_ready(
+            &vault_id,
+            format,
+            protection,
+            magic,
+            recovery_key_out.as_deref(),
+            recovery_key_text.as_deref().map(String::as_str),
+        )),
         Err(fail) => Ok(report_published_init(
-            fail, &vault_id, format, magic, path, true,
+            fail, &vault_id, format, protection, magic, path, true,
         )),
     }
 }
@@ -602,23 +769,58 @@ fn finish_init_scratch(scratch: &Path, fail: Fail) -> Fail {
         .extra("staging_path", json!(scratch.display().to_string()))
 }
 
-fn init_ready(vault_id: &str, format: u8, magic: i64) -> Report {
+fn init_ready(
+    vault_id: &str,
+    format: u8,
+    protection: Option<ProtectionMode>,
+    magic: i64,
+    recovery_key_out: Option<&Path>,
+    recovery_key_text: Option<&str>,
+) -> Report {
+    let mut body = init_body(vault_id, format, protection, magic);
+    if let Some(out) = recovery_key_out {
+        body.insert("recovery_key_out".into(), json!(out.display().to_string()));
+    } else if let Some(key) = recovery_key_text {
+        body.insert("recovery_key".into(), json!(key));
+    }
     Report {
         code: EXIT_OK,
-        body: Value::Object(init_body(vault_id, format, magic)),
+        body: Value::Object(body),
     }
 }
 
-fn init_body(vault_id: &str, format: u8, magic: i64) -> Map<String, Value> {
+fn init_body(
+    vault_id: &str,
+    format: u8,
+    protection: Option<ProtectionMode>,
+    magic: i64,
+) -> Map<String, Value> {
     let mut body = honesty("Initialized");
     body.insert("vault_id".into(), json!(vault_id));
     body.insert("vault_format".into(), json!(format));
     body.insert("created_new_vault".into(), json!(true));
-    body.insert("protection".into(), json!("unanswered_synthetic_plaintext"));
-    body.insert("primary_input".into(), json!("unanswered"));
-    body.insert("capabilities".into(), capabilities());
+    body.insert(
+        "protection".into(),
+        json!(if format == 6 {
+            protection
+                .map(ProtectionMode::as_meta)
+                .unwrap_or(crypto::PROTECTION_OS_DISK)
+        } else {
+            crypto::PROTECTION_SYNTHETIC
+        }),
+    );
+    body.insert(
+        "primary_input".into(),
+        json!(if format == 6 {
+            "local_static_files"
+        } else {
+            "unanswered"
+        }),
+    );
+    body.insert("capabilities".into(), capabilities_for(i64::from(format)));
     body.insert("platform_limits".into(), platform_limits(Some(magic)));
     body.insert("new_effect".into(), json!(true));
+    apply_format_honesty(&mut body, i64::from(format), protection);
     body
 }
 
@@ -651,11 +853,12 @@ fn report_published_init(
     fail: Fail,
     vault_id: &str,
     format: u8,
+    protection: Option<ProtectionMode>,
     magic: i64,
     output: &Path,
     parent_fsync_returned_ok: bool,
 ) -> Report {
-    let mut body = init_body(vault_id, format, magic);
+    let mut body = init_body(vault_id, format, protection, magic);
     for (key, value) in fail.extra {
         if matches!(
             key.as_str(),
@@ -706,6 +909,7 @@ fn seal_init_stage(
     conn: Connection,
     format: u8,
     vault_id: &str,
+    protection: Option<ProtectionMode>,
 ) -> Result<(), Fail> {
     let mode = match store::read_journal_mode(&conn) {
         store::SqlAnswer::Value(mode) if mode == "wal" => mode,
@@ -738,7 +942,8 @@ fn seal_init_stage(
         hooks.stop("version_checkpoint", init_point(false, format))?;
     }
     let verify = open_immutable(&scratch.join("vault.db"))?;
-    let verdict = read_main_meta(&verify).and_then(|main| compare_main(format, vault_id, &main));
+    let verdict =
+        read_main_meta(&verify).and_then(|main| compare_main(format, vault_id, protection, &main));
     if let Err(fail) = verdict {
         return Err(prefer_verify_error(verify, fail));
     }
@@ -751,13 +956,18 @@ fn seal_init_stage(
         hooks.stop("before_publish", init_point(false, format))?;
     }
     hooks.stop("before_final_set", init_point(false, format))?;
-    require_final_set(scratch)?;
+    let banner_file = if format == 6 {
+        PRODUCTION_BANNER_FILE
+    } else {
+        SYNTHETIC_BANNER_FILE
+    };
+    require_final_set(scratch, banner_file)?;
     for (stop, during, name) in [
         ("before_sync_vault_db", "sync_vault_db", "vault.db"),
         (
             "before_sync_synthetic_only",
             "sync_synthetic_only",
-            "SYNTHETIC_ONLY",
+            banner_file,
         ),
         ("before_sync_writer_lock", "sync_writer_lock", "writer.lock"),
     ] {
@@ -916,6 +1126,7 @@ fn read_main_meta(conn: &Connection) -> Result<MainMeta, Fail> {
         "body_schema",
         "html_body_schema",
         "pdf_body_schema",
+        "real_body_schema",
     ] {
         let value = store::meta(conn, key).map_err(|_| verify_damaged("meta_unreadable"))?;
         values.push((key, value));
@@ -935,7 +1146,12 @@ fn meta_value<'a>(values: &'a [(&'static str, Option<String>)], key: &str) -> Op
         .and_then(|(_, value)| value.as_deref())
 }
 
-fn compare_main(format: u8, vault_id: &str, main: &MainMeta) -> Result<(), Fail> {
+fn compare_main(
+    format: u8,
+    vault_id: &str,
+    protection: Option<ProtectionMode>,
+    main: &MainMeta,
+) -> Result<(), Fail> {
     let schema = meta_value(&main.values, "schema_version");
     let companion = meta_value(&main.values, "vault_format");
     let format_text = format.to_string();
@@ -950,14 +1166,31 @@ fn compare_main(format: u8, vault_id: &str, main: &MainMeta) -> Result<(), Fail>
         .extra("schema_version_found", json!(main.version))
         .extra("vault_format_seen", json!(companion)));
     }
-    for (key, expected) in [
-        ("vault_id", vault_id),
-        ("synthetic_only", "true"),
-        ("disposable", "true"),
-        ("protection", "unanswered_synthetic_plaintext"),
-        ("primary_input", "unanswered"),
-        ("slice", "T1"),
-    ] {
+    let expected_meta: [(&str, &str); 6] = if format == 6 {
+        [
+            ("vault_id", vault_id),
+            ("synthetic_only", "false"),
+            ("disposable", "false"),
+            (
+                "protection",
+                protection
+                    .map(ProtectionMode::as_meta)
+                    .unwrap_or(crypto::PROTECTION_OS_DISK),
+            ),
+            ("primary_input", "local_static_files"),
+            ("slice", "M4-real"),
+        ]
+    } else {
+        [
+            ("vault_id", vault_id),
+            ("synthetic_only", "true"),
+            ("disposable", "true"),
+            ("protection", crypto::PROTECTION_SYNTHETIC),
+            ("primary_input", "unanswered"),
+            ("slice", "T1"),
+        ]
+    };
+    for (key, expected) in expected_meta {
         let seen = meta_value(&main.values, key);
         if seen == Some(expected) {
             continue;
@@ -1035,10 +1268,23 @@ fn compare_main(format: u8, vault_id: &str, main: &MainMeta) -> Result<(), Fail>
             .extra("meta_seen", json!(seen)));
         }
     }
+    if format == 6 {
+        let seen = meta_value(&main.values, "real_body_schema");
+        if seen != Some(store::REAL_BODY_SCHEMA) {
+            return Err(unpublished(Fail::new(
+                EXIT_NOT_PRESERVED,
+                "NotPreserved",
+                "real_body_schema_mismatch",
+            ))
+            .extra("during", json!("init_verify"))
+            .extra("meta_key", json!("real_body_schema"))
+            .extra("meta_seen", json!(seen)));
+        }
+    }
     Ok(())
 }
 
-fn require_final_set(scratch: &Path) -> Result<(), Fail> {
+fn require_final_set(scratch: &Path, banner_file: &str) -> Result<(), Fail> {
     let mut seen = Vec::new();
     for entry in fs::read_dir(scratch).map_err(|err| unpublished(io_fail(err, "final_set")))? {
         let entry = entry.map_err(|err| unpublished(io_fail(err, "final_set")))?;
@@ -1046,7 +1292,7 @@ fn require_final_set(scratch: &Path) -> Result<(), Fail> {
     }
     seen.sort();
     let expected = [
-        "SYNTHETIC_ONLY",
+        banner_file,
         "control",
         "journal",
         "objects",
@@ -1064,7 +1310,7 @@ fn require_final_set(scratch: &Path) -> Result<(), Fail> {
         .filter(|name| !seen.iter().any(|got| got == *name))
         .map(|name| (*name).to_string())
         .collect();
-    for name in ["SYNTHETIC_ONLY", "vault.db", "writer.lock"] {
+    for name in [banner_file, "vault.db", "writer.lock"] {
         if missing.iter().any(|item| item == name) {
             continue;
         }
@@ -1117,32 +1363,40 @@ fn sync_directory(path: &Path, during: &'static str) -> Result<(), Fail> {
     fsutil::fsync_dir(path).map_err(|err| unpublished(io_fail(err, during)))
 }
 
-pub fn open_vault(path: &Path) -> Report {
-    reopen(path)
+pub fn open_vault(path: &Path, auth: AuthInput) -> Report {
+    reopen(path, &auth)
 }
 
-pub fn verify_vault(path: &Path) -> Report {
-    reopen(path)
+pub fn verify_vault(path: &Path, auth: AuthInput) -> Report {
+    reopen(path, &auth)
 }
 
-pub fn recover_vault(path: &Path) -> Report {
-    reopen(path)
+pub fn recover_vault(path: &Path, auth: AuthInput) -> Report {
+    reopen(path, &auth)
 }
 
-fn reopen(path: &Path) -> Report {
-    match reopen_inner(path) {
+fn reopen(path: &Path, auth: &AuthInput) -> Report {
+    match reopen_inner(path, auth) {
         Ok(report) => report,
         Err(fail) => demote_unscoped(fail).into_report(),
     }
 }
 
-fn reopen_inner(path: &Path) -> Result<Report, Fail> {
-    let session = open_session(path)?;
+fn reopen_inner(path: &Path, auth: &AuthInput) -> Result<Report, Fail> {
+    let session = open_session_with_auth(path, auth)?;
     let notices = journal::clean_temps(&session.root);
-    let reconciled = journal::reconcile(&session.root, &session.conn)?;
-    let decision_misses = decide::reconcile_decision_journals(&session.root, &session.conn)?;
-    let fragment_misses = decide::reconcile_fragment_journals(&session.root, &session.conn)?;
-    let mut inspection = crate::inspect::report(&session.root, &session.conn, session.magic)?;
+    let reconciled = journal::reconcile_with_cipher(&session.root, &session.conn, &session.cipher)?;
+    let decision_misses =
+        decide::reconcile_decision_journals(&session.root, &session.conn, &session.cipher)?;
+    let fragment_misses =
+        decide::reconcile_fragment_journals(&session.root, &session.conn, &session.cipher)?;
+    let mut inspection = crate::inspect::report(
+        &session.root,
+        &session.conn,
+        session.magic,
+        &session.cipher,
+        session.protection,
+    )?;
     for notice in notices {
         attach_notice(
             &mut inspection,
@@ -1164,6 +1418,123 @@ fn reopen_inner(path: &Path) -> Result<Report, Fail> {
         );
     }
     Ok(inspection)
+}
+
+pub fn rotate_passphrase(req: RotatePassphraseRequest) -> Report {
+    match rotate_passphrase_inner(req) {
+        Ok(report) => report,
+        Err(fail) => note_uncommitted(fail).into_report(),
+    }
+}
+
+fn rotate_passphrase_inner(req: RotatePassphraseRequest) -> Result<Report, Fail> {
+    if req.recovery_key_out.is_some() && !req.rotate_recovery_key {
+        return Err(Fail::new(
+            EXIT_USAGE,
+            "Usage",
+            "recovery_key_out_requires_rotate_recovery_key",
+        ));
+    }
+    let new_pass = map_cred_err(req.new_passphrase.resolve())?.ok_or_else(|| {
+        Fail::new(EXIT_AUTH, "KeyRequired", "new_passphrase_required")
+            .extra("new_effect", json!(false))
+    })?;
+    let session = open_session_with_auth(&req.vault, &req.auth)?;
+    if session.vault_format < 6 || session.protection != Some(ProtectionMode::Passphrase) {
+        return Err(
+            Fail::new(EXIT_REJECTED, "Rejected", "vault_not_passphrase_encrypted")
+                .extra("vault_format", json!(session.vault_format))
+                .extra("new_effect", json!(false)),
+        );
+    }
+    if let Some(ref key_out) = req.recovery_key_out {
+        match place_output(&session.root, key_out) {
+            Place::Inside => {
+                return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_inside_vault")
+                    .extra("new_effect", json!(false)));
+            }
+            Place::Unresolved(msg) => {
+                return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_unresolved")
+                    .extra("os_error", json!(msg))
+                    .extra("new_effect", json!(false)));
+            }
+            Place::MissingParent => {
+                return Err(
+                    Fail::new(EXIT_REJECTED, "Rejected", "output_parent_missing")
+                        .extra("new_effect", json!(false)),
+                );
+            }
+            Place::Exists => {
+                return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_exists")
+                    .extra("new_effect", json!(false)));
+            }
+            Place::Create => {}
+        }
+    }
+    let keys = session.cipher.keys().ok_or_else(|| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "missing_vault_keys")
+            .extra("new_effect", json!(false))
+    })?;
+    let now = now_ms();
+    let new_pass_slot =
+        crypto::wrap_dek_with_passphrase(keys.vault_id(), keys.dek(), &new_pass, now)
+            .map_err(crypto_init_fail)?;
+    let new_recovery = if req.rotate_recovery_key {
+        let (rec_raw, rec_str) = crypto::generate_recovery_key().map_err(crypto_init_fail)?;
+        let rec_slot = crypto::wrap_dek_with_recovery(keys.vault_id(), keys.dek(), &rec_raw, now)
+            .map_err(crypto_init_fail)?;
+        Some((rec_slot, rec_str))
+    } else {
+        None
+    };
+
+    if let (Some(ref key_out), Some((_, ref rec_str))) = (&req.recovery_key_out, &new_recovery) {
+        write_recovery_key_file(key_out, rec_str)?;
+    }
+
+    let commit_res: Result<(), Fail> = (|| {
+        let tx = session
+            .conn
+            .unchecked_transaction()
+            .map_err(|err| db_fail(err, "rotate_begin"))?;
+        store::upsert_keyslot(&tx, &new_pass_slot)
+            .map_err(|err| db_fail(err, "rotate_passphrase"))?;
+        if let Some((ref rec_slot, _)) = new_recovery {
+            store::upsert_keyslot(&tx, rec_slot).map_err(|err| db_fail(err, "rotate_recovery"))?;
+        }
+        tx.commit().map_err(|err| db_fail(err, "rotate_commit"))?;
+        let _ = store::checkpoint(&session.conn);
+        Ok(())
+    })();
+
+    if let Err(fail) = commit_res {
+        if let Some(ref key_out) = req.recovery_key_out {
+            let _ = fs::remove_file(key_out);
+        }
+        return Err(fail);
+    }
+
+    let mut body = honesty("PassphraseRotated");
+    body.insert("vault_id".into(), json!(keys.vault_id()));
+    body.insert("vault_format".into(), json!(session.vault_format));
+    body.insert("new_effect".into(), json!(true));
+    body.insert(
+        "recovery_key_rotated".into(),
+        json!(req.rotate_recovery_key),
+    );
+    if let Some(ref key_out) = req.recovery_key_out {
+        body.insert(
+            "recovery_key_out".into(),
+            json!(key_out.display().to_string()),
+        );
+    } else if let Some((_, ref rec_str)) = new_recovery {
+        body.insert("recovery_key".into(), json!(rec_str.as_str()));
+    }
+    apply_format_honesty(&mut body, session.vault_format, session.protection);
+    Ok(Report {
+        code: EXIT_OK,
+        body: Value::Object(body),
+    })
 }
 
 pub fn hold_vault(path: &Path, hooks: Hooks) -> Report {
@@ -1203,6 +1574,7 @@ pub struct ImportRequest {
     pub media_type: String,
     pub source: PathBuf,
     pub display_name: Option<String>,
+    pub auth: AuthInput,
     pub hooks: Hooks,
 }
 
@@ -1255,12 +1627,13 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
         .extra("vault_format", json!(5))
         .extra("created_new_vault", json!(false)));
     }
-    let session = open_session(&req.vault)?;
-    let reconciled = journal::reconcile(&session.root, &session.conn)?;
+    let session = open_session_with_auth(&req.vault, &req.auth)?;
+    let reconciled = journal::reconcile_with_cipher(&session.root, &session.conn, &session.cipher)?;
     let journal_unlisted = reconciled.journal_unlisted.clone();
     let label_misses = reconciled.misses;
-    if let Some(existing) = store::command(&session.conn, &req.command_id)
-        .map_err(|err| unseen_db(err, "command_lookup"))?
+    if let Some(existing) =
+        store::command_with_cipher(&session.conn, &req.command_id, &session.cipher)
+            .map_err(|err| unseen_db(err, "command_lookup"))?
     {
         return match replay_committed(&session, &req, &existing) {
             Ok(body) => Ok(stamp_journal_list(
@@ -1273,7 +1646,7 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
             )),
         };
     }
-    decide::reject_if_t3_command(&session.conn, &req.command_id)?;
+    decide::reject_if_t3_command(&session.conn, &req.command_id, &session.cipher)?;
     let meta = require_new_source(&req.source)?;
     let display_default = req
         .source
@@ -1287,7 +1660,7 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
     }
 
     let mut hooks = HookRun::new(req.hooks.clone());
-    let mut journal = load_or_new_journal(&session.root, &req, &display_name)?;
+    let mut journal = load_or_new_journal(&session.root, &req, &display_name, &session.cipher)?;
     if journal.kind != "import" {
         return Err(Fail::new(
             EXIT_REJECTED,
@@ -1319,7 +1692,7 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
     journal.generation = 1;
     journal.state = "started".into();
     journal.reason = None;
-    write_journal(&session.root, &journal)?;
+    journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
 
     let mut phase = Phase { published: false };
     let result = import_attempt(
@@ -1332,7 +1705,13 @@ fn import_inner(req: ImportRequest) -> Result<Value, Fail> {
     );
     match result {
         Ok(value) => Ok(stamp_journal_list(value, journal_unlisted.as_deref())),
-        Err(fail) => Err(unwind(&session.root, &mut journal, &phase, fail)?),
+        Err(fail) => Err(unwind(
+            &session.root,
+            &mut journal,
+            &phase,
+            fail,
+            &session.cipher,
+        )?),
     }
 }
 
@@ -1358,30 +1737,45 @@ fn import_attempt(
         return Err(cancelled());
     }
     journal.state = "copying".into();
-    write_journal(&session.root, journal)?;
+    journal::write_with_cipher(&session.root, journal, &session.cipher)?;
     let staging = staging_path(&session.root, &command_id);
     let _ = fs::remove_file(&staging);
-    copy_source(
-        &req.source,
-        &staging,
-        hooks,
-        &session.root,
-        &command_id,
-        journal.generation,
-        expected_len,
-    )?;
-    if take_cancel(
-        &session.root,
-        &command_id,
-        journal.generation,
-        "preservation",
-    )? {
-        return Err(cancelled());
-    }
-    let (hash, len) = sha256_file(&staging).map_err(|err| io_fail(err, "hash_staging"))?;
+    let mut staged_object_id: Option<String> = None;
+    let (hash, len) = if session.cipher.is_encrypted() {
+        let mut candidate_id = journal
+            .object_id
+            .clone()
+            .filter(|id| is_prefixed_id(id, "obj_"))
+            .unwrap_or_default();
+        if candidate_id.is_empty() || session.root.join("objects").join(&candidate_id).exists() {
+            candidate_id = ids::random_id("obj_").map_err(|err| io_fail(err, "random"))?;
+        }
+        let pair = copy_source_encrypted(&req.source, &staging, &candidate_id, &session.cipher)?;
+        staged_object_id = Some(candidate_id);
+        pair
+    } else {
+        copy_source(
+            &req.source,
+            &staging,
+            hooks,
+            &session.root,
+            &command_id,
+            journal.generation,
+            expected_len,
+        )?;
+        if take_cancel(
+            &session.root,
+            &command_id,
+            journal.generation,
+            "preservation",
+        )? {
+            return Err(cancelled());
+        }
+        sha256_file(&staging).map_err(|err| io_fail(err, "hash_staging"))?
+    };
     journal.content_sha256 = Some(hash.clone());
     journal.byte_length = Some(len as i64);
-    write_journal(&session.root, journal)?;
+    journal::write_with_cipher(&session.root, journal, &session.cipher)?;
     hooks.inject(
         "after_staging_fsync",
         checkpoint_map(&command_id, len, Some(len), Some(&hash), false, false),
@@ -1402,24 +1796,42 @@ fn import_attempt(
     journal.content_sha256 = Some(hash.clone());
     journal.byte_length = Some(len as i64);
 
-    let existing =
-        store::object_by_hash(&session.conn, &hash).map_err(|err| db_fail(err, "object_lookup"))?;
+    let existing = store::object_by_hash_with_cipher(
+        &session.conn,
+        session.vault_format,
+        &hash,
+        &session.cipher,
+    )
+    .map_err(|err| db_fail(err, "object_lookup"))?;
     let (object_id, storage_reused) = if let Some(object) = existing {
         refuse_unreached_object_fsync(hooks)?;
-        require_hosted_object(&session.root, &object, &hash, object.byte_length)?;
+        require_hosted_object_with_cipher(
+            &session.root,
+            &object,
+            &hash,
+            object.byte_length,
+            &session.cipher,
+        )?;
         (object.object_id, true)
-    } else if let Some(orphan) = find_orphan_with_hash(&session.root, &session.conn, &hash)? {
+    } else if let Some(orphan) =
+        find_orphan_with_hash_with_cipher(&session.root, &session.conn, &hash, &session.cipher)?
+    {
         refuse_unreached_object_fsync(hooks)?;
         (orphan, true)
     } else {
-        let mut object_id = journal
-            .object_id
-            .clone()
-            .filter(|id| is_prefixed_id(id, "obj_"))
-            .unwrap_or_default();
-        if object_id.is_empty() || session.root.join("objects").join(&object_id).exists() {
-            object_id = ids::random_id("obj_").map_err(|err| io_fail(err, "random"))?;
-        }
+        let object_id = if let Some(id) = staged_object_id {
+            id
+        } else {
+            let mut id = journal
+                .object_id
+                .clone()
+                .filter(|id| is_prefixed_id(id, "obj_"))
+                .unwrap_or_default();
+            if id.is_empty() || session.root.join("objects").join(&id).exists() {
+                id = ids::random_id("obj_").map_err(|err| io_fail(err, "random"))?;
+            }
+            id
+        };
         let dest = session.root.join("objects").join(&object_id);
         fs::hard_link(&staging, &dest).map_err(|err| io_fail(err, "publish_object"))?;
         phase.published = true;
@@ -1436,7 +1848,7 @@ fn import_attempt(
     journal.object_id = Some(object_id.clone());
     journal.storage_reused = Some(storage_reused);
     journal.state = "object_ready".into();
-    write_journal(&session.root, journal)?;
+    journal::write_with_cipher(&session.root, journal, &session.cipher)?;
     let _ = fs::remove_file(&staging);
 
     hooks.stop(
@@ -1461,31 +1873,34 @@ fn import_attempt(
             .conn
             .unchecked_transaction()
             .map_err(|err| db_fail(err, "begin"))?;
-        if store::command(&tx, &command_id)
+        if store::command_with_cipher(&tx, &command_id, &session.cipher)
             .map_err(|err| db_fail(err, "command_recheck"))?
             .is_some()
         {
             return Err(Fail::new(EXIT_REJECTED, "Rejected", "command_race"));
         }
-        if store::object_by_hash(&tx, &hash)
+        if store::object_by_hash_with_cipher(&tx, session.vault_format, &hash, &session.cipher)
             .map_err(|err| db_fail(err, "object_recheck"))?
             .is_none()
         {
             let relpath = canonical_object_relpath(&object_id)
                 .ok_or_else(|| Fail::new(EXIT_REJECTED, "Rejected", "bad_object_id"))?;
-            store::insert_object(
+            store::insert_object_with_cipher(
                 &tx,
+                session.vault_format,
                 &ObjectRow {
                     object_id: object_id.clone(),
                     content_sha256: hash.clone(),
                     byte_length: len as i64,
                     relpath,
                 },
+                &session.cipher,
             )
             .map_err(|err| db_fail(err, "insert_object"))?;
         }
         let source = if let Some(source) =
-            store::source_by_hash(&tx, &hash).map_err(|err| db_fail(err, "source_lookup"))?
+            store::source_by_hash_with_cipher(&tx, session.vault_format, &hash, &session.cipher)
+                .map_err(|err| db_fail(err, "source_lookup"))?
         {
             source
         } else {
@@ -1498,14 +1913,15 @@ fn import_attempt(
                 media_type: req.media_type.clone(),
                 user_marker: None,
             };
-            store::insert_source(&tx, &source).map_err(|err| db_fail(err, "insert_source"))?;
+            store::insert_source_with_cipher(&tx, session.vault_format, &source, &session.cipher)
+                .map_err(|err| db_fail(err, "insert_source"))?;
             source
         };
         let occurrence_id = journal.occurrence_id.clone().ok_or_else(|| {
             Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "missing_occurrence_id")
         })?;
         let recorded_at = now_ms();
-        store::insert_occurrence(
+        store::insert_occurrence_with_cipher(
             &tx,
             &OccurrenceRow {
                 occurrence_id: occurrence_id.clone(),
@@ -1520,6 +1936,7 @@ fn import_attempt(
                 storage_reused,
                 recorded_at,
             },
+            &session.cipher,
         )
         .map_err(|err| db_fail(err, "insert_occurrence"))?;
         let result = import_result(
@@ -1528,10 +1945,12 @@ fn import_attempt(
             &occurrence_id,
             storage_reused,
             journal,
+            session.vault_format,
+            session.protection,
         );
         let encoded = serde_json::to_string(&result)
             .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
-        store::insert_command(
+        store::insert_command_with_cipher(
             &tx,
             &CommandRow {
                 command_id: command_id.clone(),
@@ -1541,6 +1960,7 @@ fn import_attempt(
                 outcome: "Committed".into(),
             },
             recorded_at,
+            &session.cipher,
         )
         .map_err(|err| db_fail(err, "insert_command"))?;
         hooks.inject(
@@ -1549,7 +1969,7 @@ fn import_attempt(
         )?;
         match tx.commit() {
             Ok(()) => result,
-            Err(err) => return settle_commit(&session.root, &command_id, err),
+            Err(err) => return settle_commit(&session.root, &command_id, err, &session.cipher),
         }
     };
     finish_after_commit(committed, || {
@@ -1559,7 +1979,7 @@ fn import_attempt(
         )?;
         journal.state = "committed".into();
         journal.reason = None;
-        write_journal(&session.root, journal)?;
+        journal::write_with_cipher(&session.root, journal, &session.cipher)?;
         hooks.stop(
             "before_receipt",
             checkpoint_map(&command_id, len, Some(len), Some(&hash), true, true),
@@ -1573,6 +1993,7 @@ pub struct MarkerRequest {
     pub command_id: String,
     pub source_id: String,
     pub value: String,
+    pub auth: AuthInput,
     pub hooks: Hooks,
 }
 
@@ -1600,10 +2021,14 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
     if req.value.is_empty() || req.value.len() > 500 || req.value.contains(['\0', '\n', '\r']) {
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_marker"));
     }
-    let session = open_session(&req.vault)?;
+    let session = open_session_with_auth(&req.vault, &req.auth)?;
     let fingerprint = fingerprint(&["marker", &req.source_id, &req.value]);
-    if let Some(existing) = store::command(&session.conn, &req.command_id)
-        .map_err(|err| unseen_db(err, "command_lookup"))?
+    let expected_fp = session
+        .cipher
+        .dedup_key("payload_fingerprint", &fingerprint);
+    if let Some(existing) =
+        store::command_with_cipher(&session.conn, &req.command_id, &session.cipher)
+            .map_err(|err| unseen_db(err, "command_lookup"))?
     {
         if req.hooks.inject_point.is_some() || req.hooks.stop_at.is_some() {
             return Err(Fail::new(
@@ -1615,20 +2040,21 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
             .extra("new_effect", json!(false))
             .extra("command_id", json!(req.command_id)));
         }
-        let source = store::source_by_id(&session.conn, &req.source_id)
-            .map_err(|err| unseen_db(err, "source_lookup"))?
-            .ok_or_else(|| {
-                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_row_missing")
-                    .extra("new_effect", json!(false))
-            })?;
+        let source =
+            store::source_by_id_with_cipher(&session.conn, &req.source_id, &session.cipher)
+                .map_err(|err| unseen_db(err, "source_lookup"))?
+                .ok_or_else(|| {
+                    Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_row_missing")
+                        .extra("new_effect", json!(false))
+                })?;
         confirm_source_bytes(&session, &source, &req.command_id)?;
-        if existing.payload_fingerprint != fingerprint {
+        if existing.payload_fingerprint != expected_fp {
             return Err(checked_conflict(&req.command_id, &source));
         }
         return already_committed(&existing);
     }
-    decide::reject_if_t3_command(&session.conn, &req.command_id)?;
-    let source = store::source_by_id(&session.conn, &req.source_id)
+    decide::reject_if_t3_command(&session.conn, &req.command_id, &session.cipher)?;
+    let source = store::source_by_id_with_cipher(&session.conn, &req.source_id, &session.cipher)
         .map_err(|err| unseen_db(err, "source_lookup"))?
         .ok_or_else(|| {
             Fail::new(EXIT_REJECTED, "Rejected", "unknown_source")
@@ -1636,10 +2062,11 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
         })?;
     let existing_journal = journal::path(&session.root, &req.command_id);
     if existing_journal.exists() {
-        let existing = journal::read_file(&existing_journal).map_err(|_| {
-            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
-                .extra("new_effect", json!(false))
-        })?;
+        let existing =
+            journal::read_file_with_cipher(&existing_journal, &session.cipher).map_err(|_| {
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
+                    .extra("new_effect", json!(false))
+            })?;
         if existing.kind != "marker" {
             return Err(
                 Fail::new(EXIT_REJECTED, "Rejected", "command_kind_conflict")
@@ -1666,7 +2093,7 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
         marker_value: Some(req.value.clone()),
         source_id: Some(req.source_id.clone()),
     };
-    write_journal(&session.root, &journal)?;
+    journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
     let mut hooks = HookRun::new(req.hooks.clone());
     hooks.stop(
         "before_db_commit",
@@ -1678,13 +2105,20 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
             .conn
             .unchecked_transaction()
             .map_err(|err| db_fail(err, "begin"))?;
-        let updated = store::update_marker(&tx, &req.source_id, &req.value)
-            .map_err(|err| db_fail(err, "update_marker"))?;
+        let updated =
+            store::update_marker_with_cipher(&tx, &req.source_id, &req.value, &session.cipher)
+                .map_err(|err| db_fail(err, "update_marker"))?;
         if updated != 1 {
             return Err(Fail::new(EXIT_REJECTED, "Rejected", "unknown_source"));
         }
-        let result = marker_result(&req, &source, recorded_at);
-        store::insert_command(
+        let result = marker_result(
+            &req,
+            &source,
+            recorded_at,
+            session.vault_format,
+            session.protection,
+        );
+        store::insert_command_with_cipher(
             &tx,
             &CommandRow {
                 command_id: req.command_id.clone(),
@@ -1695,6 +2129,7 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
                 outcome: "Committed".into(),
             },
             recorded_at,
+            &session.cipher,
         )
         .map_err(|err| db_fail(err, "insert_command"))?;
         hooks.inject(
@@ -1703,7 +2138,7 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
         )?;
         match tx.commit() {
             Ok(()) => result,
-            Err(err) => return settle_commit(&session.root, &req.command_id, err),
+            Err(err) => return settle_commit(&session.root, &req.command_id, err, &session.cipher),
         }
     };
     finish_after_commit(committed, || {
@@ -1712,7 +2147,7 @@ fn marker_inner(req: MarkerRequest) -> Result<Value, Fail> {
             checkpoint_map(&req.command_id, 0, None, None, false, true),
         )?;
         journal.state = "committed".into();
-        write_journal(&session.root, &journal)?;
+        journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
         hooks.stop(
             "before_receipt",
             checkpoint_map(&req.command_id, 0, None, None, false, true),
@@ -1725,6 +2160,7 @@ pub struct ReadRequest {
     pub vault: PathBuf,
     pub source_id: String,
     pub out: PathBuf,
+    pub auth: AuthInput,
 }
 
 pub fn read_source(req: ReadRequest) -> Report {
@@ -1741,17 +2177,18 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
     if !is_prefixed_id(&req.source_id, "src_") {
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_source_id"));
     }
-    let session = open_session(&req.vault)?;
-    let source = store::source_by_id(&session.conn, &req.source_id)
+    let session = open_session_with_auth(&req.vault, &req.auth)?;
+    let source = store::source_by_id_with_cipher(&session.conn, &req.source_id, &session.cipher)
         .map_err(|err| unseen_db(err, "source_lookup"))?
         .ok_or_else(|| Fail::new(EXIT_REJECTED, "Rejected", "unknown_source"))?;
     let object = lookup_object(&session, &source.object_id)?;
-    let facts = facts::object_facts(
+    let facts = facts::object_facts_with_cipher(
         &session.root,
         &source.object_id,
         Some(&object.relpath),
         &source.content_sha256,
         source.byte_length,
+        &session.cipher,
     );
     if facts.id_rejected {
         return Err(
@@ -1772,6 +2209,14 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_missing")
                 .extra("source_id", json!(source.source_id))
                 .extra("object_id", json!(source.object_id)),
+        );
+    }
+    if let Some(detail) = &facts.auth_error {
+        return Err(
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "ciphertext_auth_failed")
+                .extra("source_id", json!(source.source_id))
+                .extra("object_id", json!(source.object_id))
+                .extra("detail", json!(detail)),
         );
     }
     if !facts.hash_matches || !facts.length_matches {
@@ -1808,7 +2253,9 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
         }
         Place::Create => {}
     }
-    if let Err(err) = copy_exclusive(&file_path, &req.out) {
+    if let Err(err) =
+        copy_exclusive_decrypted(&session.cipher, &source.object_id, &file_path, &req.out)
+    {
         return Err(match err {
             FreshCopy::Exists => Fail::new(EXIT_REJECTED, "Rejected", "output_exists"),
             FreshCopy::Io {
@@ -1846,6 +2293,7 @@ fn read_inner(req: ReadRequest) -> Result<Value, Fail> {
     body.insert("searchability".into(), json!(NOT_SEARCHABLE));
     body.insert("object_path_rejected".into(), json!(path_rejected));
     body.insert("new_effect".into(), json!(false));
+    apply_format_honesty(&mut body, session.vault_format, session.protection);
     Ok(Value::Object(body))
 }
 
@@ -2003,7 +2451,12 @@ enum FreshCopy {
 /// `O_CREAT|O_EXCL|O_NOFOLLOW` covers a name that appears after the check.
 /// `output_written` is not this function's concern: `cleanup` says whether a
 /// file this call created was removed.
-fn copy_exclusive(src: &Path, dst: &Path) -> Result<(), FreshCopy> {
+fn copy_exclusive_decrypted(
+    cipher: &VaultCipher,
+    object_id: &str,
+    src: &Path,
+    dst: &Path,
+) -> Result<(), FreshCopy> {
     match fs::symlink_metadata(dst) {
         Ok(_) => return Err(FreshCopy::Exists),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -2027,9 +2480,13 @@ fn copy_exclusive(src: &Path, dst: &Path) -> Result<(), FreshCopy> {
         }
     })?;
     let copied = (|| -> io::Result<()> {
-        let mut reader = File::open(src)?;
-        let permissions = reader.metadata()?.permissions();
-        io::copy(&mut reader, &mut writer)?;
+        let permissions = fs::metadata(src)?.permissions();
+        cipher
+            .copy_decrypted_object(object_id, src, &mut writer)
+            .map_err(|err| match err {
+                CryptoError::Io(io_err) => io_err,
+                other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+            })?;
         writer.flush()?;
         writer.set_permissions(permissions)?;
         Ok(())
@@ -2057,6 +2514,7 @@ pub struct CancelRequest {
     pub command_id: String,
     pub generation: i64,
     pub kind: String,
+    pub auth: AuthInput,
 }
 
 pub fn cancel_command(req: CancelRequest) -> Report {
@@ -2074,7 +2532,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
         return fragment::cancel_fragment(req);
     }
     if req.kind == "extraction" {
-        let session = open_session(&req.vault)?;
+        let session = open_session_with_auth(&req.vault, &req.auth)?;
         let _session = session;
         return Err(
             Fail::new(EXIT_REJECTED, "Rejected", "extraction_cancel_not_available")
@@ -2086,18 +2544,24 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
     if req.kind != "preservation" {
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_cancel_kind"));
     }
-    guard_vault(&req.vault)?;
+    let (_, banner) = vault_shape(&req.vault)?;
+    inspect_version_readonly_with_banner(&req.vault, banner)?;
     let lock = match lockfile::VaultLock::try_acquire(&req.vault.join("writer.lock"))
         .map_err(|err| unseen_io(err, "lock"))?
     {
         Some(lock) => lock,
-        None => return cancel_without_lock(&req),
+        None => return cancel_without_lock(&req, banner),
     };
     let _lock = lock;
-    accept_wal_format(&req.vault.join("vault.db"))?;
+    let version = accept_wal_format_with_banner(&req.vault.join("vault.db"), banner)?;
     let conn = open_writer(&req.vault)?;
-    if let Some(existing) =
-        store::command(&conn, &req.command_id).map_err(|err| unseen_db(err, "command_lookup"))?
+    let protection = match banner {
+        VaultBannerKind::Synthetic => None,
+        VaultBannerKind::Production(mode) => Some(mode),
+    };
+    let cipher = unlock_cipher(&conn, version, protection, &req.auth)?;
+    if let Some(existing) = store::command_with_cipher(&conn, &req.command_id, &cipher)
+        .map_err(|err| unseen_db(err, "command_lookup"))?
     {
         let generation = result_generation(&existing.result_json)?;
         if generation != req.generation {
@@ -2120,11 +2584,15 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
             .extra("cancel_applied", json!(false))
             .extra("preservation", json!("not_preserved")));
     }
-    let mut journal = read_journal_file(&path).map_err(|_| {
+    let mut journal = journal::read_file_with_cipher(&path, &cipher).map_err(|_| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
-    if journal.kind == "fragment" || journal.kind == "decision" || journal.kind == "html" {
+    if journal.kind == "fragment"
+        || journal.kind == "decision"
+        || journal.kind == "html"
+        || journal.kind == "pdf"
+    {
         return Err(fragment_journal_conflict());
     }
     if journal.generation != req.generation {
@@ -2133,7 +2601,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
     }
     journal.state = "aborted".into();
     journal.reason = Some("cancelled".into());
-    write_journal(&req.vault, &journal)?;
+    journal::write_with_cipher(&req.vault, &journal, &cipher)?;
     let _ = fs::remove_file(staging_path(&req.vault, &req.command_id));
     let _ = fs::remove_file(req.vault.join("control").join(&req.command_id));
     let mut body = honesty("Cancelled");
@@ -2144,20 +2612,15 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
     body.insert("arrangement".into(), json!("not_arranged"));
     body.insert("searchability".into(), json!("not_searchable"));
     body.insert("new_effect".into(), json!(false));
+    apply_format_honesty(&mut body, version, protection);
     Ok(Report {
         code: EXIT_OK,
         body: Value::Object(body),
     })
 }
 
-fn vault_shape(path: &Path) -> Result<i64, Fail> {
-    require_vault_shape(path)?;
-    if !banner_exact(path)? {
-        return Err(
-            Fail::new(EXIT_NOT_SYNTHETIC, "NotSynthetic", "banner_mismatch")
-                .extra("created_new_vault", json!(false)),
-        );
-    }
+fn vault_shape(path: &Path) -> Result<(i64, VaultBannerKind), Fail> {
+    let banner = inspect_vault_banner(path)?;
     if !sqlite_header_ok(&path.join("vault.db"))? {
         return Err(Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_header")
             .extra("created_new_vault", json!(false)));
@@ -2166,12 +2629,12 @@ fn vault_shape(path: &Path) -> Result<i64, Fail> {
     if network_filesystem(magic) {
         return Err(unsupported_fs(magic));
     }
-    Ok(magic)
+    Ok((magic, banner))
 }
 
 fn guard_vault(path: &Path) -> Result<i64, Fail> {
-    let magic = vault_shape(path)?;
-    inspect_version_readonly(path)?;
+    let (magic, banner) = vault_shape(path)?;
+    inspect_version_readonly_with_banner(path, banner)?;
     Ok(magic)
 }
 
@@ -2190,16 +2653,26 @@ fn acquire_writer_lock(path: &Path) -> Result<lockfile::VaultLock, Fail> {
 struct ReviewRead {
     conn: Connection,
     _lock: VaultLock,
+    protection: Option<ProtectionMode>,
+    cipher: VaultCipher,
 }
 
 impl ReviewRead {
     fn connection(&self) -> &Connection {
         &self.conn
     }
+
+    fn protection(&self) -> Option<ProtectionMode> {
+        self.protection
+    }
+
+    fn cipher(&self) -> &VaultCipher {
+        &self.cipher
+    }
 }
 
-fn open_review_read(vault: &Path) -> Result<(ReviewRead, i64), Fail> {
-    vault_shape(vault)?;
+fn open_review_read(vault: &Path, auth: &AuthInput) -> Result<(ReviewRead, i64), Fail> {
+    let (_, banner) = vault_shape(vault)?;
     let lock = acquire_writer_lock(vault)?;
     let db = vault.join("vault.db");
     let uri = wal_visible_uri(&db)?;
@@ -2211,23 +2684,62 @@ fn open_review_read(vault: &Path) -> Result<(ReviewRead, i64), Fail> {
     let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
     conn.execute_batch("BEGIN")
         .map_err(|err| busy_is_locked(err, "user_version_unreadable", false))?;
-    let version = accept_connection_format(&db, &conn)?;
-    Ok((ReviewRead { conn, _lock: lock }, version))
+    let version = accept_connection_format_with_banner(&db, &conn, banner)?;
+    let protection = match banner {
+        VaultBannerKind::Synthetic => None,
+        VaultBannerKind::Production(mode) => Some(mode),
+    };
+    let cipher = unlock_cipher(&conn, version, protection, auth)?;
+    Ok((
+        ReviewRead {
+            conn,
+            _lock: lock,
+            protection,
+            cipher,
+        },
+        version,
+    ))
+}
+
+fn open_readonly_unlocked(
+    vault: &Path,
+    auth: &AuthInput,
+) -> Result<(Connection, i64, Option<ProtectionMode>, VaultCipher), Fail> {
+    let (_, banner) = vault_shape(vault)?;
+    inspect_version_readonly_with_banner(vault, banner)?;
+    let db = vault.join("vault.db");
+    let uri = wal_visible_uri(&db)?;
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|err| unseen_db(err, "readonly_open"))?;
+    let version = accept_connection_format_with_banner(&db, &conn, banner)?;
+    let protection = match banner {
+        VaultBannerKind::Synthetic => None,
+        VaultBannerKind::Production(mode) => Some(mode),
+    };
+    let cipher = unlock_cipher(&conn, version, protection, auth)?;
+    Ok((conn, version, protection, cipher))
 }
 
 fn open_session(path: &Path) -> Result<Session, Fail> {
-    let magic = vault_shape(path)?;
-    let lock = acquire_writer_lock(path)?;
-    inspect_version_readonly(path)?;
-    accept_wal_format(&path.join("vault.db"))?;
-    finish_session(path, lock, magic)
+    open_session_with_auth(path, &AuthInput::default())
 }
 
-fn open_html_session(path: &Path) -> Result<Session, Fail> {
-    let magic = vault_shape(path)?;
+fn open_session_with_auth(path: &Path, auth: &AuthInput) -> Result<Session, Fail> {
+    let (magic, banner) = vault_shape(path)?;
     let lock = acquire_writer_lock(path)?;
-    match accept_wal_format(&path.join("vault.db"))? {
-        4 | 5 => {}
+    inspect_version_readonly_with_banner(path, banner)?;
+    let version = accept_wal_format_with_banner(&path.join("vault.db"), banner)?;
+    finish_session(path, lock, magic, version, banner, auth)
+}
+
+fn open_html_session(path: &Path, auth: &AuthInput) -> Result<Session, Fail> {
+    let (magic, banner) = vault_shape(path)?;
+    let lock = acquire_writer_lock(path)?;
+    let version = match accept_wal_format_with_banner(&path.join("vault.db"), banner)? {
+        version @ 4..=6 => version,
         version => {
             return Err(
                 Fail::new(EXIT_VERSION, "VersionUnsupported", "html_requires_format_4")
@@ -2237,15 +2749,15 @@ fn open_html_session(path: &Path) -> Result<Session, Fail> {
                     .extra("created_new_vault", json!(false)),
             );
         }
-    }
-    finish_session(path, lock, magic)
+    };
+    finish_session(path, lock, magic, version, banner, auth)
 }
 
-fn open_pdf_session(path: &Path) -> Result<Session, Fail> {
-    let magic = vault_shape(path)?;
+fn open_pdf_session(path: &Path, auth: &AuthInput) -> Result<Session, Fail> {
+    let (magic, banner) = vault_shape(path)?;
     let lock = acquire_writer_lock(path)?;
-    match accept_wal_format(&path.join("vault.db"))? {
-        5 => {}
+    let version = match accept_wal_format_with_banner(&path.join("vault.db"), banner)? {
+        version @ (5 | 6) => version,
         version => {
             return Err(
                 Fail::new(EXIT_VERSION, "VersionUnsupported", "pdf_requires_format_5")
@@ -2255,21 +2767,200 @@ fn open_pdf_session(path: &Path) -> Result<Session, Fail> {
                     .extra("created_new_vault", json!(false)),
             );
         }
-    }
-    finish_session(path, lock, magic)
+    };
+    finish_session(path, lock, magic, version, banner, auth)
 }
 
-fn finish_session(path: &Path, lock: lockfile::VaultLock, magic: i64) -> Result<Session, Fail> {
+fn finish_session(
+    path: &Path,
+    lock: lockfile::VaultLock,
+    magic: i64,
+    vault_format: i64,
+    banner: VaultBannerKind,
+    auth: &AuthInput,
+) -> Result<Session, Fail> {
+    let protection = match banner {
+        VaultBannerKind::Synthetic => None,
+        VaultBannerKind::Production(mode) => Some(mode),
+    };
     let conn = open_writer(path)?;
+    let cipher = unlock_cipher(&conn, vault_format, protection, auth)?;
     Ok(Session {
         root: path.to_path_buf(),
         _lock: lock,
         conn,
         magic,
+        vault_format,
+        protection,
+        cipher,
     })
 }
 
-fn require_vault_shape(path: &Path) -> Result<(), Fail> {
+fn unlock_cipher(
+    conn: &Connection,
+    vault_format: i64,
+    protection: Option<ProtectionMode>,
+    auth: &AuthInput,
+) -> Result<VaultCipher, Fail> {
+    if vault_format < 6 || protection != Some(ProtectionMode::Passphrase) {
+        return Ok(VaultCipher::Plain);
+    }
+    let vault_id = store::meta(conn, "vault_id")
+        .map_err(|err| unseen_db(err, "vault_id"))?
+        .ok_or_else(|| {
+            Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "missing_vault_id")
+                .extra("new_effect", json!(false))
+        })?;
+    let cred = map_cred_err(auth.resolve())?;
+    let dek = match cred {
+        Credential::None => {
+            return Err(Fail::new(EXIT_AUTH, "KeyRequired", "passphrase_required")
+                .extra("vault_format", json!(vault_format))
+                .extra("protection", json!(crypto::PROTECTION_PASSPHRASE))
+                .extra("synthetic_only", json!(false))
+                .extra("locked_at_rest", json!(true))
+                .extra("new_effect", json!(false)));
+        }
+        Credential::Passphrase(pass) => {
+            let slot = store::load_keyslot(conn, "passphrase")
+                .map_err(|err| unseen_db(err, "keyslot"))?
+                .ok_or_else(|| {
+                    Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "missing_passphrase_slot")
+                        .extra("new_effect", json!(false))
+                })?;
+            match crypto::unwrap_dek_with_passphrase(&vault_id, &slot, &pass) {
+                Ok(dek) => dek,
+                Err(CryptoError::AuthFailed) => {
+                    return Err(Fail::new(EXIT_AUTH, "AuthFailed", "invalid_passphrase")
+                        .extra("vault_format", json!(vault_format))
+                        .extra("protection", json!(crypto::PROTECTION_PASSPHRASE))
+                        .extra("synthetic_only", json!(false))
+                        .extra("new_effect", json!(false)));
+                }
+                Err(err) => {
+                    return Err(
+                        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "keyslot_corrupt")
+                            .extra("detail", json!(err.to_string()))
+                            .extra("new_effect", json!(false)),
+                    );
+                }
+            }
+        }
+        Credential::RecoveryKey(rec) => {
+            let slot = store::load_keyslot(conn, "recovery")
+                .map_err(|err| unseen_db(err, "keyslot"))?
+                .ok_or_else(|| {
+                    Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "missing_recovery_slot")
+                        .extra("new_effect", json!(false))
+                })?;
+            match crypto::unwrap_dek_with_recovery(&vault_id, &slot, &rec) {
+                Ok(dek) => dek,
+                Err(CryptoError::AuthFailed) => {
+                    return Err(Fail::new(EXIT_AUTH, "AuthFailed", "invalid_recovery_key")
+                        .extra("vault_format", json!(vault_format))
+                        .extra("protection", json!(crypto::PROTECTION_PASSPHRASE))
+                        .extra("synthetic_only", json!(false))
+                        .extra("new_effect", json!(false)));
+                }
+                Err(err) => {
+                    return Err(
+                        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "keyslot_corrupt")
+                            .extra("detail", json!(err.to_string()))
+                            .extra("new_effect", json!(false)),
+                    );
+                }
+            }
+        }
+    };
+    let keys = VaultKeys::from_dek(&vault_id, dek).map_err(|err| {
+        Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "subkey_derivation_failed")
+            .extra("detail", json!(err.to_string()))
+            .extra("new_effect", json!(false))
+    })?;
+    Ok(VaultCipher::Aead(Box::new(keys)))
+}
+
+fn map_cred_err<T>(res: Result<T, CredentialError>) -> Result<T, Fail> {
+    res.map_err(|err| match err {
+        CredentialError::Conflict => Fail::new(EXIT_USAGE, "Usage", "conflicting_credentials")
+            .extra("new_effect", json!(false)),
+        CredentialError::Empty(reason) => {
+            Fail::new(EXIT_USAGE, "Usage", reason).extra("new_effect", json!(false))
+        }
+        CredentialError::Io(io_err) => Fail::new(EXIT_USAGE, "Usage", "credential_unreadable")
+            .extra("os_error", json!(io_err.to_string()))
+            .extra("new_effect", json!(false)),
+    })
+}
+
+fn crypto_init_fail(err: CryptoError) -> Fail {
+    Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "crypto_init_failed")
+        .extra("detail", json!(err.to_string()))
+        .extra("created_new_vault", json!(false))
+}
+
+fn validate_new_key_out_before_init(vault_path: &Path, key_out: &Path) -> Result<(), Fail> {
+    let vault_abs = absolute_existing_base(&crate::platform::final_directory_entry(vault_path))
+        .map_err(|err| io_fail(err, "recovery_key_out"))?;
+    let out_abs = absolute_existing_base(&crate::platform::final_directory_entry(key_out))
+        .map_err(|err| io_fail(err, "recovery_key_out"))?;
+    if out_abs == vault_abs || out_abs.starts_with(&vault_abs) {
+        return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_inside_vault")
+            .extra("created_new_vault", json!(false)));
+    }
+    let Some(parent) = out_abs.parent() else {
+        return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_unresolved")
+            .extra("created_new_vault", json!(false)));
+    };
+    if !parent.is_dir() {
+        return Err(
+            Fail::new(EXIT_REJECTED, "Rejected", "output_parent_missing")
+                .extra("created_new_vault", json!(false)),
+        );
+    }
+    match fs::symlink_metadata(&out_abs) {
+        Ok(_) => Err(Fail::new(EXIT_REJECTED, "Rejected", "output_exists")
+            .extra("created_new_vault", json!(false))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io_fail(err, "recovery_key_out").extra("created_new_vault", json!(false))),
+    }
+}
+
+fn write_recovery_key_file(path: &Path, key_text: &str) -> Result<(), Fail> {
+    let mut file = match crate::platform::open_new_nofollow(path) {
+        Ok(file) => file,
+        Err(err) if crate::platform::exclusive_create_refused(&err) => {
+            return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_exists")
+                .extra("new_effect", json!(false)));
+        }
+        Err(err) => return Err(io_fail(err, "recovery_key_write")),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(io_fail(err, "recovery_key_chmod"));
+        }
+    }
+    let content = format!(
+        "# SubVault Format 6 Offline Recovery Key\n# Store this offline in a safe place. Losing both passphrase and recovery key permanently loses vault access.\n{key_text}\n"
+    );
+    if let Err(err) = file
+        .write_all(content.as_bytes())
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(io_fail(err, "recovery_key_write"));
+    }
+    drop(file);
+    let _ = fsutil::fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")));
+    Ok(())
+}
+
+fn inspect_vault_banner(path: &Path) -> Result<VaultBannerKind, Fail> {
     if !path.exists() {
         return Err(Fail::new(EXIT_NOT_VAULT, "NotAVault", "missing_path")
             .extra("created_new_vault", json!(false)));
@@ -2278,22 +2969,47 @@ fn require_vault_shape(path: &Path) -> Result<(), Fail> {
         return Err(Fail::new(EXIT_NOT_VAULT, "NotAVault", "not_a_directory")
             .extra("created_new_vault", json!(false)));
     }
-    if !path.join("SYNTHETIC_ONLY").is_file() || !path.join("vault.db").is_file() {
+    let has_synthetic = path.join(SYNTHETIC_BANNER_FILE).is_file();
+    let has_prod = path.join(PRODUCTION_BANNER_FILE).is_file();
+    if has_synthetic && has_prod {
+        return Err(
+            Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "mixed_vault_banners")
+                .extra("created_new_vault", json!(false)),
+        );
+    }
+    if (!has_synthetic && !has_prod) || !path.join("vault.db").is_file() {
         return Err(
             Fail::new(EXIT_NOT_VAULT, "NotAVault", "missing_vault_files")
                 .extra("created_new_vault", json!(false)),
         );
     }
-    Ok(())
-}
-
-fn banner_exact(path: &Path) -> Result<bool, Fail> {
-    // A failed read has not examined any object. That is the same class as an
-    // unreadable vault.db: unknown, with no preservation verdict. Bytes that
-    // were read and do not match stay NotSynthetic below, and are not rewritten.
-    let bytes = fs::read(path.join("SYNTHETIC_ONLY"))
-        .map_err(|err| vault_unreadable(&err, "banner_unreadable", "banner"))?;
-    Ok(bytes == VAULT_BANNER.as_bytes())
+    if has_synthetic {
+        // A failed read has not examined any object. That is the same class as an
+        // unreadable vault.db: unknown, with no preservation verdict. Bytes that
+        // were read and do not match stay NotSynthetic below, and are not rewritten.
+        let bytes = fs::read(path.join(SYNTHETIC_BANNER_FILE))
+            .map_err(|err| vault_unreadable(&err, "banner_unreadable", "banner"))?;
+        if bytes != VAULT_BANNER.as_bytes() {
+            return Err(
+                Fail::new(EXIT_NOT_SYNTHETIC, "NotSynthetic", "banner_mismatch")
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
+        Ok(VaultBannerKind::Synthetic)
+    } else {
+        let bytes = fs::read(path.join(PRODUCTION_BANNER_FILE))
+            .map_err(|err| vault_unreadable(&err, "banner_unreadable", "banner"))?;
+        if bytes == PRODUCTION_BANNER_PASSPHRASE.as_bytes() {
+            Ok(VaultBannerKind::Production(ProtectionMode::Passphrase))
+        } else if bytes == PRODUCTION_BANNER_OS_DISK.as_bytes() {
+            Ok(VaultBannerKind::Production(ProtectionMode::OsDisk))
+        } else {
+            Err(
+                Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "vault_banner_mismatch")
+                    .extra("created_new_vault", json!(false)),
+            )
+        }
+    }
 }
 
 fn sqlite_header_ok(path: &Path) -> Result<bool, Fail> {
@@ -2322,71 +3038,25 @@ fn vault_unreadable(err: &io::Error, reason: &'static str, during: &str) -> Fail
 }
 
 fn inspect_version_readonly(path: &Path) -> Result<i64, Fail> {
-    let (version, format, schema, html_schema, pdf_schema) =
-        visible_main_format(&path.join("vault.db"))?;
-    if version == 5 {
-        if consistent_format_5(format.as_deref(), schema.as_deref(), pdf_schema.as_deref()) {
-            return Ok(5);
-        }
-        return Err(
-            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
-                .extra("schema_version_found", json!(version))
-                .extra("created_new_vault", json!(false)),
-        );
-    }
-    if version == 4 {
-        if consistent_format_4(format.as_deref(), schema.as_deref(), html_schema.as_deref()) {
-            return Ok(4);
-        }
-        return Err(
-            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
-                .extra("schema_version_found", json!(version))
-                .extra("created_new_vault", json!(false)),
-        );
-    }
-    if version == 2 || version == 3 {
-        let expected = if version == 2 { "2" } else { "3" };
-        if format.as_deref() == Some(expected) && schema.as_deref() == Some("1") {
-            return Ok(version);
-        }
-        return Err(Fail::new(
-            EXIT_VERSION,
-            "VersionUnsupported",
-            "vault_format_unverified",
-        )
-        .extra("schema_version_found", json!(version))
-        .extra("created_new_vault", json!(false)));
-    }
-    if version > 5 {
-        return Err(
-            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
-                .extra("schema_version_found", json!(version))
-                .extra("created_new_vault", json!(false)),
-        );
-    }
-    if version != 1 {
-        return Err(
-            Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "unexpected_user_version")
-                .extra("schema_version_found", json!(version))
-                .extra("created_new_vault", json!(false)),
-        );
-    }
-    if schema.as_deref() != Some("1") {
-        return Err(
-            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "schema_mismatch")
-                .extra("created_new_vault", json!(false)),
-        );
-    }
-    Ok(1)
+    let banner = inspect_vault_banner(path)?;
+    inspect_version_readonly_with_banner(path, banner)
 }
 
-type FormatView = (
-    i64,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
+fn inspect_version_readonly_with_banner(path: &Path, banner: VaultBannerKind) -> Result<i64, Fail> {
+    let view = visible_main_format(&path.join("vault.db"))?;
+    judge_format(view.version, view.version, &view, banner)
+}
+
+struct FormatView {
+    version: i64,
+    format: Option<String>,
+    schema: Option<String>,
+    html_schema: Option<String>,
+    pdf_schema: Option<String>,
+    real_schema: Option<String>,
+    synthetic_only: Option<String>,
+    protection: Option<String>,
+}
 
 fn visible_main_format(db: &Path) -> Result<FormatView, Fail> {
     let uri = readonly_uri(db)?;
@@ -2405,7 +3075,22 @@ fn visible_main_format(db: &Path) -> Result<FormatView, Fail> {
         .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
     let pdf_schema = store::meta(&conn, "pdf_body_schema")
         .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
-    Ok((version, format, schema, html_schema, pdf_schema))
+    let real_schema = store::meta(&conn, "real_body_schema")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
+    let synthetic_only = store::meta(&conn, "synthetic_only")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
+    let protection = store::meta(&conn, "protection")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", true))?;
+    Ok(FormatView {
+        version,
+        format,
+        schema,
+        html_schema,
+        pdf_schema,
+        real_schema,
+        synthetic_only,
+        protection,
+    })
 }
 
 fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
@@ -2459,6 +3144,12 @@ fn readonly_uri(path: &Path) -> Result<String, Fail> {
 /// This open may create or touch `-shm`. It is not a claim that the directory
 /// received no files.
 fn accept_wal_format(db: &Path) -> Result<i64, Fail> {
+    let vault_dir = db.parent().unwrap_or_else(|| Path::new("."));
+    let banner = inspect_vault_banner(vault_dir)?;
+    accept_wal_format_with_banner(db, banner)
+}
+
+fn accept_wal_format_with_banner(db: &Path, banner: VaultBannerKind) -> Result<i64, Fail> {
     // No WAL frames means the main file is the effective database. Skipping the
     // extra open avoids creating an empty `-wal` on a checkpointed vault.
     let mut wal_name = db.as_os_str().to_os_string();
@@ -2467,15 +3158,8 @@ fn accept_wal_format(db: &Path) -> Result<i64, Fail> {
         .map(|meta| meta.is_file() && meta.len() > 0)
         .unwrap_or(false);
     if !frames {
-        let (header, format, schema, html_schema, pdf_schema) = visible_main_format(db)?;
-        return judge_format(
-            header,
-            header,
-            format.as_deref(),
-            schema.as_deref(),
-            html_schema.as_deref(),
-            pdf_schema.as_deref(),
-        );
+        let view = visible_main_format(db)?;
+        return judge_format(view.version, view.version, &view, banner);
     }
     let uri = wal_visible_uri(db)?;
     let conn = Connection::open_with_flags(
@@ -2483,7 +3167,7 @@ fn accept_wal_format(db: &Path) -> Result<i64, Fail> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|err| busy_is_locked(err, "sqlite_unreadable", false))?;
-    accept_connection_format(db, &conn)
+    accept_connection_format_with_banner(db, &conn, banner)
 }
 
 fn sqlite_busy(err: &rusqlite::Error) -> bool {
@@ -2509,17 +3193,20 @@ fn busy_is_locked(err: rusqlite::Error, damaged: &'static str, published: bool) 
 }
 
 fn accept_connection_format(db: &Path, conn: &Connection) -> Result<i64, Fail> {
+    let vault_dir = db.parent().unwrap_or_else(|| Path::new("."));
+    let banner = inspect_vault_banner(vault_dir)?;
+    accept_connection_format_with_banner(db, conn, banner)
+}
+
+fn accept_connection_format_with_banner(
+    db: &Path,
+    conn: &Connection,
+    banner: VaultBannerKind,
+) -> Result<i64, Fail> {
     let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
-    let (header, _, _, _, _) = visible_main_format(db)?;
-    let (effective, format, schema, html_schema, pdf_schema) = effective_view(conn)?;
-    judge_format(
-        header,
-        effective,
-        format.as_deref(),
-        schema.as_deref(),
-        html_schema.as_deref(),
-        pdf_schema.as_deref(),
-    )
+    let main = visible_main_format(db)?;
+    let eff = effective_view(conn)?;
+    judge_format(main.version, eff.version, &eff, banner)
 }
 
 fn effective_view(conn: &Connection) -> Result<FormatView, Fail> {
@@ -2533,37 +3220,77 @@ fn effective_view(conn: &Connection) -> Result<FormatView, Fail> {
         .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
     let pdf_schema = store::meta(conn, "pdf_body_schema")
         .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
-    Ok((version, format, schema, html_schema, pdf_schema))
+    let real_schema = store::meta(conn, "real_body_schema")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
+    let synthetic_only = store::meta(conn, "synthetic_only")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
+    let protection = store::meta(conn, "protection")
+        .map_err(|err| busy_is_locked(err, "meta_unreadable", false))?;
+    Ok(FormatView {
+        version,
+        format,
+        schema,
+        html_schema,
+        pdf_schema,
+        real_schema,
+        synthetic_only,
+        protection,
+    })
 }
 
-fn consistent_format_4(
-    format: Option<&str>,
-    schema: Option<&str>,
-    html_schema: Option<&str>,
-) -> bool {
-    format == Some("4") && schema == Some("1") && html_schema == Some(store::HTML_BODY_SCHEMA)
+fn consistent_format_4(view: &FormatView) -> bool {
+    view.format.as_deref() == Some("4")
+        && view.schema.as_deref() == Some("1")
+        && view.html_schema.as_deref() == Some(store::HTML_BODY_SCHEMA)
 }
 
-fn consistent_format_5(
-    format: Option<&str>,
-    schema: Option<&str>,
-    pdf_schema: Option<&str>,
-) -> bool {
-    format == Some("5") && schema == Some("1") && pdf_schema == Some(store::PDF_BODY_SCHEMA)
+fn consistent_format_5(view: &FormatView) -> bool {
+    view.format.as_deref() == Some("5")
+        && view.schema.as_deref() == Some("1")
+        && view.pdf_schema.as_deref() == Some(store::PDF_BODY_SCHEMA)
+}
+
+fn consistent_format_6(view: &FormatView, mode: ProtectionMode) -> bool {
+    view.format.as_deref() == Some("6")
+        && view.schema.as_deref() == Some("1")
+        && view.real_schema.as_deref() == Some(store::REAL_BODY_SCHEMA)
+        && view.synthetic_only.as_deref() == Some("false")
+        && view.protection.as_deref() == Some(mode.as_meta())
 }
 
 fn judge_format(
     header: i64,
     effective: i64,
-    format: Option<&str>,
-    schema: Option<&str>,
-    html_schema: Option<&str>,
-    pdf_schema: Option<&str>,
+    view: &FormatView,
+    banner: VaultBannerKind,
 ) -> Result<i64, Fail> {
+    let format = view.format.as_deref();
+    let schema = view.schema.as_deref();
+    if effective == 6 {
+        if let VaultBannerKind::Production(mode) = banner {
+            if header == 6 && consistent_format_6(view, mode) {
+                return Ok(6);
+            }
+        }
+        return Err(
+            Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
+                .extra("schema_version_found", json!(effective))
+                .extra("created_new_vault", json!(false)),
+        );
+    }
+    if matches!(banner, VaultBannerKind::Production(_)) {
+        return Err(Fail::new(
+            EXIT_VERSION,
+            "VersionUnsupported",
+            "vault_banner_format_mismatch",
+        )
+        .extra("schema_version_found", json!(effective))
+        .extra("created_new_vault", json!(false)));
+    }
     // A user_version of 5 is format 5 only when the header and the format meta
     // agree. A bumped older vault stays newer_schema and is not migrated.
     if effective == 5 {
-        if header == 5 && consistent_format_5(format, schema, pdf_schema) {
+        if header == 5 && consistent_format_5(view) {
             return Ok(5);
         }
         return Err(
@@ -2576,7 +3303,7 @@ fn judge_format(
     // agree. A format 2 or 3 vault whose version was bumped to 4 stays
     // newer_schema and is not migrated.
     if effective == 4 {
-        if header == 4 && consistent_format_4(format, schema, html_schema) {
+        if header == 4 && consistent_format_4(view) {
             return Ok(4);
         }
         return Err(
@@ -2585,7 +3312,7 @@ fn judge_format(
                 .extra("created_new_vault", json!(false)),
         );
     }
-    if effective > 5 {
+    if effective > 6 {
         return Err(
             Fail::new(EXIT_VERSION, "VersionUnsupported", "newer_schema")
                 .extra("schema_version_found", json!(effective))
@@ -2658,10 +3385,11 @@ fn load_or_new_journal(
     root: &Path,
     req: &ImportRequest,
     display_name: &str,
+    cipher: &VaultCipher,
 ) -> Result<Journal, Fail> {
     let path = journal_path(root, &req.command_id);
     if path.exists() {
-        let journal = read_journal_file(&path).map_err(|_| {
+        let journal = journal::read_file_with_cipher(&path, cipher).map_err(|_| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
                 .extra("command_id", json!(req.command_id))
         })?;
@@ -2693,6 +3421,37 @@ fn load_or_new_journal(
         marker_value: None,
         source_id: None,
     })
+}
+
+fn copy_source_encrypted(
+    src: &Path,
+    dest: &Path,
+    object_id: &str,
+    cipher: &VaultCipher,
+) -> Result<(String, u64), Fail> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|err| io_fail(err, "staging_dir"))?;
+    }
+    let input = File::open(src).map_err(|err| io_fail(err, "read_source"))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(|err| io_fail(err, "create_staging"))?;
+    let (hash, len) = cipher
+        .encrypt_object_stream(object_id, input, &mut output)
+        .map_err(|err| match err {
+            CryptoError::Io(io_err) => io_fail(io_err, "write_staging"),
+            other => Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "object_encrypt_failed")
+                .extra("detail", json!(other.to_string())),
+        })?;
+    output
+        .sync_all()
+        .map_err(|err| io_fail(err, "staging_fsync"))?;
+    if let Some(parent) = dest.parent() {
+        fsutil::fsync_dir(parent).map_err(|err| io_fail(err, "staging_dir_fsync"))?;
+    }
+    Ok((hash, len))
 }
 
 fn copy_source(
@@ -2773,12 +3532,14 @@ fn copy_source(
     Ok(())
 }
 
-fn find_orphan_with_hash(
+fn find_orphan_with_hash_with_cipher(
     root: &Path,
     conn: &Connection,
     hash: &str,
+    cipher: &VaultCipher,
 ) -> Result<Option<String>, Fail> {
-    let objects = store::list_objects(conn).map_err(|err| db_fail(err, "list_objects"))?;
+    let objects = store::list_objects_with_cipher(conn, cipher)
+        .map_err(|err| db_fail(err, "list_objects"))?;
     let known: std::collections::BTreeSet<String> =
         objects.into_iter().map(|o| o.object_id).collect();
     let dir = root.join("objects");
@@ -2795,22 +3556,29 @@ fn find_orphan_with_hash(
         if !is_prefixed_id(&name, "obj_") || known.contains(&name) {
             continue;
         }
-        let (file_hash, _) =
-            sha256_file(&dir.join(&name)).map_err(|err| io_fail(err, "hash_orphan"))?;
-        if file_hash == hash {
-            return Ok(Some(name));
+        match cipher.verify_object_file(&name, &dir.join(&name)) {
+            Ok((file_hash, _)) if file_hash == hash => return Ok(Some(name)),
+            Ok(_) => {}
+            Err(CryptoError::Io(err)) => return Err(io_fail(err, "hash_orphan")),
+            Err(_) => {}
         }
     }
     Ok(None)
 }
 
 fn lookup_object(session: &Session, object_id: &str) -> Result<ObjectRow, Fail> {
-    store::object_by_id(&session.conn, object_id)
+    store::object_by_id_with_cipher(&session.conn, object_id, &session.cipher)
         .map_err(|err| unseen_db(err, "object_lookup"))?
         .ok_or_else(|| Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_row_missing"))
 }
 
-fn unwind(root: &Path, journal: &mut Journal, phase: &Phase, fail: Fail) -> Result<Fail, Fail> {
+fn unwind(
+    root: &Path,
+    journal: &mut Journal,
+    phase: &Phase,
+    fail: Fail,
+    cipher: &VaultCipher,
+) -> Result<Fail, Fail> {
     if !fail.keep_staging {
         let _ = fs::remove_file(staging_path(root, &journal.command_id));
     }
@@ -2821,7 +3589,7 @@ fn unwind(root: &Path, journal: &mut Journal, phase: &Phase, fail: Fail) -> Resu
             journal.state = "object_ready".into();
         }
         journal.reason = Some(fail.reason.clone());
-        write_journal(root, journal)?;
+        journal::write_with_cipher(root, journal, cipher)?;
     }
     Ok(fail)
 }
@@ -2922,6 +3690,8 @@ fn import_result(
     occurrence_id: &str,
     storage_reused: bool,
     journal: &Journal,
+    vault_format: i64,
+    protection: Option<ProtectionMode>,
 ) -> Value {
     let mut body = honesty("Committed");
     body.insert("new_effect".into(), json!(true));
@@ -2942,10 +3712,17 @@ fn import_result(
     body.insert("display_name".into(), json!(journal.display_name));
     body.insert("user_marker".into(), json!(source.user_marker));
     body.insert("injected".into(), json!(false));
+    apply_format_honesty(&mut body, vault_format, protection);
     Value::Object(body)
 }
 
-fn marker_result(req: &MarkerRequest, source: &SourceRow, recorded_at: i64) -> Value {
+fn marker_result(
+    req: &MarkerRequest,
+    source: &SourceRow,
+    recorded_at: i64,
+    vault_format: i64,
+    protection: Option<ProtectionMode>,
+) -> Value {
     let mut body = honesty("Committed");
     body.insert("new_effect".into(), json!(true));
     body.insert("kind".into(), json!("marker"));
@@ -2964,6 +3741,7 @@ fn marker_result(req: &MarkerRequest, source: &SourceRow, recorded_at: i64) -> V
         "marker_role".into(),
         json!("committed metadata observation point, not a subscription fact"),
     );
+    apply_format_honesty(&mut body, vault_format, protection);
     Value::Object(body)
 }
 
@@ -3054,8 +3832,9 @@ pub(super) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
-    if let Some(row) = read_committed(&req.vault, &req.command_id)? {
+fn cancel_without_lock(req: &CancelRequest, banner: VaultBannerKind) -> Result<Report, Fail> {
+    let (_, _, _, cipher) = open_readonly_unlocked(&req.vault, &req.auth)?;
+    if let Some(row) = read_committed_with_cipher(&req.vault, &req.command_id, &cipher)? {
         let generation = result_generation(&row.result_json)?;
         if generation != req.generation {
             return Err(Fail::new(EXIT_REJECTED, "Rejected", "generation_mismatch")
@@ -3076,18 +3855,22 @@ fn cancel_without_lock(req: &CancelRequest) -> Result<Report, Fail> {
             .extra("cancel_applied", json!(false))
             .extra("preservation", json!("not_preserved")));
     }
-    let journal = read_journal_file(&path).map_err(|_| {
+    let journal = journal::read_file_with_cipher(&path, &cipher).map_err(|_| {
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "journal_invalid")
             .extra("cancel_applied", json!(false))
     })?;
-    if journal.kind == "fragment" || journal.kind == "decision" || journal.kind == "html" {
+    if journal.kind == "fragment"
+        || journal.kind == "decision"
+        || journal.kind == "html"
+        || journal.kind == "pdf"
+    {
         return Err(fragment_journal_conflict());
     }
     if journal.generation != req.generation {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "generation_mismatch")
             .extra("cancel_applied", json!(false)));
     }
-    accept_wal_format(&req.vault.join("vault.db"))?;
+    accept_wal_format_with_banner(&req.vault.join("vault.db"), banner)?;
     write_control(&req.vault, &req.command_id, req.generation, &req.kind)?;
     let mut body = honesty("CancelPending");
     body.insert("command_id".into(), json!(req.command_id));
@@ -3107,7 +3890,11 @@ fn fragment_journal_conflict() -> Fail {
         .extra("new_effect", json!(false))
 }
 
-fn read_committed(root: &Path, command_id: &str) -> Result<Option<CommandRow>, Fail> {
+fn read_committed_with_cipher(
+    root: &Path,
+    command_id: &str,
+    cipher: &VaultCipher,
+) -> Result<Option<CommandRow>, Fail> {
     let db = root.join("vault.db");
     if !sqlite_header_ok(&db)? {
         return Err(Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "sqlite_header")
@@ -3121,7 +3908,7 @@ fn read_committed(root: &Path, command_id: &str) -> Result<Option<CommandRow>, F
     .map_err(|err| uncertain(command_id, "wal_open", &err.to_string()))?;
     let _ = conn.busy_timeout(std::time::Duration::from_millis(0));
     accept_connection_format(&db, &conn)?;
-    store::command(&conn, command_id)
+    store::command_with_cipher(&conn, command_id, cipher)
         .map_err(|err| uncertain(command_id, "wal_query", &err.to_string()))
 }
 
@@ -3211,7 +3998,7 @@ fn replay_committed(
             )
             .extra("new_effect", json!(false))
         })?;
-    let source = store::source_by_id(&session.conn, source_id)
+    let source = store::source_by_id_with_cipher(&session.conn, source_id, &session.cipher)
         .map_err(|err| unseen_db(err, "source_lookup"))?
         .ok_or_else(|| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "source_row_missing")
@@ -3224,8 +4011,9 @@ fn replay_committed(
         // hash was checked above, and the requested media type is still part of
         // the import fingerprint. Display name is not.
         SourceView::Absent => {
-            let fingerprint = fingerprint(&["import", &source.content_sha256, &req.media_type]);
-            if fingerprint != existing.payload_fingerprint {
+            let fp = fingerprint(&["import", &source.content_sha256, &req.media_type]);
+            let expected_fp = session.cipher.dedup_key("payload_fingerprint", &fp);
+            if expected_fp != existing.payload_fingerprint {
                 return Err(checked_conflict(&req.command_id, &source)
                     .extra("requested_media_type", json!(req.media_type))
                     .extra("source_check", json!("absent")));
@@ -3260,8 +4048,9 @@ fn replay_committed(
             .extra("byte_length", json!(len))
             .extra("requested_media_type", json!(req.media_type))),
         SourceView::Ready { hash, len } => {
-            let fingerprint = fingerprint(&["import", &hash, &req.media_type]);
-            if fingerprint != existing.payload_fingerprint || len as i64 != source.byte_length {
+            let fp = fingerprint(&["import", &hash, &req.media_type]);
+            let expected_fp = session.cipher.dedup_key("payload_fingerprint", &fp);
+            if expected_fp != existing.payload_fingerprint || len as i64 != source.byte_length {
                 return Err(checked_conflict(&req.command_id, &source)
                     .extra("requested_media_type", json!(req.media_type)));
             }
@@ -3278,35 +4067,38 @@ fn confirm_source_bytes(
     source: &SourceRow,
     command_id: &str,
 ) -> Result<(), Fail> {
-    let object = store::object_by_id(&session.conn, &source.object_id)
+    let object = store::object_by_id_with_cipher(&session.conn, &source.object_id, &session.cipher)
         .map_err(|err| unseen_db(err, "object_lookup"))?
         .ok_or_else(|| {
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_row_missing")
                 .extra("new_effect", json!(false))
                 .extra("command_id", json!(command_id))
         })?;
-    let facts = facts::object_facts(
+    let facts = facts::object_facts_with_cipher(
         &session.root,
         &object.object_id,
         Some(&object.relpath),
         &source.content_sha256,
         source.byte_length,
+        &session.cipher,
     );
     hosted_facts_ok(&facts).map_err(|fail| fail.extra("command_id", json!(command_id)))
 }
 
-fn require_hosted_object(
+fn require_hosted_object_with_cipher(
     root: &Path,
     object: &ObjectRow,
     expected_hash: &str,
     expected_len: i64,
+    cipher: &VaultCipher,
 ) -> Result<(), Fail> {
-    let facts = facts::object_facts(
+    let facts = facts::object_facts_with_cipher(
         root,
         &object.object_id,
         Some(&object.relpath),
         expected_hash,
         expected_len,
+        cipher,
     );
     hosted_facts_ok(&facts)
 }
@@ -3320,6 +4112,9 @@ fn hosted_facts_ok(facts: &ObjectFacts) -> Result<(), Fail> {
     }
     if facts.missing {
         return Err(bad_object("object_missing"));
+    }
+    if let Some(detail) = &facts.auth_error {
+        return Err(bad_object("ciphertext_auth_failed").extra("detail", json!(detail)));
     }
     if !facts.hash_matches || !facts.length_matches {
         return Err(bad_object("hash_mismatch")
@@ -3559,8 +4354,13 @@ fn note_post_commit(mut result: Value, fail: &Fail) -> Value {
     result
 }
 
-fn settle_commit(root: &Path, command_id: &str, err: rusqlite::Error) -> Result<Value, Fail> {
-    match read_committed(root, command_id) {
+fn settle_commit(
+    root: &Path,
+    command_id: &str,
+    err: rusqlite::Error,
+    cipher: &VaultCipher,
+) -> Result<Value, Fail> {
+    match read_committed_with_cipher(root, command_id, cipher) {
         Ok(Some(row)) => {
             let mut body = already_committed(&row)?;
             if let Some(map) = body.as_object_mut() {
@@ -3773,6 +4573,7 @@ mod published_sync_static {
                 fail,
                 "vlt_static",
                 1,
+                None,
                 0,
                 Path::new("/requested/vault"),
                 false,
@@ -3803,6 +4604,7 @@ mod published_sync_static {
             fail,
             "vlt_static",
             3,
+            None,
             0,
             Path::new("/requested/vault"),
             true,
