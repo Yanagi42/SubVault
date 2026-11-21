@@ -1,25 +1,27 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="daylight">
+<html lang="zh-CN" data-theme="gallery">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SubVault — 私人加密资产与票据馆</title>
+  <title>SubVault — 白昼私人资产馆</title>
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <!-- 全屏柔和磨砂拖拽层 -->
+  <!-- 全屏柔和光感拖拽层 -->
   <div id="global-drop-overlay" class="drop-overlay hidden" aria-hidden="true">
     <div class="drop-overlay-card">
-      <div class="drop-overlay-icon">
-        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+      <div class="drop-overlay-ring">
+        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>
       </div>
-      <h2>松手即刻加密入库</h2>
-      <p>支持拖入 PDF 发票、邮件 HTML、支付宝 / 微信 CSV、收据截图或整个文件夹</p>
-      <div class="drop-overlay-tags">
-        <span>按原件自动去重</span>
+      <h2>轻放即可收入资产馆</h2>
+      <p>PDF 电子发票、邮件 HTML、支付宝 / 微信 CSV、收据截图或整个文件夹</p>
+      <div class="drop-overlay-meta">
+        <span>按原件指纹自动防重</span>
+        <span>·</span>
         <span>原件字节零改动</span>
-        <span>100% 离线本机处理</span>
+        <span>·</span>
+        <span>纯本机离线加密</span>
       </div>
     </div>
   </div>
@@ -27,93 +29,87 @@
   <!-- 庆祝彩纸 Canvas -->
   <canvas id="confetti-canvas" class="confetti-canvas hidden" aria-hidden="true"></canvas>
 
-  <!-- 顶部轻提示 Toast -->
+  <!-- 底部浮雕 Toast -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite">
     <span class="toast-dot"></span>
     <span id="toast-msg"></span>
     <button id="toast-close" class="toast-close" type="button" aria-label="关闭提示">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
     </button>
   </div>
 
   <!-- =====================================================================
-       视图 0：欢迎与解锁窗口（macOS 风格居中白昼双栏卡片）
+       视图 0：白昼画廊欢迎窗（杂志级留白 + 实体资产视觉预览卡片）
        ===================================================================== -->
-  <main id="screen-lobby" class="lobby-shell">
-    <div class="lobby-topbar">
-      <button id="lobby-theme-btn" class="ghost-pill-btn" type="button" title="切换界面外观">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
-        <span id="lobby-theme-label">纯净白昼</span>
+  <main id="screen-lobby" class="lobby-stage">
+    <div class="lobby-corner">
+      <button id="lobby-theme-btn" class="pill-ghost" type="button" title="切换画廊光感主题">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <span id="lobby-theme-label">白昼画廊</span>
       </button>
     </div>
 
-    <div class="lobby-window">
-      <!-- 左侧：品牌承诺与最近账本 -->
-      <aside class="lobby-aside">
-        <div class="lobby-brand">
-          <div class="brand-mark">
-            <img src="/icon.svg" alt="SubVault" width="32" height="32">
+    <div class="lobby-folio">
+      <!-- 左侧：品牌叙事 + 实体感概念缩略展品 + 最近账本 -->
+      <aside class="lobby-showcase">
+        <div class="folio-brand-row">
+          <div class="folio-emblem">
+            <img src="/icon.svg" alt="SubVault" width="26" height="26">
           </div>
           <div>
-            <div class="brand-name">SubVault</div>
-            <div class="brand-tag">离线私人资产与票据馆</div>
+            <div class="folio-brand-name">SubVault</div>
+            <div class="folio-brand-sub">LOCAL ARCHIVE · ZERO CLOUD</div>
           </div>
         </div>
 
-        <h1 class="lobby-headline">把每一份订阅、买断授权与硬件保修，安放在只属于你的本地金库</h1>
+        <h1 class="lobby-display">把每一笔订阅、买断密钥与心爱硬件，收进一座只属于你的白昼档案馆</h1>
 
-        <ul class="lobby-promises">
-          <li>
-            <span class="promise-ico">
-              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-            </span>
-            <span>纯本机运行，不连银行、不扫邮箱、绝不上云</span>
-          </li>
-          <li>
-            <span class="promise-ico">
-              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/><path d="m9 12 2 2 4-4"/></svg>
-            </span>
-            <span>发票原件、备注与密钥在硬盘全程加密保护</span>
-          </li>
-          <li>
-            <span class="promise-ico">
-              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-            </span>
-            <span>随时一键导出 Excel 与完整明文备份，零锁定</span>
-          </li>
-        </ul>
+        <!-- 概念性实体资产缩略叠卡（纯粹视觉叙事，传达实物感） -->
+        <div class="lobby-artifact-stack" aria-hidden="true">
+          <div class="mini-artifact art-hw">
+            <div class="ma-top"><span>MacBook Air</span><span class="ma-tag iris">在保 · 45天</span></div>
+            <div class="ma-val">¥28.03 <small>/ 天</small></div>
+          </div>
+          <div class="mini-artifact art-lic">
+            <div class="ma-top"><span>Raycast Pro</span><span class="ma-tag blue">买断密钥</span></div>
+            <div class="ma-code">•••• · •••• · K9X2</div>
+          </div>
+          <div class="mini-artifact art-sub">
+            <div class="ma-top"><span>ChatGPT Plus</span><span class="ma-tag rose">↑ +11%</span></div>
+            <div class="ma-val">$20<small>.00 / 月</small></div>
+          </div>
+        </div>
 
-        <div class="lobby-recent-wrap">
-          <div class="section-eyebrow">最近打开的账本</div>
+        <div class="lobby-recent-block">
+          <div class="micro-eyebrow">最近使用</div>
           <div id="recent-vaults-list" class="recent-list"></div>
-          <div id="recent-vaults-empty" class="recent-empty">暂无历史记录，可在右侧直接新建一本</div>
+          <div id="recent-vaults-empty" class="recent-empty">还没有本地账本，可在右侧立刻创建</div>
         </div>
       </aside>
 
-      <!-- 右侧：单焦点操作面板（打开 / 新建 干净切换） -->
-      <section class="lobby-main">
-        <div class="segmented-bar lobby-seg" role="tablist">
-          <button type="button" class="seg-tab active" data-lobby-tab="unlock">打开已有账本</button>
-          <button type="button" class="seg-tab" data-lobby-tab="create">新建本地账本</button>
+      <!-- 右侧：单焦点流畅操作台 -->
+      <section class="lobby-form-side">
+        <div class="seg-pill lobby-mode-seg" role="tablist">
+          <button type="button" class="seg-btn active" data-lobby-tab="unlock">打开已有账本</button>
+          <button type="button" class="seg-btn" data-lobby-tab="create">新建本地账本</button>
         </div>
 
-        <!-- 面板 A：解锁已有 -->
         <div id="lobby-pane-unlock" class="lobby-pane">
           <form id="form-unlock-vault" class="form-stack">
             <label class="field">
-              <span>账本位置</span>
-              <div class="input-group">
+              <span>账本文件夹位置</span>
+              <div class="input-row">
                 <input id="unlock-path" type="text" required placeholder="例如 C:\Users\你\Documents\SubVault\我的订阅账本">
-                <button type="button" class="btn btn-secondary btn-sm" data-pick-target="unlock-path" data-pick-title="选择已有的 SubVault 账本文件夹">浏览</button>
+                <button type="button" class="btn btn-soft btn-sm" data-pick-target="unlock-path" data-pick-title="选择已有的 SubVault 账本文件夹">浏览</button>
               </div>
             </label>
 
             <div class="field">
               <span>解锁方式</span>
-              <div class="segmented-bar compact" role="tablist">
-                <button type="button" class="seg-tab active" data-unlock-mode="passphrase">主密码</button>
-                <button type="button" class="seg-tab" data-unlock-mode="recovery">恢复密钥</button>
-                <button type="button" class="seg-tab" data-unlock-mode="os-disk">系统盘免密</button>
+              <div class="seg-pill compact" role="tablist">
+                <button type="button" class="seg-btn active" data-unlock-mode="passphrase">主密码</button>
+                <button type="button" class="seg-btn" data-unlock-mode="recovery">恢复密钥</button>
+                <button type="button" class="seg-btn" data-unlock-mode="os-disk">系统盘免密</button>
               </div>
             </div>
 
@@ -129,44 +125,43 @@
 
             <div id="unlock-error" class="form-error hidden"></div>
 
-            <button id="btn-unlock-submit" class="btn btn-primary btn-lg btn-block" type="submit">
-              解锁并进入票据馆
+            <button id="btn-unlock-submit" class="btn btn-ink btn-lg btn-block" type="submit">
+              解锁并进入资产馆
             </button>
           </form>
         </div>
 
-        <!-- 面板 B：新建账本 -->
         <div id="lobby-pane-create" class="lobby-pane hidden">
           <form id="form-create-vault" class="form-stack">
             <label class="field">
-              <span>保存位置（自动新建文件夹）</span>
-              <div class="input-group">
-                <input id="create-path" type="text" required placeholder="选择本机保存路径">
-                <button type="button" class="btn btn-secondary btn-sm" data-pick-target="create-path" data-pick-title="选择新账本保存位置" data-pick-suffix="我的订阅账本">浏览</button>
+              <span>保存位置（自动新建目录）</span>
+              <div class="input-row">
+                <input id="create-path" type="text" required placeholder="选择本机文件夹位置">
+                <button type="button" class="btn btn-soft btn-sm" data-pick-target="create-path" data-pick-title="选择新账本保存位置" data-pick-suffix="我的订阅账本">浏览</button>
               </div>
             </label>
 
             <div class="field">
-              <span>本地保护方式</span>
-              <div class="choice-stack">
-                <label class="choice-card active" id="opt-passphrase">
+              <span>保护方式</span>
+              <div class="choice-list">
+                <label class="choice-tile active" id="opt-passphrase">
                   <input type="radio" name="create-protection" value="passphrase" checked>
-                  <div class="choice-body">
-                    <div class="choice-title">主密码加密保护 <span class="pill-tag pill-blue">推荐</span></div>
-                    <div class="choice-desc">原件、金额、备注与激活密钥全部本地加密，并生成离线恢复密钥备用。</div>
+                  <div class="choice-copy">
+                    <div class="choice-head">主密码加密保护 <span class="micro-pill blue">推荐</span></div>
+                    <div class="choice-note">原件、备注与软件密钥全部本机加密，附带离线恢复密钥。</div>
                   </div>
                 </label>
-                <label class="choice-card" id="opt-os-disk">
+                <label class="choice-tile" id="opt-os-disk">
                   <input type="radio" name="create-protection" value="os-disk">
-                  <div class="choice-body">
-                    <div class="choice-title">系统磁盘加密模式（免密直入）</div>
-                    <div class="choice-desc">适合已启用 BitLocker / FileVault 全盘加密的个人电脑。</div>
+                  <div class="choice-copy">
+                    <div class="choice-head">系统磁盘加密模式（免密直入）</div>
+                    <div class="choice-note">适合已开启 BitLocker / FileVault 全盘加密的电脑。</div>
                   </div>
                 </label>
               </div>
             </div>
 
-            <div id="create-passphrase-fields" class="form-row-2">
+            <div id="create-passphrase-fields" class="grid-2">
               <label class="field">
                 <span>设置主密码（至少 6 位）</span>
                 <input id="create-passphrase" type="password" autocomplete="new-password" placeholder="字母 + 数字组合">
@@ -179,373 +174,306 @@
 
             <div id="create-error" class="form-error hidden"></div>
 
-            <button id="btn-create-submit" class="btn btn-primary btn-lg btn-block" type="submit">
-              创建本地账本并开始
+            <button id="btn-create-submit" class="btn btn-ink btn-lg btn-block" type="submit">
+              创建私人资产馆
             </button>
           </form>
+        </div>
+
+        <div class="lobby-footnote">
+          不连银行 · 不扫邮箱 · 原件零篡改 · 随时一键导出带走
         </div>
       </section>
     </div>
   </main>
 
   <!-- =====================================================================
-       视图 1：主应用桌面工作台（极简左栏 + 舒展白昼主画布）
+       视图 1：白昼画册主工作台（悬浮玻璃顶栏 + 100% 舒展画布，告别传统侧边后台感）
        ===================================================================== -->
-  <div id="screen-workspace" class="app-shell hidden">
-    <!-- 隐藏文件选择器 -->
+  <div id="screen-workspace" class="folio-app hidden">
     <input id="file-picker-input" type="file" multiple accept=".pdf,.html,.htm,.csv,.txt,.png,.jpg,.jpeg,.webp" class="hidden">
     <input id="folder-picker-input" type="file" webkitdirectory multiple class="hidden">
 
-    <!-- 左侧优雅导航栏 -->
-    <aside class="sidebar">
-      <div class="sb-header">
-        <div class="sb-brand">
-          <div class="brand-mark brand-mark-sm">
-            <img src="/icon.svg" alt="SubVault" width="24" height="24">
-          </div>
-          <div class="sb-vault-meta">
-            <div id="sb-vault-name" class="sb-vault-name">我的订阅账本</div>
-            <div class="sb-vault-state">
-              <span id="sb-vault-dot" class="status-dot green"></span>
-              <span id="sb-vault-status">已加密 · 本机离线</span>
+    <!-- 顶部极简浮空导览栏 -->
+    <header class="masthead">
+      <div class="masthead-inner">
+        <!-- 左：账本身份胶囊（点击展开路径 / 锁定 / 退出浮层） -->
+        <div class="vault-anchor">
+          <button id="vault-pill-btn" class="vault-pill" type="button" title="账本状态与安全退出">
+            <img src="/icon.svg" alt="SubVault" width="20" height="20" class="vp-logo">
+            <span id="mh-vault-name" class="vp-name">我的订阅账本</span>
+            <span id="mh-vault-dot" class="vp-dot green"></span>
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+          <div id="vault-popover" class="vault-popover hidden">
+            <div class="vp-pop-head">
+              <div id="vp-vault-status" class="vp-pop-status">本机已加密 · 离线运行</div>
+              <div id="vp-vault-path" class="vp-pop-path"></div>
+            </div>
+            <div class="vp-pop-actions">
+              <button id="btn-lock-vault" class="vp-pop-btn" type="button">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                锁定账本（清空内存密钥）
+              </button>
+              <button id="btn-shutdown-app" class="vp-pop-btn danger" type="button">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" x2="12" y1="2" y2="12"/></svg>
+                安全退出工作台
+              </button>
             </div>
           </div>
         </div>
-      </div>
 
-      <div class="sb-search-wrap">
-        <button id="btn-cmd-open" class="sb-cmd-trigger" type="button" title="打开搜索与快捷指令（Ctrl+K）">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-          <span>搜索或指令…</span>
-          <kbd>⌘K</kbd>
-        </button>
-      </div>
-
-      <nav class="sb-nav" aria-label="主导航">
-        <div class="sb-section-label">工作台</div>
-        <button class="nav-item active" data-nav="assets" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1.5"/><rect width="7" height="7" x="14" y="3" rx="1.5"/><rect width="7" height="7" x="14" y="14" rx="1.5"/><rect width="7" height="7" x="3" y="14" rx="1.5"/></svg></span>
-          <span class="nav-label">全部资产</span>
-          <span id="cnt-all" class="nav-badge">0</span>
-        </button>
-        <button class="nav-item" data-nav="calendar" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg></span>
-          <span class="nav-label">续费与保修日历</span>
-        </button>
-        <button class="nav-item" data-nav="insights" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg></span>
-          <span class="nav-label">洞察与省钱沙盘</span>
-        </button>
-        <button class="nav-item" data-nav="triage" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></span>
-          <span class="nav-label">极速整理</span>
-          <span id="cnt-triage" class="nav-badge badge-warm hidden">0</span>
-        </button>
-        <button class="nav-item" data-nav="security" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/><path d="m9 12 2 2 4-4"/></svg></span>
-          <span class="nav-label">核对与备份</span>
-          <span id="cnt-attention" class="nav-badge hidden">0</span>
-        </button>
-
-        <div class="sb-section-label" style="margin-top:18px">智能分类</div>
-        <button class="nav-item" data-collection="subscription" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg></span>
-          <span class="nav-label">周期订阅</span>
-          <span id="cnt-sub" class="nav-badge"></span>
-        </button>
-        <button class="nav-item" data-collection="license" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg></span>
-          <span class="nav-label">买断与密钥</span>
-          <span id="cnt-lic" class="nav-badge"></span>
-        </button>
-        <button class="nav-item" data-collection="hardware" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="12" x="4" y="4" rx="2"/><path d="M2 20h20"/></svg></span>
-          <span class="nav-label">硬件与保修</span>
-          <span id="cnt-hw" class="nav-badge"></span>
-        </button>
-        <button class="nav-item" data-collection="reimbursable" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/><path d="M8 7h8M8 11h8M8 15h5"/></svg></span>
-          <span class="nav-label">报销跟进</span>
-          <span id="cnt-reimb" class="nav-badge"></span>
-        </button>
-        <button class="nav-item" data-collection="csv" type="button">
-          <span class="nav-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8"/></svg></span>
-          <span class="nav-label">CSV 流水挑拣</span>
-          <span id="cnt-csv" class="nav-badge"></span>
-        </button>
-      </nav>
-
-      <div class="sb-footer">
-        <button id="sb-drop-hint" class="sb-drop-pill" type="button" title="点击选择文件，或直接将文件拖入窗口任意位置">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
-          <span>拖入发票 / CSV / 文件夹</span>
-        </button>
-
-        <div class="sb-util-row">
-          <button id="btn-theme-cycle" class="sb-icon-btn" type="button" title="切换外观（纯净白昼 / 暖玉极简 / 静谧深色）">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <!-- 中：悬浮磨砂胶囊主导航 -->
+        <nav class="floating-dock" aria-label="主视图切换">
+          <button class="dock-item active" data-nav="assets" type="button">资产馆</button>
+          <button class="dock-item" data-nav="calendar" type="button">时间轴日历</button>
+          <button class="dock-item" data-nav="insights" type="button">洞察与沙盘</button>
+          <button class="dock-item" data-nav="triage" type="button">
+            整理台 <span id="cnt-triage" class="dock-badge amber hidden">0</span>
           </button>
-          <button id="btn-privacy-toggle" class="sb-icon-btn" type="button" title="隐私防窥打码（快捷键 P）">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+          <button class="dock-item" data-nav="security" type="button">
+            备份与核对 <span id="cnt-attention" class="dock-badge hidden">0</span>
           </button>
-          <button id="btn-lock-vault" class="sb-icon-btn" type="button" title="立即锁定账本并清空内存密钥">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-          </button>
-          <button id="btn-shutdown-app" class="sb-icon-btn danger" type="button" title="安全退出并关闭本机服务">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" x2="12" y1="2" y2="12"/></svg>
-          </button>
-        </div>
-        <div id="sb-vault-path" class="sb-vault-path"></div>
-      </div>
-    </aside>
+        </nav>
 
-    <!-- 右侧纯净主工作画布 -->
-    <main class="main-stage">
-      <!-- 轻薄毛玻璃顶栏 -->
-      <header class="stage-header">
-        <div class="stage-title-group">
-          <h2 id="stage-title" class="stage-title">全部资产</h2>
-          <span id="stage-count" class="stage-count">0</span>
-          <div id="stage-active-chips" class="stage-chips"></div>
-        </div>
-
-        <div class="stage-actions">
+        <!-- 右：静谧工具与主录入动作 -->
+        <div class="masthead-right">
           <div id="import-progress" class="import-pill hidden"></div>
 
-          <div id="stage-assets-controls" class="assets-header-tools">
-            <div class="search-field">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-              <input id="search-box" type="search" placeholder="筛选商家、账号、备注… (/)">
-            </div>
-
-            <div class="icon-seg" role="group" aria-label="切换卡片或列表">
-              <button class="icon-seg-btn active" data-view-mode="cards" type="button" title="卡片视图">
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>
-              </button>
-              <button class="icon-seg-btn" data-view-mode="table" type="button" title="台账列表">
-                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>
-              </button>
-            </div>
-          </div>
-
-          <button id="btn-open-manual" class="btn btn-secondary btn-sm" type="button">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-            记一笔
+          <button id="btn-cmd-open" class="icon-circle" type="button" title="搜索或快捷指令（Ctrl+K）">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          </button>
+          <button id="btn-privacy-toggle" class="icon-circle" type="button" title="隐私防窥模糊（快捷键 P）">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+          <button id="btn-theme-cycle" class="icon-circle" type="button" title="切换光感外观（白昼画廊 / 晨光宣纸 / 静谧夜览）">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
           </button>
 
-          <div class="split-primary-btn">
-            <button id="btn-import-files" class="btn btn-primary btn-sm" type="button">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
-              导入账单
+          <button id="btn-open-manual" class="btn btn-soft btn-sm" type="button">记一笔</button>
+
+          <div class="split-ink-btn">
+            <button id="btn-import-files" class="btn btn-ink btn-sm" type="button">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+              收入账单
             </button>
-            <button id="btn-import-folder" class="btn btn-primary btn-sm btn-icon-only" type="button" title="批量导入整个文件夹">
+            <button id="btn-import-folder" class="btn btn-ink btn-sm btn-icon-pad" type="button" title="批量导入整个文件夹">
               <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
             </button>
           </div>
         </div>
-      </header>
-
-      <!-- 内容容器 -->
-      <div class="stage-content">
-        <!-- 视图 A：资产库总览 -->
-        <section id="pane-assets" class="stage-pane">
-          <!-- 示例数据一键清空条（仅当账本包含体验示例时出现） -->
-          <div id="demo-notice-bar" class="demo-notice-bar hidden">
-            <div class="demo-notice-text">
-              <span class="pill-tag pill-blue">体验模式</span>
-              <span id="demo-notice-msg">当前账本包含体验示例数据，随时可一键移除且不影响你的真实账单。</span>
-            </div>
-            <button id="btn-clear-demo-pack" class="btn btn-secondary btn-sm" type="button">一键清空示例数据</button>
-          </div>
-
-          <!-- 统一财务总览 Bento（含内嵌按需提醒条） -->
-          <div id="hero-bento" class="hero-bento"></div>
-
-          <!-- 轻量级次级筛选与排序条 -->
-          <div id="assets-subbar" class="subbar hidden">
-            <div class="subbar-left">
-              <select id="filter-account" class="clean-select" title="按归属账号筛选">
-                <option value="">所有账号</option>
-              </select>
-              <select id="filter-currency" class="clean-select" title="按币种筛选">
-                <option value="">所有币种</option>
-              </select>
-            </div>
-            <div class="subbar-right">
-              <span class="subbar-caption">所有金额按原件币种独立统计，绝不虚构汇率</span>
-              <select id="sort-order" class="clean-select" title="排序方式">
-                <option value="recent">按录入时间</option>
-                <option value="amount_desc">按金额从高到低</option>
-                <option value="date_desc">按账单日期</option>
-              </select>
-            </div>
-          </div>
-
-          <!-- 卡片画廊 / 列表渲染舞台 -->
-          <div id="ledger-stage"></div>
-        </section>
-
-        <!-- 视图 B：专属续费与保修日历 -->
-        <section id="pane-calendar" class="stage-pane hidden"></section>
-
-        <!-- 视图 C：洞察图表 + 商家档案 + 省钱沙盘 -->
-        <section id="pane-insights" class="stage-pane hidden"></section>
-
-        <!-- 视图 D：极速整理工作台 -->
-        <section id="pane-triage" class="stage-pane hidden"></section>
-
-        <!-- 视图 E：去重核对、离线导出与安全设置 -->
-        <section id="pane-security" class="stage-pane hidden">
-          <div id="security-attention-wrap" class="security-section"></div>
-
-          <div class="section-heading">离线导出与独立校验</div>
-          <div class="bento-2">
-            <div class="surface-card pad-20 stack-12">
-              <div class="card-kicker">表格导出</div>
-              <h3 class="card-title">下载 Excel 资产台账（.csv）</h3>
-              <p class="card-desc">采用 Windows Excel 兼容编码，中文不乱码；包含资产类型、保修截止、报销状态与原件校验码（出于安全自动隐藏原始软件密钥）。</p>
-              <div style="margin-top:auto">
-                <button id="btn-dl-excel" class="btn btn-primary btn-sm" type="button">下载 Excel 表格 (.csv)</button>
-              </div>
-            </div>
-
-            <div class="surface-card pad-20 stack-12">
-              <div class="card-kicker">完整带走</div>
-              <h3 class="card-title">下载完整离线备份包（.zip）</h3>
-              <p class="card-desc">打包全部未改动原始发票、台账表格、可读核对单与防篡改清单，彻底摆脱软件绑定。</p>
-              <label id="zip-ack-row" class="check-row hidden">
-                <input id="chk-zip-ack" type="checkbox">
-                <span>我知晓导出的备份包为明文原件，将自行妥善保管</span>
-              </label>
-              <div style="margin-top:auto">
-                <button id="btn-dl-zip" class="btn btn-primary btn-sm" type="button">下载完整离线包 (.zip)</button>
-              </div>
-            </div>
-
-            <div class="surface-card pad-20 stack-12">
-              <div class="card-kicker">本地归档</div>
-              <h3 class="card-title">导出到本地文件夹并自动验真</h3>
-              <p class="card-desc">写入指定文件夹后，立即用独立校验引擎逐个核对原件字节完整性。</p>
-              <label class="field">
-                <span>目标文件夹路径（不能位于当前账本内部）</span>
-                <div class="input-group">
-                  <input id="export-dir-path" type="text" placeholder="例如 C:\Users\你\Documents\SubVault-备份">
-                  <button type="button" class="btn btn-secondary btn-sm" data-pick-target="export-dir-path" data-pick-title="选择备份包保存位置" data-pick-suffix="SubVault-备份包">浏览</button>
-                </div>
-              </label>
-              <label id="dir-ack-row" class="check-row hidden">
-                <input id="chk-dir-ack" type="checkbox">
-                <span>我知晓导出的目录为明文原件与记录</span>
-              </label>
-              <div>
-                <button id="btn-export-dir" class="btn btn-secondary btn-sm" type="button">导出并立即校验</button>
-              </div>
-              <div id="export-dir-result" class="inline-result hidden"></div>
-            </div>
-
-            <div class="surface-card pad-20 stack-12">
-              <div class="card-kicker">独立核验</div>
-              <h3 class="card-title">校验历史离线备份包</h3>
-              <p class="card-desc">选择以前导出的任意备份目录，核对每一份原件是否与当时完全一致、未经损坏。</p>
-              <label class="field">
-                <span>备份包目录路径</span>
-                <div class="input-group">
-                  <input id="verify-dir-path" type="text" placeholder="选择包含 manifest.json 的目录">
-                  <button type="button" class="btn btn-secondary btn-sm" data-pick-target="verify-dir-path" data-pick-title="选择要校验的备份包目录">浏览</button>
-                </div>
-              </label>
-              <div>
-                <button id="btn-verify-dir" class="btn btn-secondary btn-sm" type="button">开始完整性校验</button>
-              </div>
-              <div id="verify-dir-result" class="inline-result hidden"></div>
-            </div>
-          </div>
-
-          <div id="card-security-rotate" class="surface-card pad-20 stack-14 hidden" style="margin-top:16px">
-            <div>
-              <div class="card-kicker">账本安全</div>
-              <h3 class="card-title">修改账本主密码</h3>
-              <p class="card-desc">无需重新导入历史账单，可安全更换主密码并选择性轮换离线恢复密钥。</p>
-            </div>
-            <form id="form-rotate-pass" class="stack-12">
-              <div class="form-row-2">
-                <label class="field">
-                  <span>新主密码（至少 6 位）</span>
-                  <input id="rotate-new-pass" type="password" required placeholder="输入新密码">
-                </label>
-                <label class="field">
-                  <span>确认新主密码</span>
-                  <input id="rotate-new-pass-confirm" type="password" required placeholder="再次输入">
-                </label>
-              </div>
-              <label class="check-row">
-                <input id="chk-rotate-recovery" type="checkbox">
-                <span>同步重新生成离线恢复密钥（旧恢复密钥立即作废）</span>
-              </label>
-              <div>
-                <button class="btn btn-secondary btn-sm" type="submit">更新主密码</button>
-              </div>
-            </form>
-          </div>
-        </section>
       </div>
+    </header>
+
+    <!-- 100% 舒展画廊主画布 -->
+    <main class="folio-container">
+      <!-- 视图 A：白昼资产馆 -->
+      <section id="pane-assets" class="view-pane">
+        <!-- 示例数据一键清空条（仅当存在示例数据时浮现） -->
+        <div id="demo-notice-bar" class="demo-banner hidden">
+          <div class="demo-banner-left">
+            <span class="micro-pill blue">体验示例</span>
+            <span id="demo-notice-msg">当前账本包含体验示例数据，随时可一键清除且不影响真实账单。</span>
+          </div>
+          <button id="btn-clear-demo-pack" class="btn btn-soft btn-sm" type="button">一键清空示例数据</button>
+        </div>
+
+        <!-- 杂志级非对称 Hero：左「动态资产总览 + 构成光带」 / 右「实时资产信号卡」 -->
+        <div id="editorial-hero" class="editorial-hero"></div>
+
+        <!-- 雕塑感智能分类条 + 轻盈搜索排序 -->
+        <div id="collection-bar" class="collection-bar hidden">
+          <div class="collection-pills" id="collection-pills">
+            <button type="button" class="cpill active" data-collection="all">全部 <span class="cp-n" id="cnt-all">0</span></button>
+            <button type="button" class="cpill" data-collection="subscription">周期订阅 <span class="cp-n" id="cnt-sub"></span></button>
+            <button type="button" class="cpill" data-collection="license">买断密钥 <span class="cp-n" id="cnt-lic"></span></button>
+            <button type="button" class="cpill" data-collection="hardware">硬件保修 <span class="cp-n" id="cnt-hw"></span></button>
+            <button type="button" class="cpill" data-collection="reimbursable">报销联 <span class="cp-n" id="cnt-reimb"></span></button>
+            <button type="button" class="cpill" data-collection="csv">CSV 流水 <span class="cp-n" id="cnt-csv"></span></button>
+          </div>
+
+          <div class="collection-tools">
+            <div id="active-filter-chips" class="inline-chips"></div>
+            <div class="search-capsule">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+              <input id="search-box" type="search" placeholder="筛选商家、型号、备注…">
+            </div>
+            <select id="filter-account" class="ghost-select" title="按归属账号筛选">
+              <option value="">所有账号</option>
+            </select>
+            <select id="sort-order" class="ghost-select" title="排序方式">
+              <option value="recent">最新收入</option>
+              <option value="amount_desc">金额从高到低</option>
+              <option value="date_desc">账单日期最近</option>
+            </select>
+            <div class="view-toggle" role="group" aria-label="切换画廊或清单">
+              <button class="vt-btn active" data-view-mode="cards" type="button" title="实物感画廊">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="7" height="7" x="3" y="3" rx="1.2"/><rect width="7" height="7" x="14" y="3" rx="1.2"/><rect width="7" height="7" x="14" y="14" rx="1.2"/><rect width="7" height="7" x="3" y="14" rx="1.2"/></svg>
+              </button>
+              <button class="vt-btn" data-view-mode="table" type="button" title="高密度清单">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 实体感资产陈列区 -->
+        <div id="ledger-stage"></div>
+      </section>
+
+      <!-- 视图 B：70/30 双栏时间轴日历 -->
+      <section id="pane-calendar" class="view-pane hidden"></section>
+
+      <!-- 视图 C：洞察图表 + 商家档案 + 省钱沙盘 -->
+      <section id="pane-insights" class="view-pane hidden"></section>
+
+      <!-- 视图 D：胶片观片台式极速整理 -->
+      <section id="pane-triage" class="view-pane hidden"></section>
+
+      <!-- 视图 E：备份、防重核对与安全设置 -->
+      <section id="pane-security" class="view-pane hidden">
+        <div class="page-intro">
+          <div class="micro-eyebrow">ARCHIVE INTEGRITY &amp; PORTABILITY</div>
+          <h2>离线导出、防重核对与金库安全</h2>
+          <p>你永远拥有数据的完整控制权：每一份原件都能随时明文导出并用独立校验器验真。</p>
+        </div>
+
+        <div id="security-attention-wrap" class="sec-stack"></div>
+
+        <div class="sec-grid-2">
+          <div class="folio-card pad-24 stack-12">
+            <div class="micro-eyebrow">EXCEL LEDGER</div>
+            <h3 class="folio-h3">导出 Excel 资产台账（.csv）</h3>
+            <p class="folio-p">Windows Excel 双击直开中文绝不乱码；涵盖资产类型、保修截止、报销进度与原件指纹，并出于安全自动隐藏原始激活密钥。</p>
+            <div style="margin-top:auto">
+              <button id="btn-dl-excel" class="btn btn-ink btn-sm" type="button">下载 Excel 表格 (.csv)</button>
+            </div>
+          </div>
+
+          <div class="folio-card pad-24 stack-12">
+            <div class="micro-eyebrow">FULL EXIT PACK</div>
+            <h3 class="folio-h3">下载完整离线备份包（.zip）</h3>
+            <p class="folio-p">包含全部未改动原始发票、台账表格、可读核对单与防篡改清单，彻底摆脱软件绑定。</p>
+            <label id="zip-ack-row" class="check-row hidden">
+              <input id="chk-zip-ack" type="checkbox">
+              <span>我已知晓备份包内含明文原件，会妥善离线保管</span>
+            </label>
+            <div style="margin-top:auto">
+              <button id="btn-dl-zip" class="btn btn-ink btn-sm" type="button">下载完整备份包 (.zip)</button>
+            </div>
+          </div>
+
+          <div class="folio-card pad-24 stack-12">
+            <div class="micro-eyebrow">LOCAL ARCHIVE</div>
+            <h3 class="folio-h3">导出到本地文件夹并验真</h3>
+            <p class="folio-p">写入硬盘目录后，立即运行独立引擎逐文件校验字节完整性。</p>
+            <label class="field">
+              <span>导出目录（不可位于当前账本内部）</span>
+              <div class="input-row">
+                <input id="export-dir-path" type="text" placeholder="例如 C:\Users\你\Documents\SubVault-备份">
+                <button type="button" class="btn btn-soft btn-sm" data-pick-target="export-dir-path" data-pick-title="选择备份包保存位置" data-pick-suffix="SubVault-备份包">浏览</button>
+              </div>
+            </label>
+            <label id="dir-ack-row" class="check-row hidden">
+              <input id="chk-dir-ack" type="checkbox">
+              <span>我已知晓导出的目录为明文原件与记录</span>
+            </label>
+            <div><button id="btn-export-dir" class="btn btn-soft btn-sm" type="button">导出并立即校验</button></div>
+            <div id="export-dir-result" class="inline-banner hidden"></div>
+          </div>
+
+          <div class="folio-card pad-24 stack-12">
+            <div class="micro-eyebrow">VERIFY BACKUP</div>
+            <h3 class="folio-h3">独立校验历史备份包</h3>
+            <p class="folio-p">指定任意曾导出的备份目录，核对每一份原件是否完整无篡改。</p>
+            <label class="field">
+              <span>备份包目录路径</span>
+              <div class="input-row">
+                <input id="verify-dir-path" type="text" placeholder="选择包含 manifest.json 的目录">
+                <button type="button" class="btn btn-soft btn-sm" data-pick-target="verify-dir-path" data-pick-title="选择要校验的备份包目录">浏览</button>
+              </div>
+            </label>
+            <div><button id="btn-verify-dir" class="btn btn-soft btn-sm" type="button">开始完整性校验</button></div>
+            <div id="verify-dir-result" class="inline-banner hidden"></div>
+          </div>
+        </div>
+
+        <div id="card-security-rotate" class="folio-card pad-24 stack-14 hidden" style="margin-top:16px">
+          <div>
+            <div class="micro-eyebrow">VAULT KEY ROTATION</div>
+            <h3 class="folio-h3">更换账本主密码</h3>
+            <p class="folio-p">无需重新导入历史原件，即可安全轮换主密码并可选重新生成离线恢复密钥。</p>
+          </div>
+          <form id="form-rotate-pass" class="stack-12">
+            <div class="grid-2">
+              <label class="field">
+                <span>新主密码（至少 6 位）</span>
+                <input id="rotate-new-pass" type="password" required placeholder="输入新密码">
+              </label>
+              <label class="field">
+                <span>确认新主密码</span>
+                <input id="rotate-new-pass-confirm" type="password" required placeholder="再次输入">
+              </label>
+            </div>
+            <label class="check-row">
+              <input id="chk-rotate-recovery" type="checkbox">
+              <span>同步生成新的离线恢复密钥（旧恢复密钥立即作废）</span>
+            </label>
+            <div><button class="btn btn-soft btn-sm" type="submit">更新主密码</button></div>
+          </form>
+        </div>
+      </section>
     </main>
   </div>
 
   <!-- =====================================================================
-       弹窗 A：离线恢复密钥保存（创建 / 轮换后一次性提示）
+       弹窗 A：离线恢复密钥
        ===================================================================== -->
   <div id="modal-recovery" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-sheet">
       <div class="modal-head">
-        <h3>妥善保管你的离线恢复密钥</h3>
-        <span class="pill-tag pill-amber">仅显示一次</span>
+        <h3>请立即保管你的离线恢复密钥</h3>
+        <span class="micro-pill amber">仅显示一次</span>
       </div>
-      <p class="modal-sub">
-        SubVault 不设云端账号也不存密码。若将来忘记主密码，这串恢复密钥是找回账本的<strong>唯一钥匙</strong>，请立即下载备份到安全位置。
-      </p>
-      <div class="recovery-display">
-        <code id="modal-recovery-key"></code>
-      </div>
+      <p class="modal-sub">SubVault 纯离线运行且不存密码。若将来忘记主密码，这串密钥是找回账本的<strong>唯一钥匙</strong>，请立刻下载离线留存。</p>
+      <div class="recovery-plate"><code id="modal-recovery-key"></code></div>
       <div class="btn-row">
-        <button id="btn-copy-recovery" class="btn btn-secondary btn-sm" type="button">复制恢复密钥</button>
-        <button id="btn-download-recovery" class="btn btn-secondary btn-sm" type="button">下载 .txt 备份文件</button>
+        <button id="btn-copy-recovery" class="btn btn-soft btn-sm" type="button">复制密钥</button>
+        <button id="btn-download-recovery" class="btn btn-soft btn-sm" type="button">下载 .txt 备份</button>
       </div>
       <label class="check-row">
         <input id="chk-recovery-saved" type="checkbox">
-        <span>我已将这串恢复密钥安全离线保存</span>
+        <span>我已妥善离线保管这串恢复密钥</span>
       </label>
-      <button id="btn-confirm-recovery" class="btn btn-primary btn-lg btn-block" type="button" disabled>
-        确认并进入票据馆
-      </button>
+      <button id="btn-confirm-recovery" class="btn btn-ink btn-lg btn-block" type="button" disabled>确认并进入资产馆</button>
     </div>
   </div>
 
   <!-- =====================================================================
-       弹窗 B：手动记一笔资产 / 账单（渐进式展开）
+       弹窗 B：手动记一笔资产
        ===================================================================== -->
   <div id="modal-manual" class="modal-backdrop hidden" role="dialog" aria-modal="true">
-    <div class="modal-sheet modal-sheet-wide">
+    <div class="modal-sheet modal-wide">
       <div class="modal-head">
         <div>
-          <h3>手动记一笔资产</h3>
-          <p class="modal-sub" style="margin-top:2px">自动生成本地加密凭证，并纳入日历、图表与资产提醒</p>
+          <h3>收入一笔新资产</h3>
+          <p class="modal-sub">自动生成本地加密凭证，并纳入日历、构成光带与提醒系统</p>
         </div>
-        <button id="btn-close-manual" class="icon-close-btn" type="button" aria-label="关闭">
+        <button id="btn-close-manual" class="close-btn" type="button" aria-label="关闭">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
         </button>
       </div>
 
       <form id="form-manual-entry" class="form-stack">
-        <div class="segmented-bar kind-seg" role="radiogroup" aria-label="选择资产类型">
-          <button type="button" class="seg-tab active" data-man-kind="subscription">周期订阅</button>
-          <button type="button" class="seg-tab" data-man-kind="license">买断授权</button>
-          <button type="button" class="seg-tab" data-man-kind="hardware">硬件保修</button>
-          <button type="button" class="seg-tab" data-man-kind="reimbursable">报销凭证</button>
-          <button type="button" class="seg-tab" data-man-kind="general">普通账单</button>
+        <div class="seg-pill kind-seg" role="radiogroup" aria-label="选择资产类型">
+          <button type="button" class="seg-btn active" data-man-kind="subscription">周期订阅</button>
+          <button type="button" class="seg-btn" data-man-kind="license">买断授权</button>
+          <button type="button" class="seg-btn" data-man-kind="hardware">硬件保修</button>
+          <button type="button" class="seg-btn" data-man-kind="reimbursable">报销凭证</button>
+          <button type="button" class="seg-btn" data-man-kind="general">普通账单</button>
         </div>
 
-        <div class="form-row-2">
+        <div class="grid-2">
           <label class="field">
             <span>商家 / 品牌或设备名 *</span>
             <input id="man-vendor" type="text" required placeholder="如 Spotify、Raycast、MacBook Air">
@@ -556,7 +484,7 @@
           </label>
         </div>
 
-        <div class="form-row-2">
+        <div class="grid-2">
           <label class="field">
             <span>币种</span>
             <select id="man-currency"></select>
@@ -567,22 +495,21 @@
           </label>
         </div>
 
-        <div id="man-cycle-row" class="chip-line">
-          <span class="chip-line-label">计费周期</span>
-          <button type="button" class="choice-pill active" data-man-cycle="monthly">月付</button>
-          <button type="button" class="choice-pill" data-man-cycle="yearly">年付</button>
-          <button type="button" class="choice-pill" data-man-cycle="quarterly">季付</button>
-          <button type="button" class="choice-pill" data-man-cycle="one_time">一次性</button>
+        <div id="man-cycle-row" class="chip-strip">
+          <span class="chip-strip-lbl">周期</span>
+          <button type="button" class="tap-chip active" data-man-cycle="monthly">月付</button>
+          <button type="button" class="tap-chip" data-man-cycle="yearly">年付</button>
+          <button type="button" class="tap-chip" data-man-cycle="quarterly">季付</button>
+          <button type="button" class="tap-chip" data-man-cycle="one_time">一次性</button>
         </div>
 
-        <!-- 渐进展开：买断授权 -->
-        <div id="man-panel-license" class="inset-panel hidden">
-          <div class="form-row-2">
+        <div id="man-panel-license" class="tinted-box hidden">
+          <div class="grid-2">
             <label class="field">
               <span>激活密钥 / 序列号（单独加密）</span>
-              <div class="input-group">
+              <div class="input-row">
                 <input id="man-license-key" type="password" autocomplete="off" placeholder="选填，如 XXXX-XXXX-XXXX">
-                <button type="button" id="btn-man-toggle-key" class="btn btn-secondary btn-sm">显示</button>
+                <button type="button" id="btn-man-toggle-key" class="btn btn-soft btn-sm">显示</button>
               </div>
             </label>
             <label class="field">
@@ -592,18 +519,16 @@
           </div>
         </div>
 
-        <!-- 渐进展开：硬件保修 -->
-        <div id="man-panel-hardware" class="inset-panel hidden">
+        <div id="man-panel-hardware" class="tinted-box hidden">
           <label class="field">
-            <span>保修截止日期（将在日历提醒并自动计算日均持有成本）</span>
+            <span>保修截止日期（自动绘制保修倒计时环与日均持有成本）</span>
             <input id="man-warranty-end" type="date">
           </label>
         </div>
 
-        <!-- 渐进展开：报销凭证 -->
-        <div id="man-panel-reimb" class="inset-panel hidden">
+        <div id="man-panel-reimb" class="tinted-box hidden">
           <label class="field">
-            <span>报销进度</span>
+            <span>报销状态</span>
             <select id="man-reimburse-status">
               <option value="pending">待报销（尚未提交）</option>
               <option value="submitted">已提交财务审批</option>
@@ -612,16 +537,16 @@
           </label>
         </div>
 
-        <div class="chip-line">
-          <span class="chip-line-label">归属账号</span>
-          <button type="button" class="choice-pill active" data-man-acc="个人">个人</button>
-          <button type="button" class="choice-pill" data-man-acc="公司工作">公司工作</button>
-          <button type="button" class="choice-pill" data-man-acc="家庭共享">家庭共享</button>
+        <div class="chip-strip">
+          <span class="chip-strip-lbl">账号</span>
+          <button type="button" class="tap-chip active" data-man-acc="个人">个人</button>
+          <button type="button" class="tap-chip" data-man-acc="公司工作">公司工作</button>
+          <button type="button" class="tap-chip" data-man-acc="家庭共享">家庭共享</button>
         </div>
 
-        <div class="form-row-2">
+        <div class="grid-2">
           <label class="field">
-            <span>账号标签</span>
+            <span>归属账号</span>
             <input id="man-account" type="text" value="个人" placeholder="个人 / 公司工作 / 邮箱">
           </label>
           <label class="field">
@@ -630,7 +555,7 @@
           </label>
         </div>
 
-        <div class="form-row-2">
+        <div class="grid-2">
           <label class="field">
             <span>购买 / 账单日期</span>
             <input id="man-bill-date" type="date">
@@ -643,20 +568,20 @@
 
         <div class="modal-foot">
           <button id="btn-cancel-manual" class="btn btn-ghost btn-sm" type="button">取消</button>
-          <button id="btn-submit-manual" class="btn btn-primary btn-sm" type="submit">保存这笔资产</button>
+          <button id="btn-submit-manual" class="btn btn-ink btn-sm" type="submit">收入资产馆</button>
         </div>
       </form>
     </div>
   </div>
 
   <!-- =====================================================================
-       弹窗 C：全局 Spotlight 命令面板 (Ctrl+K)
+       弹窗 C：Spotlight 命令面板 (Ctrl+K)
        ===================================================================== -->
   <div id="modal-cmd" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="cmd-sheet">
-      <div class="cmd-search-row">
+      <div class="cmd-search">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input id="cmd-input" type="text" placeholder="搜索资产、商家，或直达日历 / 密钥库 / 保修 / 省钱沙盘…">
+        <input id="cmd-input" type="text" placeholder="搜索资产、商家，或直达密钥库 / 硬件保修 / 日历 / 省钱沙盘…">
         <kbd>Esc</kbd>
       </div>
       <div id="cmd-list" class="cmd-list"></div>
@@ -664,54 +589,53 @@
   </div>
 
   <!-- =====================================================================
-       右侧滑出抽屉：资产详情与原件核对检视器
+       右侧浮雕详情检视抽屉
        ===================================================================== -->
   <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
   <aside id="detail-drawer" class="drawer hidden" aria-label="资产详情与原件核对">
-    <div class="drawer-header">
+    <div class="drawer-head">
       <div class="drawer-id">
-        <div id="drawer-avatar" class="monogram">SV</div>
-        <div class="drawer-id-text">
+        <div id="drawer-avatar" class="brand-badge">SV</div>
+        <div class="drawer-id-copy">
           <h3 id="drawer-title">资产详情</h3>
           <div id="drawer-subtitle" class="drawer-sub"></div>
         </div>
       </div>
-      <div class="drawer-header-right">
-        <span id="drawer-stamp" class="pill-tag pill-green">原件完整</span>
-        <button id="btn-close-drawer" class="icon-close-btn" type="button" aria-label="关闭">
+      <div class="drawer-head-right">
+        <span id="drawer-stamp" class="micro-pill green">原件完整</span>
+        <button id="btn-close-drawer" class="close-btn" type="button" aria-label="关闭">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
         </button>
       </div>
     </div>
 
-    <div class="drawer-tab-wrap">
-      <div class="segmented-bar compact" id="drawer-tabs">
-        <button class="seg-tab dtab active" data-dtab="edit" type="button">信息与金额</button>
-        <button class="seg-tab dtab" data-dtab="evidence" type="button">原件预览</button>
-        <button class="seg-tab dtab hidden" id="dtab-csv-btn" data-dtab="csv" type="button">流水挑拣</button>
-        <button class="seg-tab dtab" data-dtab="history" type="button">修订历史</button>
-        <button class="seg-tab dtab" data-dtab="redact" type="button">脱敏导出</button>
+    <div class="drawer-tabs-wrap">
+      <div class="seg-pill compact" id="drawer-tabs">
+        <button class="seg-btn dtab active" data-dtab="edit" type="button">信息与金额</button>
+        <button class="seg-btn dtab" data-dtab="evidence" type="button">原件预览</button>
+        <button class="seg-btn dtab hidden" id="dtab-csv-btn" data-dtab="csv" type="button">流水挑拣</button>
+        <button class="seg-btn dtab" data-dtab="history" type="button">修订历史</button>
+        <button class="seg-btn dtab" data-dtab="redact" type="button">脱敏导出</button>
       </div>
     </div>
 
     <div class="drawer-body">
-      <!-- 抽屉 1：编辑 -->
       <div id="dpane-edit" class="dpane">
         <div id="drawer-warnings" class="warning-stack"></div>
 
         <form id="form-edit-item" class="form-stack">
           <div class="field">
             <span>资产类型</span>
-            <div class="segmented-bar kind-seg" id="ed-kind-bar" role="radiogroup">
-              <button type="button" class="seg-tab" data-ed-kind="subscription">周期订阅</button>
-              <button type="button" class="seg-tab" data-ed-kind="license">买断授权</button>
-              <button type="button" class="seg-tab" data-ed-kind="hardware">硬件保修</button>
-              <button type="button" class="seg-tab" data-ed-kind="reimbursable">报销凭证</button>
-              <button type="button" class="seg-tab" data-ed-kind="general">普通账单</button>
+            <div class="seg-pill kind-seg" id="ed-kind-bar" role="radiogroup">
+              <button type="button" class="seg-btn" data-ed-kind="subscription">周期订阅</button>
+              <button type="button" class="seg-btn" data-ed-kind="license">买断授权</button>
+              <button type="button" class="seg-btn" data-ed-kind="hardware">硬件保修</button>
+              <button type="button" class="seg-btn" data-ed-kind="reimbursable">报销凭证</button>
+              <button type="button" class="seg-btn" data-ed-kind="general">普通账单</button>
             </div>
           </div>
 
-          <div class="form-row-2">
+          <div class="grid-2">
             <label class="field">
               <span>商家 / 品牌或设备名</span>
               <input id="ed-vendor" type="text" placeholder="如 OpenAI、Apple MacBook Air、Raycast">
@@ -722,7 +646,7 @@
             </label>
           </div>
 
-          <div class="form-row-2">
+          <div class="grid-2">
             <label class="field">
               <span>归属账号</span>
               <input id="ed-account" type="text" list="account-presets" placeholder="个人 / 公司工作 / 邮箱">
@@ -745,7 +669,7 @@
             </label>
           </div>
 
-          <div class="form-row-2">
+          <div class="grid-2">
             <label class="field">
               <span>币种</span>
               <select id="ed-currency"></select>
@@ -756,7 +680,7 @@
             </label>
           </div>
 
-          <div class="form-row-2">
+          <div class="grid-2">
             <label class="field">
               <span>分类</span>
               <input id="ed-category" type="text" list="category-presets" placeholder="如 AI 工具、数码硬件、办公效率">
@@ -779,14 +703,13 @@
             </label>
           </div>
 
-          <!-- 渐进展开：买断授权 -->
-          <div id="ed-panel-license" class="inset-panel hidden">
+          <div id="ed-panel-license" class="tinted-box hidden">
             <label class="field">
               <span>激活密钥 / 序列号（单独加密保存在本地，导出表格不包含）</span>
-              <div class="input-group">
+              <div class="input-row">
                 <input id="ed-license-key" type="password" autocomplete="off" class="sensitive" placeholder="粘贴软件激活码或设备序列号">
-                <button type="button" id="btn-ed-toggle-key" class="btn btn-secondary btn-sm">显示</button>
-                <button type="button" id="btn-ed-copy-key" class="btn btn-secondary btn-sm">复制</button>
+                <button type="button" id="btn-ed-toggle-key" class="btn btn-soft btn-sm">显示</button>
+                <button type="button" id="btn-ed-copy-key" class="btn btn-soft btn-sm">复制</button>
               </div>
             </label>
             <label class="field">
@@ -795,17 +718,15 @@
             </label>
           </div>
 
-          <!-- 渐进展开：硬件保修 -->
-          <div id="ed-panel-hardware" class="inset-panel hidden">
+          <div id="ed-panel-hardware" class="tinted-box hidden">
             <label class="field">
               <span>保修截止日期</span>
               <input id="ed-warranty-end" type="date">
             </label>
-            <div id="ed-hardware-metrics" class="hw-metric-row hidden"></div>
+            <div id="ed-hardware-metrics" class="hw-live-row hidden"></div>
           </div>
 
-          <!-- 渐进展开：报销进度 -->
-          <div id="ed-panel-reimb" class="inset-panel hidden">
+          <div id="ed-panel-reimb" class="tinted-box hidden">
             <label class="field">
               <span>报销状态</span>
               <select id="ed-reimburse-status">
@@ -817,7 +738,7 @@
             </label>
           </div>
 
-          <div id="ed-period-row" class="form-row-2">
+          <div id="ed-period-row" class="grid-2">
             <label class="field">
               <span>服务周期开始</span>
               <input id="ed-period-start" type="date">
@@ -829,21 +750,19 @@
           </div>
 
           <label class="field">
-            <span>个人备注（全程本地加密）</span>
+            <span>个人备注（全程本机加密）</span>
             <textarea id="ed-notes" rows="3" placeholder="记录报销单号、取消提醒或保修说明…"></textarea>
           </label>
 
-          <div class="drawer-save-bar">
-            <button id="btn-save-item" class="btn btn-primary btn-lg btn-block" type="submit">
-              保存修改
-            </button>
-            <div class="drawer-danger-zone">
-              <button id="btn-ask-delete-item" class="danger-link-btn" type="button">将此条记录移出账本…</button>
-              <div id="delete-confirm-bar" class="delete-confirm-bar hidden">
-                <span>确认从本账本中永久移除这条记录与原件？</span>
+          <div class="drawer-footer">
+            <button id="btn-save-item" class="btn btn-ink btn-lg btn-block" type="submit">保存修改</button>
+            <div class="danger-zone">
+              <button id="btn-ask-delete-item" class="danger-text-btn" type="button">将此记录移出账本…</button>
+              <div id="delete-confirm-bar" class="delete-confirm hidden">
+                <span>确认永久移出这条记录及其原件？</span>
                 <div class="btn-row">
                   <button id="btn-cancel-delete-item" class="btn btn-ghost btn-sm" type="button">取消</button>
-                  <button id="btn-confirm-delete-item" class="btn btn-danger-soft btn-sm" type="button">确认移出</button>
+                  <button id="btn-confirm-delete-item" class="btn btn-rose btn-sm" type="button">确认移出</button>
                 </div>
               </div>
             </div>
@@ -851,21 +770,19 @@
         </form>
       </div>
 
-      <!-- 抽屉 2：原件预览 -->
       <div id="dpane-evidence" class="dpane hidden">
-        <div class="meta-panel" id="evidence-meta"></div>
+        <div class="meta-sheet" id="evidence-meta"></div>
         <div class="btn-row" style="margin-bottom:12px">
-          <a id="btn-download-raw" class="btn btn-secondary btn-sm" href="#" download>下载未改动原件</a>
+          <a id="btn-download-raw" class="btn btn-soft btn-sm" href="#" download>下载未改动原件</a>
           <button id="btn-toggle-text-view" class="btn btn-ghost btn-sm" type="button">切换文本对照</button>
         </div>
         <div id="evidence-preview-box" class="preview-frame"></div>
         <pre id="evidence-text-box" class="code-sheet hidden"></pre>
-        <div id="evidence-occurrences" class="occ-list"></div>
+        <div id="evidence-occurrences" class="stack-8"></div>
       </div>
 
-      <!-- 抽屉 3：CSV 流水挑拣 -->
       <div id="dpane-csv" class="dpane hidden">
-        <div class="csv-toolbar">
+        <div class="csv-bar">
           <input id="csv-search" class="clean-input" type="search" placeholder="筛选商户、商品说明或日期…">
           <label class="check-row compact">
             <input id="chk-csv-expense-only" type="checkbox" checked>
@@ -875,26 +792,24 @@
         <div id="csv-rows-container" class="stack-8"></div>
       </div>
 
-      <!-- 抽屉 4：修改历史 -->
       <div id="dpane-history" class="dpane hidden">
-        <p class="muted-note">每一次提取、补录、金额修正与撤销都按时间顺序完整留痕，原件字节永不被改写。</p>
+        <p class="folio-p" style="margin-bottom:14px">每一次提取、补录、修正与撤销均按时间顺序完整留痕，原件字节永不被改写。</p>
         <div id="history-timeline" class="stack-8"></div>
       </div>
 
-      <!-- 抽屉 5：隐私脱敏导出 -->
       <div id="dpane-redact" class="dpane hidden">
-        <p class="muted-note">自动抹去姓名、邮箱、电话、卡号、订单号与具体金额数字，保留版式结构，便于安全分享或反馈。</p>
+        <p class="folio-p" style="margin-bottom:14px">自动抹去姓名、邮箱、电话、卡号、订单号与具体金额数字，保留版式结构便于安全分享。</p>
         <label class="field" style="margin-bottom:12px">
-          <span>额外抹去的敏感词（可选，用逗号隔开）</span>
+          <span>额外抹去的敏感词（可选，逗号隔开）</span>
           <input id="redact-custom-terms" type="text" placeholder="如 张三, 某某科技有限公司">
         </label>
-        <button id="btn-run-redact" class="btn btn-primary btn-sm" type="button">生成脱敏预览</button>
+        <button id="btn-run-redact" class="btn btn-ink btn-sm" type="button">生成脱敏预览</button>
         <div id="redact-result-wrap" class="hidden" style="margin-top:14px">
-          <div id="redact-stats" class="inline-result" style="margin-bottom:10px"></div>
+          <div id="redact-stats" class="inline-banner" style="margin-bottom:10px"></div>
           <pre id="redact-output" class="code-sheet"></pre>
           <div class="btn-row">
-            <button id="btn-copy-redact" class="btn btn-secondary btn-sm" type="button">复制脱敏内容</button>
-            <button id="btn-dl-redact" class="btn btn-secondary btn-sm" type="button">下载 .txt</button>
+            <button id="btn-copy-redact" class="btn btn-soft btn-sm" type="button">复制脱敏内容</button>
+            <button id="btn-dl-redact" class="btn btn-soft btn-sm" type="button">下载 .txt</button>
           </div>
         </div>
       </div>
