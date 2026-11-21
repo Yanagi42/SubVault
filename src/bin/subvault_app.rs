@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::process::exit;
 
-use subvault::workbench::{run_standalone, WorkbenchOptions};
+use subvault::workbench::{run_standalone, WorkbenchOptions, DEFAULT_WORKBENCH_PORT};
 
 fn main() {
-    let mut port: u16 = 0;
+    let mut port: u16 = DEFAULT_WORKBENCH_PORT;
     let mut open_browser = true;
     let mut initial_vault: Option<PathBuf> = None;
 
@@ -12,7 +12,7 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--no-browser" => {
+            "--no-browser" | "--no-open" => {
                 open_browser = false;
                 i += 1;
             }

@@ -64,6 +64,10 @@ fn is_demo_source(display_name: &str, occurrences: &[Value]) -> bool {
     })
 }
 
+/// Fixed loopback port used by default so browser password managers and
+/// local preferences (theme, etc.) persist across restarts on a stable origin.
+pub const DEFAULT_WORKBENCH_PORT: u16 = 18421;
+
 #[derive(Clone, Debug)]
 pub struct WorkbenchOptions {
     pub port: u16,
@@ -102,7 +106,19 @@ pub struct WorkbenchServer {
 
 impl WorkbenchServer {
     pub fn start(opts: WorkbenchOptions) -> io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", opts.port))?;
+        let listener = match TcpListener::bind(("127.0.0.1", opts.port)) {
+            Ok(l) => l,
+            Err(err)
+                if opts.port == DEFAULT_WORKBENCH_PORT
+                    && matches!(
+                        err.kind(),
+                        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+                    ) =>
+            {
+                TcpListener::bind(("127.0.0.1", 0))?
+            }
+            Err(err) => return Err(err),
+        };
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
 

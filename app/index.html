@@ -96,7 +96,7 @@
             <label class="field">
               <span>账本文件夹位置</span>
               <div class="input-row">
-                <input id="unlock-path" type="text" required placeholder="例如 C:\Users\你\Documents\SubVault\我的订阅账本">
+                <input id="unlock-path" name="username" type="text" autocomplete="username" required placeholder="例如 C:\Users\你\Documents\SubVault\我的订阅账本">
                 <button type="button" class="btn btn-soft btn-sm" data-pick-target="unlock-path" data-pick-title="选择已有的 SubVault 账本文件夹">浏览</button>
               </div>
             </label>
@@ -112,7 +112,7 @@
 
             <label id="unlock-passphrase-wrap" class="field">
               <span>账本主密码</span>
-              <input id="unlock-passphrase" type="password" autocomplete="current-password" placeholder="输入创建时设置的主密码">
+              <input id="unlock-passphrase" name="password" type="password" autocomplete="current-password" placeholder="输入创建时设置的主密码">
             </label>
 
             <label id="unlock-recovery-wrap" class="field hidden">
@@ -133,7 +133,7 @@
             <label class="field">
               <span>保存位置（自动新建目录）</span>
               <div class="input-row">
-                <input id="create-path" type="text" required placeholder="选择本机文件夹位置">
+                <input id="create-path" name="username" type="text" autocomplete="username" required placeholder="选择本机文件夹位置">
                 <button type="button" class="btn btn-soft btn-sm" data-pick-target="create-path" data-pick-title="选择新账本保存位置" data-pick-suffix="我的订阅账本">浏览</button>
               </div>
             </label>
@@ -161,11 +161,11 @@
             <div id="create-passphrase-fields" class="grid-2">
               <label class="field">
                 <span>设置主密码（至少 6 位）</span>
-                <input id="create-passphrase" type="password" autocomplete="new-password" placeholder="字母 + 数字组合">
+                <input id="create-passphrase" name="password" type="password" autocomplete="new-password" placeholder="字母 + 数字组合">
               </label>
               <label class="field">
                 <span>确认主密码</span>
-                <input id="create-passphrase-confirm" type="password" autocomplete="new-password" placeholder="再次输入">
+                <input id="create-passphrase-confirm" name="confirm-password" type="password" autocomplete="new-password" placeholder="再次输入">
               </label>
             </div>
 

@@ -217,7 +217,9 @@ pub fn execute(args: Vec<String>) -> Report {
             })
         }
         "app" => crate::workbench::run_cli_app(crate::workbench::WorkbenchOptions {
-            port: flags.port.unwrap_or(0),
+            port: flags
+                .port
+                .unwrap_or(crate::workbench::DEFAULT_WORKBENCH_PORT),
             open_browser: !flags.no_browser,
             initial_vault: flags.vault,
         }),
