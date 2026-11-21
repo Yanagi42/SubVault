@@ -68,3 +68,38 @@ jobs:
         run: |
           bash scripts/package-release.sh
           (cd dist && sha256sum -c SHA256SUMS.txt)
+
+  test-windows:
+    name: Rust Core & Portable Bundle (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Clippy lints on Windows (lib & binary)
+        run: cargo clippy --lib --bins --locked -- -D warnings
+
+      - name: Run Windows native unit & integration test suites
+        env:
+          SUBVAULT_GIT_SHA: ${{ github.sha }}
+        run: |
+          cargo test --locked --lib --test windows_native --test pdf_bill --test verify_package --test review_sheet --test review_snapshot -- --test-threads=1
+
+      - name: Build portable Windows release bundle & verify SHA256SUMS
+        shell: pwsh
+        env:
+          SUBVAULT_GIT_SHA: ${{ github.sha }}
+        run: |
+          ./scripts/package-release-windows.ps1
+          $line = (Get-Content dist/SHA256SUMS-windows.txt).Trim()
+          $parts = $line -split '\s+'
+          $actual = (Get-FileHash (Join-Path dist $parts[1]) -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $parts[0]) { throw "SHA256 mismatch: $actual != $($parts[0])" }
