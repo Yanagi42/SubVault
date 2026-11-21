@@ -189,7 +189,7 @@ fn format6_dual_protection_init_isolation_and_cli_secret_guard() {
     assert_eq!(init_os["synthetic_only"], false);
     assert_eq!(init_os["protection"], "os_disk_assumed");
     assert_eq!(init_os["security_complete"], false);
-    assert_eq!(init_os["user_ready"], false);
+    assert_eq!(init_os["user_ready"], true);
     assert_eq!(init_os["capabilities"]["real_data_import"], "available");
     assert!(os_vault.join("SUBVAULT_VAULT").is_file());
     assert!(!os_vault.join("SYNTHETIC_ONLY").exists());

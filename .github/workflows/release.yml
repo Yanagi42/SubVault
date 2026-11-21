@@ -88,8 +88,9 @@ jobs:
         env:
           SUBVAULT_GIT_SHA: ${{ github.sha }}
         run: |
+          node --check app/app.js
           cargo clippy --lib --bins --locked -- -D warnings
-          cargo test --locked --lib --test windows_native --test format6_crypto --test redact --test pdf_bill --test verify_package --test review_sheet --test review_snapshot -- --test-threads=1
+          cargo test --locked --lib --test windows_native --test format6_crypto --test redact --test real_bills --test workbench_e2e --test pdf_bill --test verify_package --test review_sheet --test review_snapshot -- --test-threads=1
 
       - name: Package Windows portable archive
         shell: pwsh

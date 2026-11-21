@@ -1,15 +1,19 @@
-# SubVault v0.1.0 Release Notes (Draft — Pre-Release)
+# SubVault v0.1.0 Release Notes
 
-> **Status:** Draft notes for the upcoming first usable **`v0.1.0`** release. SubVault stays on `0.1.0` (unreleased) while the final real-data milestone in [`docs/ROADMAP.md`](./docs/ROADMAP.md) (thin native desktop shell) is completed.
+> **Status:** Ready for `v0.1.0` — all five milestones in [`docs/ROADMAP.md`](./docs/ROADMAP.md) (encrypted Format 6 core, bilingual real-world PDF/HTML/CSV extraction, and zero-install local graphical workbench `subvault-app`) are implemented and verified across Windows and Linux.
 
-**Target tag:** `v0.1.0`  
-**Live Demo:** <https://yanagi42.github.io/SubVault/>
+**Target tag:** `v0.1.0`
 
 ---
 
-## Highlights Included So Far
+## Highlights
 
-1. **Verified Rust + SQLite Preservation, Encryption & Extraction Core (`subvault` CLI, Formats 1–6)**
+1. **Zero-Install Single-Binary Local Graphical Workbench (`subvault-app` / `subvault app`)**
+   - Double-click `subvault-app.exe` (Windows) or `./subvault-app` (Linux) to open a clean local workspace (`127.0.0.1` loopback-only, 256-bit session token, strict Origin/CSP guards, in-memory `Zeroizing` encryption keys).
+   - Drag and drop individual files or entire folders of PDFs, styled HTML emails, Alipay/WeChat CSVs, or receipt screenshots; view per-currency spend totals without fabricated exchange rates; inspect original PDFs/images/sandboxed HTML inline; edit or manually record scanned bills with full undo history; export Excel-ready UTF-8 BOM `.csv`, verifiable `.zip` offline exit packs, or redacted templates in one click.
+
+2. **Verified Rust + SQLite Preservation, Encryption & Bilingual Extraction Core (`subvault` CLI, Formats 1–6)**
+   - **Bilingual Real-World Bill Extraction (M5):** Multi-currency (`CNY`, `USD`, `EUR`, `GBP`, `JPY`, `HKD`, `CAD`, `AUD`, `SGD`, `TWD`, `KRW`, `CHF`), Chinese electronic invoices (UTF-16BE PDFs), styled HTML emails (zero JS/network), Alipay GB18030/GBK & WeChat UTF-8 BOM CSV statements (`subvault csv`), encrypted user annotations (`subvault annotate`), and auditable manual entry (`subvault record-fact`).
    - **Real-Data Format 6 & At-Rest Protection (M4):** Dedicated non-synthetic Format 6 (`subvault init --format 6 --protection passphrase|os-disk`, `SUBVAULT_VAULT` banner) isolated from disposable Formats 1–5. `passphrase` mode provides pure-Rust `Argon2id` + `HKDF-SHA256` + `XChaCha20-Poly1305` envelope encryption across objects, staging, journals, and sensitive SQLite columns, offline `SVRK-...` recovery keys, `subvault rotate-passphrase`, dedicated `EXIT_AUTH = 22`, mandatory `--acknowledge-plaintext yes` on `export`, and zero raw-secret CLI arguments.
    - **Redacted Template Export (`subvault redact`):** Local-only deterministic sanitizer for external files or stored vault sources (`--source` or `--vault --source-id`) with repeatable `--redact-term`, PDF text extraction without binary/XMP metadata, HTML script/style/comment stripping with preserved table structure, and PII-free JSON receipts.
    - **Immutable Byte Custody (T1):** Content-addressed `objects/obj_<id>` storage with SHA-256 integrity verification, zero byte normalization, idempotent `CommandId` journaling, exclusive non-blocking locks (`flock` on Linux, Win32 `LockFileEx` on Windows), SQLite 3.46 WAL (`synchronous=FULL`), atomic no-replace directory publication, and honest exit codes (`0`–`22`).
@@ -32,9 +36,9 @@
 
 | Asset | Contents |
 | --- | --- |
-| `subvault-v0.1.0-linux-x86_64.zip` | Portable Linux x86_64 `subvault` CLI binary (Formats 1–5), static Web Demo (`web/`), verified T0 synthetic corpus, `run-demo.sh`, and documentation |
+| `subvault-v0.1.0-linux-x86_64.zip` | Portable Linux x86_64 `subvault-app` local graphical workbench + `bin/subvault` CLI (Formats 1–6), static Web Demo (`web/`), verified T0 synthetic corpus, `run-demo.sh`, and documentation |
 | `subvault-v0.1.0-linux-x86_64.tar.gz` | Same Linux portable bundle in `.tar.gz` format |
-| `subvault-v0.1.0-windows-x86_64.zip` | Portable Windows x86_64 `subvault.exe` CLI binary (Formats 1–5), static Web Demo (`web/`), verified T0 synthetic corpus, `run-demo.ps1`, and documentation |
+| `subvault-v0.1.0-windows-x86_64.zip` | Portable Windows x86_64 double-click `subvault-app.exe` local workbench + `bin/subvault.exe` CLI (Formats 1–6), static Web Demo (`web/`), verified T0 synthetic corpus, `run-demo.ps1`, and documentation |
 | `subvault-v0.1.0-web-demo.zip` | Pure-static Web Demo files ready for any static host or offline folder |
 | `SHA256SUMS.txt` | SHA-256 checksums for all archives |
 
@@ -54,6 +58,7 @@ cd subvault-v0.1.0-linux-x86_64
 
 ---
 
-## Remaining Scope Before Publishing `v0.1.0`
+## Launch the Local Graphical Workbench
 
-- **Thin Desktop Shell:** Wrap the verified Rust/SQLite core for everyday local use.
+- **Windows:** Unzip `subvault-v0.1.0-windows-x86_64.zip` and double-click `subvault-app.exe`.
+- **Linux:** Extract `subvault-v0.1.0-linux-x86_64.zip` and run `./subvault-app`.

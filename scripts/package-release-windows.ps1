@@ -36,14 +36,18 @@ if ([string]::IsNullOrWhiteSpace($GitSha)) { $GitSha = "unknown" }
 
 Write-Host "==> Packaging SubVault v$Version (windows-x86_64, git=$($GitSha.Substring(0, [Math]::Min(12, $GitSha.Length))))"
 
-Write-Host "==> 1/4 Building release binary (subvault.exe)..."
+Write-Host "==> 1/4 Building release binaries (subvault.exe & subvault-app.exe)..."
 $env:SUBVAULT_GIT_SHA = $GitSha
 cargo build --release --locked
 if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
 
 $BinPath = Join-Path $Root "target\release\subvault.exe"
+$AppBinPath = Join-Path $Root "target\release\subvault-app.exe"
 if (-not (Test-Path $BinPath)) {
     throw "Expected compiled binary at $BinPath"
+}
+if (-not (Test-Path $AppBinPath)) {
+    throw "Expected compiled workbench binary at $AppBinPath"
 }
 
 Write-Host "==> 2/4 Assembling portable directory: dist\$BundleName\"
@@ -54,6 +58,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $StageDir "web") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $StageDir "synthetic") | Out-Null
 
 Copy-Item -Path $BinPath -Destination (Join-Path $StageDir "bin\subvault.exe")
+Copy-Item -Path $AppBinPath -Destination (Join-Path $StageDir "subvault-app.exe")
 
 # Copy pure-static web assets (excluding package.json used only for local Node ESM tests)
 $WebFiles = @(".nojekyll", "index.html", "styles.css", "app.js", "engine.js", "demo-data.js", "pdf.js", "zip.js")

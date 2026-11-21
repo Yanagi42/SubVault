@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SubVault — 本地隐私订阅与账单工作台</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <!-- 顶部全局栏 -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <img src="/icon.svg" alt="SubVault" class="brand-icon" width="32" height="32">
+        <div>
+          <div class="brand-row">
+            <h1 class="brand-title">SubVault</h1>
+            <span id="vault-status-chip" class="chip chip-neutral">纯本地 · 不联网</span>
+          </div>
+          <div id="vault-path-sub" class="brand-sub">零银行登录 · 零邮箱授权 · 账单原件防篡改留存</div>
+        </div>
+      </div>
+
+      <div id="topbar-workspace-actions" class="topbar-actions hidden">
+        <label class="btn btn-primary" for="file-picker-input">
+          + 导入账单文件
+        </label>
+        <input id="file-picker-input" type="file" multiple accept=".pdf,.html,.htm,.csv,.txt,.png,.jpg,.jpeg,.webp" class="hidden">
+
+        <label class="btn btn-outline" for="folder-picker-input">
+          导入整个文件夹
+        </label>
+        <input id="folder-picker-input" type="file" webkitdirectory multiple class="hidden">
+
+        <button id="btn-lock-vault" class="btn btn-ghost" type="button" title="立即清空内存密钥并锁回解锁界面">
+          锁定账本
+        </button>
+        <button id="btn-shutdown-app" class="btn btn-ghost-danger" type="button" title="清空内存密钥并关闭本地服务">
+          安全退出
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- 顶部轻提示 -->
+  <div id="toast" class="toast hidden" role="status" aria-live="polite">
+    <span id="toast-msg"></span>
+    <button id="toast-close" class="toast-close" type="button" aria-label="关闭提示">×</button>
+  </div>
+
+  <!-- 视图 0：欢迎与解锁大厅 -->
+  <main id="screen-lobby" class="lobby-wrap">
+    <section class="lobby-hero">
+      <span class="hero-eyebrow">100% 本机运行 · 无云端上传 · 无账号绑定</span>
+      <h2>把散落在邮箱和网盘里的账单，整理成一本只属于你的加密账本</h2>
+      <p>
+        支持直接拖入国内外 PDF 发票、带样式的邮件 HTML、支付宝/微信 CSV 流水与收据截图。
+        自动按原件内容去重，不瞎估状态，所有数字都能一键对照原始凭证，随时一键打包带走。
+      </p>
+    </section>
+
+    <div class="lobby-grid">
+      <!-- 卡片 A：打开已有账本 -->
+      <section class="card lobby-card">
+        <div class="card-head">
+          <h3>打开已有本地账本</h3>
+          <span class="badge badge-slate">最近使用</span>
+        </div>
+
+        <div id="recent-vaults-list" class="recent-list"></div>
+
+        <form id="form-unlock-vault" class="form-stack">
+          <label class="field">
+            <span>账本文件夹路径</span>
+            <div class="input-with-btn">
+              <input id="unlock-path" type="text" required placeholder="例如 C:\Users\你\Documents\SubVault\我的订阅账本">
+              <button type="button" class="btn btn-outline btn-sm" data-pick-target="unlock-path" data-pick-title="选择已有的 SubVault 账本文件夹">浏览…</button>
+            </div>
+          </label>
+
+          <div class="seg-toggle" role="tablist">
+            <button type="button" class="seg-btn active" data-unlock-mode="passphrase">使用主密码解锁</button>
+            <button type="button" class="seg-btn" data-unlock-mode="recovery">使用恢复密钥解锁</button>
+            <button type="button" class="seg-btn" data-unlock-mode="os-disk">无密码（系统盘模式）</button>
+          </div>
+
+          <label id="unlock-passphrase-wrap" class="field">
+            <span>账本主密码</span>
+            <input id="unlock-passphrase" type="password" autocomplete="current-password" placeholder="输入创建时设置的主密码">
+          </label>
+
+          <label id="unlock-recovery-wrap" class="field hidden">
+            <span>离线恢复密钥（SVRK-…）</span>
+            <input id="unlock-recovery" type="text" placeholder="粘贴完整 SVRK-... 恢复密钥">
+          </label>
+
+          <div id="unlock-error" class="form-error hidden"></div>
+
+          <button id="btn-unlock-submit" class="btn btn-primary btn-block" type="submit">
+            解锁并进入账本
+          </button>
+        </form>
+      </section>
+
+      <!-- 卡片 B：新建本地账本 -->
+      <section class="card lobby-card">
+        <div class="card-head">
+          <h3>新建一本本地账本</h3>
+          <span class="badge badge-emerald">首次使用</span>
+        </div>
+
+        <form id="form-create-vault" class="form-stack">
+          <label class="field">
+            <span>保存位置（自动创建文件夹）</span>
+            <div class="input-with-btn">
+              <input id="create-path" type="text" required placeholder="选择本机文件夹路径">
+              <button type="button" class="btn btn-outline btn-sm" data-pick-target="create-path" data-pick-title="选择新账本保存位置" data-pick-suffix="我的订阅账本">浏览…</button>
+            </div>
+          </label>
+
+          <div class="field">
+            <span>保护方式</span>
+            <div class="radio-cards">
+              <label class="radio-card active" id="opt-passphrase">
+                <input type="radio" name="create-protection" value="passphrase" checked>
+                <div>
+                  <strong>推荐：主密码加密保护</strong>
+                  <small>账本内所有原件、商家备注与账单金额在硬盘上全部加密，并生成一份离线恢复密钥备用。</small>
+                </div>
+              </label>
+              <label class="radio-card" id="opt-os-disk">
+                <input type="radio" name="create-protection" value="os-disk">
+                <div>
+                  <strong>系统磁盘加密模式（免输密码）</strong>
+                  <small>适合电脑已开启 BitLocker / FileVault / LUKS 全盘加密的用户，打开即用。</small>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <div id="create-passphrase-fields" class="form-stack">
+            <label class="field">
+              <span>设置主密码（至少 6 位）</span>
+              <input id="create-passphrase" type="password" autocomplete="new-password" placeholder="建议字母 + 数字组合">
+            </label>
+            <label class="field">
+              <span>再次确认主密码</span>
+              <input id="create-passphrase-confirm" type="password" autocomplete="new-password" placeholder="再次输入主密码">
+            </label>
+          </div>
+
+          <div id="create-error" class="form-error hidden"></div>
+
+          <button id="btn-create-submit" class="btn btn-emerald btn-block" type="submit">
+            创建并立即使用
+          </button>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <!-- 恢复密钥保存弹窗（新建加密账本或轮换恢复密钥后强制提示） -->
+  <div id="modal-recovery" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>请务必保存您的离线恢复密钥</h3>
+        <span class="badge badge-amber">仅显示这一次</span>
+      </div>
+      <p class="modal-desc">
+        因为 SubVault 完全不联网、不存您的密码，如果您日后忘记主密码，这串恢复密钥是<strong>唯一</strong>找回账本的方式。建议下载保存或手抄存放在安全处。
+      </p>
+      <div class="recovery-box">
+        <code id="modal-recovery-key"></code>
+      </div>
+      <div class="modal-actions-row">
+        <button id="btn-copy-recovery" class="btn btn-outline" type="button">一键复制密钥</button>
+        <button id="btn-download-recovery" class="btn btn-outline" type="button">下载为 .txt 备份文件</button>
+      </div>
+      <label class="checkbox-row">
+        <input id="chk-recovery-saved" type="checkbox">
+        <span>我已妥善保存这串离线恢复密钥</span>
+      </label>
+      <button id="btn-confirm-recovery" class="btn btn-primary btn-block" type="button" disabled>
+        确认并进入账本
+      </button>
+    </div>
+  </div>
+
+  <!-- 视图 1：主工作区（解锁后显示） -->
+  <main id="screen-workspace" class="workspace-wrap hidden">
+    <!-- 拖拽导入区 + 批量进度条 -->
+    <section id="drop-zone" class="drop-banner">
+      <div class="drop-banner-left">
+        <div class="drop-icon">↓</div>
+        <div>
+          <strong>把账单文件或整个文件夹直接拖到这里即可入库</strong>
+          <div class="drop-hint">
+            支持 PDF 发票（中英文）、邮件 HTML、支付宝/微信/银行 CSV、文本与收据截图（PNG/JPG/WebP）；重复文件自动识别不重算。
+          </div>
+        </div>
+      </div>
+      <div id="import-progress" class="import-progress hidden"></div>
+    </section>
+
+    <!-- 多币种真实花费统计区 -->
+    <section id="summary-section" class="summary-grid" aria-label="花费总览"></section>
+    <p class="honesty-caption">
+      说明：以上统计严格基于本账本已入库账单按币种独立汇总（不虚构汇率换算、不连接银行核验扣款）；重复导入的相同原件只计算一次。
+    </p>
+
+    <!-- 主导航标签 -->
+    <nav class="tab-bar" role="tablist">
+      <button class="tab-item active" data-tab="ledger" type="button">
+        全部订阅与账单 <span id="count-tab-ledger" class="tab-count">0</span>
+      </button>
+      <button class="tab-item" data-tab="attention" type="button">
+        去重与待核对 <span id="count-tab-attention" class="tab-count tab-count-amber">0</span>
+      </button>
+      <button class="tab-item" data-tab="export" type="button">
+        导出备份与安全设置
+      </button>
+    </nav>
+
+    <!-- 标签页 1：订阅与账单主台账 -->
+    <section id="pane-ledger" class="pane">
+      <div class="toolbar">
+        <div class="filter-group" id="ledger-filters">
+          <button class="pill active" data-filter="all" type="button">全部</button>
+          <button class="pill" data-filter="recurring" type="button">周期订阅</button>
+          <button class="pill" data-filter="needs" type="button">待补录 / 冲突</button>
+          <button class="pill" data-filter="duplicates" type="button">已自动去重</button>
+          <button class="pill" data-filter="csv" type="button">CSV 流水</button>
+        </div>
+
+        <div class="toolbar-right">
+          <select id="filter-account" class="select-sm" title="按归属账号筛选">
+            <option value="">所有账号</option>
+          </select>
+          <select id="filter-currency" class="select-sm" title="按币种筛选">
+            <option value="">所有币种</option>
+          </select>
+          <input id="search-box" class="search-box" type="search" placeholder="搜索商家、项目、账号、备注、文件名…">
+        </div>
+      </div>
+
+      <div id="ledger-list-wrap" class="card table-card"></div>
+    </section>
+
+    <!-- 标签页 2：去重与待核对 -->
+    <section id="pane-attention" class="pane hidden"></section>
+
+    <!-- 标签页 3：导出备份与安全设置 -->
+    <section id="pane-export" class="pane hidden">
+      <div class="export-grid">
+        <div class="card export-card">
+          <h3>一键导出 Excel 账单表（.csv）</h3>
+          <p>导出带 UTF-8 BOM 编码的表格文件，Windows Excel 双击直接打开中文不乱码，包含商家、套餐、账号、周期、金额、日期与原件校验值。</p>
+          <button id="btn-dl-excel" class="btn btn-primary" type="button">下载 Excel 账单表 (.csv)</button>
+        </div>
+
+        <div class="card export-card">
+          <h3>一键下载完整离线备份包（.zip）</h3>
+          <p>包含全部原始账单原件、<code>facts.csv</code>、<code>ledger-excel.csv</code>、可读核对单与 <code>manifest.json</code> 完整哈希校验清单，永不锁定。</p>
+          <label id="zip-ack-row" class="checkbox-row hidden">
+            <input id="chk-zip-ack" type="checkbox">
+            <span>我已知晓：导出的备份包内含明文原件与账单记录，会妥善保管</span>
+          </label>
+          <button id="btn-dl-zip" class="btn btn-emerald" type="button">下载完整离线备份包 (.zip)</button>
+        </div>
+
+        <div class="card export-card">
+          <h3>导出到本地文件夹并自动完整性校验</h3>
+          <p>直接在硬盘生成标准离线退出目录，并立即用独立校验引擎逐文件核验 SHA-256。</p>
+          <label class="field">
+            <span>导出文件夹路径（不能在当前账本内部）</span>
+            <div class="input-with-btn">
+              <input id="export-dir-path" type="text" placeholder="例如 C:\Users\你\Documents\SubVault-备份-2026">
+              <button type="button" class="btn btn-outline btn-sm" data-pick-target="export-dir-path" data-pick-title="选择备份包保存位置" data-pick-suffix="SubVault-备份包">浏览…</button>
+            </div>
+          </label>
+          <label id="dir-ack-row" class="checkbox-row hidden">
+            <input id="chk-dir-ack" type="checkbox">
+            <span>我已知晓：导出的目录为明文原件与记录</span>
+          </label>
+          <button id="btn-export-dir" class="btn btn-outline" type="button">导出目录并立即校验</button>
+          <div id="export-dir-result" class="result-box hidden"></div>
+        </div>
+
+        <div class="card export-card">
+          <h3>独立校验任意离线备份包</h3>
+          <p>选择之前导出的任意备份文件夹，核对其中每个原件和表格是否完整无篡改。</p>
+          <label class="field">
+            <span>备份包目录路径</span>
+            <div class="input-with-btn">
+              <input id="verify-dir-path" type="text" placeholder="输入包含 manifest.json 的备份包目录">
+              <button type="button" class="btn btn-outline btn-sm" data-pick-target="verify-dir-path" data-pick-title="选择要校验的备份包目录">浏览…</button>
+            </div>
+          </label>
+          <button id="btn-verify-dir" class="btn btn-outline" type="button">开始完整性校验</button>
+          <div id="verify-dir-result" class="result-box hidden"></div>
+        </div>
+
+        <div id="card-security-rotate" class="card export-card hidden">
+          <h3>安全设置：修改账本主密码</h3>
+          <p>无需重新导入文件，事务性轮换加密密钥槽；也可同时作废旧恢复密钥并生成新密钥。</p>
+          <form id="form-rotate-pass" class="form-stack">
+            <label class="field">
+              <span>新主密码（至少 6 位）</span>
+              <input id="rotate-new-pass" type="password" required placeholder="输入新密码">
+            </label>
+            <label class="field">
+              <span>确认新主密码</span>
+              <input id="rotate-new-pass-confirm" type="password" required placeholder="再次输入新密码">
+            </label>
+            <label class="checkbox-row">
+              <input id="chk-rotate-recovery" type="checkbox">
+              <span>同时重新生成一份新的离线恢复密钥（旧恢复密钥将立即失效）</span>
+            </label>
+            <button class="btn btn-outline" type="submit">更新主密码</button>
+          </form>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 右侧抽屉：单条账单的原件证据、人工编辑、CSV 流水挑拣、历史与脱敏 -->
+  <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+  <aside id="detail-drawer" class="drawer hidden" aria-label="账单详情与原件核对">
+    <div class="drawer-header">
+      <div>
+        <h3 id="drawer-title">账单详情</h3>
+        <div id="drawer-subtitle" class="drawer-sub"></div>
+      </div>
+      <button id="btn-close-drawer" class="icon-btn" type="button" aria-label="关闭抽屉">×</button>
+    </div>
+
+    <div class="drawer-tabs" id="drawer-tabs">
+      <button class="dtab active" data-dtab="edit" type="button">信息与金额</button>
+      <button class="dtab" data-dtab="evidence" type="button">查看原件</button>
+      <button class="dtab hidden" id="dtab-csv-btn" data-dtab="csv" type="button">CSV 流水挑拣</button>
+      <button class="dtab" data-dtab="history" type="button">修改历史</button>
+      <button class="dtab" data-dtab="redact" type="button">脱敏导出</button>
+    </div>
+
+    <div class="drawer-body">
+      <!-- 抽屉页 1：编辑与兜底手录 -->
+      <div id="dpane-edit" class="dpane">
+        <div id="drawer-warnings" class="warning-stack"></div>
+
+        <form id="form-edit-item" class="form-stack">
+          <div class="form-row-2">
+            <label class="field">
+              <span>商家 / 服务名称</span>
+              <input id="ed-vendor" type="text" placeholder="如 OpenAI、Apple iCloud、WPS">
+            </label>
+            <label class="field">
+              <span>项目 / 套餐名</span>
+              <input id="ed-plan" type="text" placeholder="如 ChatGPT Plus、2TB 方案">
+            </label>
+          </div>
+
+          <div class="form-row-2">
+            <label class="field">
+              <span>归属账号（区分个人 / 工作）</span>
+              <input id="ed-account" type="text" list="account-presets" placeholder="个人 / 公司 / 邮箱">
+              <datalist id="account-presets">
+                <option value="个人">
+                <option value="公司工作">
+                <option value="家庭共享">
+              </datalist>
+            </label>
+            <label class="field">
+              <span>计费周期</span>
+              <select id="ed-cycle">
+                <option value="unknown">未标注</option>
+                <option value="monthly">按月续费（月付）</option>
+                <option value="yearly">按年续费（年付）</option>
+                <option value="quarterly">按季续费（季付）</option>
+                <option value="weekly">按周续费（周付）</option>
+                <option value="one_time">一次性买断 / 单次消费</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="form-row-2">
+            <label class="field">
+              <span>币种</span>
+              <select id="ed-currency"></select>
+            </label>
+            <label class="field">
+              <span>账单金额</span>
+              <input id="ed-amount" type="text" placeholder="例如 98.00 或 19.99">
+            </label>
+          </div>
+
+          <div class="form-row-2">
+            <label class="field">
+              <span>分类</span>
+              <input id="ed-category" type="text" list="category-presets" placeholder="如 AI 工具、云存储、开发工具">
+              <datalist id="category-presets">
+                <option value="AI 工具">
+                <option value="云存储">
+                <option value="云服务">
+                <option value="开发工具">
+                <option value="办公效率">
+                <option value="影音娱乐">
+                <option value="安全工具">
+                <option value="购物会员">
+                <option value="其他">
+              </datalist>
+            </label>
+            <label class="field">
+              <span>账单 / 付款日期</span>
+              <input id="ed-bill-date" type="date">
+            </label>
+          </div>
+
+          <div class="form-row-2">
+            <label class="field">
+              <span>服务周期开始</span>
+              <input id="ed-period-start" type="date">
+            </label>
+            <label class="field">
+              <span>服务周期结束</span>
+              <input id="ed-period-end" type="date">
+            </label>
+          </div>
+
+          <label class="field">
+            <span>个人备注（在加密账本内全程加密保存）</span>
+            <textarea id="ed-notes" rows="3" placeholder="记录报销单号、取消提醒或账号说明…"></textarea>
+          </label>
+
+          <button id="btn-save-item" class="btn btn-primary btn-block" type="submit">
+            保存修改（保留原件并记录修订历史）
+          </button>
+        </form>
+      </div>
+
+      <!-- 抽屉页 2：原件预览与 SHA-256 存证 -->
+      <div id="dpane-evidence" class="dpane hidden">
+        <div class="evidence-meta-card" id="evidence-meta"></div>
+        <div class="evidence-actions">
+          <a id="btn-download-raw" class="btn btn-outline btn-sm" href="#" download>下载未改动原件</a>
+          <button id="btn-toggle-text-view" class="btn btn-ghost btn-sm" type="button">切换文本对照</button>
+        </div>
+        <div id="evidence-preview-box" class="preview-box"></div>
+        <pre id="evidence-text-box" class="text-preview hidden"></pre>
+        <div id="evidence-occurrences" class="occ-list"></div>
+      </div>
+
+      <!-- 抽屉页 3：CSV 流水挑拣 -->
+      <div id="dpane-csv" class="dpane hidden">
+        <div class="csv-bar">
+          <input id="csv-search" class="search-box" type="search" placeholder="筛选商户、商品说明或日期…">
+          <label class="checkbox-row compact">
+            <input id="chk-csv-expense-only" type="checkbox" checked>
+            <span>仅看支出</span>
+          </label>
+        </div>
+        <div id="csv-rows-container" class="csv-rows"></div>
+      </div>
+
+      <!-- 抽屉页 4：不可篡改修改历史与撤销 -->
+      <div id="dpane-history" class="dpane hidden">
+        <p class="muted-note">每一次自动提取、手动登记、金额修改和撤销都会按时间顺序追加记录，原始账单字节永远不会被改写。</p>
+        <div id="history-timeline" class="timeline"></div>
+      </div>
+
+      <!-- 抽屉页 5：单条隐私脱敏导出 -->
+      <div id="dpane-redact" class="dpane hidden">
+        <p class="muted-note">自动抹去本账单中的姓名、邮箱、电话、卡号、订单号、日期与具体金额数字（保留币种与排版），方便安全分享或排查格式问题。</p>
+        <label class="field">
+          <span>额外要抹去的敏感词（可选，用逗号隔开）</span>
+          <input id="redact-custom-terms" type="text" placeholder="例如 张三, 某某科技有限公司">
+        </label>
+        <button id="btn-run-redact" class="btn btn-primary" type="button">生成脱敏模板预览</button>
+        <div id="redact-result-wrap" class="hidden">
+          <div id="redact-stats" class="redact-stats"></div>
+          <pre id="redact-output" class="text-preview"></pre>
+          <div class="modal-actions-row">
+            <button id="btn-copy-redact" class="btn btn-outline btn-sm" type="button">复制脱敏内容</button>
+            <button id="btn-dl-redact" class="btn btn-outline btn-sm" type="button">下载为 .txt</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <script src="/app.js"></script>
+</body>
+</html>

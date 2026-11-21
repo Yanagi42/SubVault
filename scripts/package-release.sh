@@ -28,12 +28,17 @@ else
   echo "==> 2/5 Skipping Node Web Demo check (node not installed)"
 fi
 
-echo "==> 3/5 Building release binary..."
+echo "==> 3/5 Building release binaries (subvault & subvault-app)..."
 SUBVAULT_GIT_SHA="$GIT_SHA" cargo build --release --locked
 
 BIN_PATH="$ROOT/target/release/subvault"
+APP_BIN_PATH="$ROOT/target/release/subvault-app"
 if [[ ! -x "$BIN_PATH" ]]; then
   echo "Expected compiled binary at $BIN_PATH" >&2
+  exit 1
+fi
+if [[ ! -x "$APP_BIN_PATH" ]]; then
+  echo "Expected compiled workbench binary at $APP_BIN_PATH" >&2
   exit 1
 fi
 
@@ -42,7 +47,8 @@ rm -rf "$DIST_DIR"
 mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/web" "$STAGE_DIR/synthetic"
 
 cp "$BIN_PATH" "$STAGE_DIR/bin/subvault"
-chmod 0755 "$STAGE_DIR/bin/subvault"
+cp "$APP_BIN_PATH" "$STAGE_DIR/subvault-app"
+chmod 0755 "$STAGE_DIR/bin/subvault" "$STAGE_DIR/subvault-app"
 
 # Copy pure-static web assets (excluding package.json used only for local Node ESM tests)
 cp "$ROOT/web/.nojekyll" "$STAGE_DIR/web/.nojekyll"

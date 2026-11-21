@@ -123,7 +123,7 @@ pub fn apply_format_honesty(
 ) {
     if vault_format >= 6 {
         body.insert("synthetic_only".into(), Value::Bool(false));
-        body.insert("user_ready".into(), Value::Bool(false));
+        body.insert("user_ready".into(), Value::Bool(true));
         let prot = protection
             .map(crate::crypto::ProtectionMode::as_meta)
             .unwrap_or(crate::crypto::PROTECTION_OS_DISK);

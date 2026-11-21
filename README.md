@@ -80,7 +80,18 @@ flowchart LR
 
 ## Quick Start
 
-### 1. Try the Live Demo (Zero Install)
+### 1. Launch the Local Graphical Workbench (`subvault-app`, Recommended)
+Build from source with `cargo build --release --locked` (or unpack a portable release bundle), then double-click or run:
+- **Windows:** `target\release\subvault-app.exe` (or `subvault-app.exe` in the unpacked release zip)
+- **Linux:** `./target/release/subvault-app` (or `./subvault-app` in the unpacked release zip)
+- **Or from CLI:** `subvault app`
+
+What works out of the box (100% local, zero cloud, zero bank/inbox logins):
+- Create or unlock an encrypted Format 6 vault (with offline `SVRK-...` recovery key) or an OS-disk-encryption vault.
+- Drag and drop individual files or entire folders of **PDF invoices** (English & Chinese UTF-16BE), **styled HTML email receipts**, **Alipay GBK / WeChat UTF-8 CSV statements**, or **receipt screenshots** (`.png`/`.jpg`/`.webp`).
+- View per-currency spend totals, automatic SHA-256 duplicate interception, inline original evidence preview, auditable manual entry / amount correction / undo, inline PII redaction, and one-click Excel UTF-8 BOM `.csv` or verifiable `.zip` offline exit packs.
+
+### 2. Try the Static Web Demo (Synthetic Corpus Only)
 Open **[https://yanagi42.github.io/SubVault/](https://yanagi42.github.io/SubVault/)**:
 - Browse the preloaded 12-file synthetic corpus immediately.
 - Click **`+ Import Sample Batch`** or **`+ Renamed Duplicate Receipt`** to watch SHA-256 deduplication reuse objects without duplicating spend or losing human edits.

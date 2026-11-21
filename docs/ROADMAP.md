@@ -32,8 +32,8 @@ SubVault will **not** cut premature version bumps during pre-release development
 
 ---
 
-## Remaining Milestones Before Cutting `v0.1.0`
-
-### Milestone 5: Thin Native Desktop Shell → Ship `v0.1.0`
-- Thin native desktop shell wrapping the verified Rust/SQLite core (drag-and-drop / watch-folder local intake for PDF, HTML, and CSV — zero Plaid and zero inbox OAuth).
-- Cut the first official **`v0.1.0`** release once real users can safely drop real bills and run the full workflow end-to-end.
+### Milestone 5: Single-Binary Local Workbench & Bilingual Real-World Bill Engine (`v0.1.0` Ready)
+- [x] Bilingual real-world static extraction (`src/real_extract.rs`, `src/csv_ingest.rs`) for Format 6: multi-currency (`CNY`, `USD`, `EUR`, `GBP`, `JPY`, `HKD`, `CAD`, `AUD`, `SGD`, `TWD`, `KRW`, `CHF`), Chinese electronic invoices (UTF-16BE PDFs), styled real-world email HTML (zero JS/network, safely ignoring `<script>`/`<style>`/`display:none`), and Alipay GB18030/GBK & WeChat UTF-8 BOM CSV statements.
+- [x] Encrypted user annotations (`source_annotations`) and auditable manual entry (`subvault annotate`, `subvault record-fact`, `decisions.kind = 'human_record'`, multi-currency `correct` & `undo`) for scanned PDFs, receipt screenshots, and promoted CSV transactions — with zero plaintext on disk.
+- [x] Single-binary zero-install local graphical workbench (`subvault-app` / `subvault app`, `src/workbench.rs`, embedded `app/`): loopback-only `127.0.0.1` + 256-bit session token + strict Origin/CSP guards + in-memory `Zeroizing` DEK, folder & batch drag-and-drop import, per-currency subscription dashboard, native OS folder picker, inline PDF/image/sandboxed-HTML evidence viewer, Alipay/WeChat CSV row picker, inline redaction, one-click Excel UTF-8 BOM CSV & `.zip` verifiable offline exit pack, and passphrase rotation.
+- [x] Ready for `v0.1.0` real-world use on both Windows 11 NTFS (`x86_64-pc-windows-msvc`) and Linux (`x86_64-unknown-linux-gnu`).

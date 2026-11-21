@@ -20,6 +20,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No publ
     - Added pure-Rust application-layer envelope encryption (`src/crypto.rs`: `Argon2id` + `HKDF-SHA256` + `XChaCha20-Poly1305`) encrypting `objects/obj_*` (`SVENC001` 64 KiB authenticated chunks bound to `vault_id || object_id || chunk_idx || flags`), `staging/*.partial`, `journal/*.json` (`SVJRN001`), and all sensitive SQLite cells (`enc:v1:...` bound to `vault_id || table || row_id || column`), plus keyed `HMAC-SHA256` dedup keys, offline checksummed recovery keys (`SVRK-...`), `subvault rotate-passphrase`, dedicated `EXIT_AUTH = 22`, and CLI raw-secret flag refusal (`--passphrase` rejected).
     - Enforced explicit `--acknowledge-plaintext yes` on `subvault export` for `passphrase_aead_v1` vaults with honest exit package protection annotations (`plaintext_exit_from_passphrase_aead_v1` / `plaintext_exit_from_os_disk_assumed`), compatible with `verify-package` and `review --package`.
     - Added deterministic local-only `subvault redact` (`src/redact.rs`, `tests/redact.rs`) supporting both external files and vault sources (`--source` or `--vault --source-id`) with repeatable `--redact-term`, PDF text extraction without binary/XMP metadata, HTML script/style/comment stripping with preserved table structure, and PII-free JSON receipts.
+  - **Single-Binary Local Workbench & Bilingual Real-World Bill Engine (Milestone 5):**
+    - Added bilingual real-world static extraction (`src/real_extract.rs`, `src/csv_ingest.rs`) on Format 6 covering multi-currency (`CNY`, `USD`, `EUR`, `GBP`, `JPY`, `HKD`, `CAD`, `AUD`, `SGD`, `TWD`, `KRW`, `CHF`), Chinese electronic invoices (UTF-16BE PDFs), styled email HTML (zero JS/network, ignoring `<script>`/`<style>`/`display:none`), and Alipay GB18030/GBK & WeChat UTF-8 BOM CSV statements (`subvault csv`).
+    - Added encrypted user annotations (`source_annotations`) and auditable manual entry (`subvault annotate`, `subvault record-fact`, `decisions.kind = 'human_record'`, multi-currency `correct`/`undo`) for scanned PDFs, receipt screenshots, and promoted CSV rows with zero plaintext on disk.
+    - Added zero-install single-binary local graphical workbench (`subvault-app` / `subvault app`, `src/workbench.rs`, embedded `app/`): loopback-only `127.0.0.1` + 256-bit session token + strict Origin/CSP guards + in-memory `Zeroizing` DEK, batch & folder drag-and-drop import, per-currency subscription dashboard, native OS folder picker, inline PDF/image/sandboxed-HTML evidence preview, CSV row picker, inline redaction, one-click Excel UTF-8 BOM CSV & `.zip` verifiable exit pack, and passphrase rotation.
 - **Pure-Static Interactive Web Demo (`web/`):**
   - Preloaded 12-file synthetic corpus, one-click sample batch import, SHA-256 deduplication & conflict audit, masked account attribution + undo, browser `localStorage` persistence, client-side real binary `.pdf` hashing/extraction (`web/pdf.js`), pure-JS `.zip` offline exit download (`web/zip.js`), and native CLI export folder loader (`Open Native Export`) with bidirectional Format 5 CLI↔Web interop verification.
 - **CI, Pages, Packaging & Documentation:**
@@ -30,5 +34,5 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No publ
 - Switched `.github/workflows/pages.yml` to manual `workflow_dispatch` only until the product is ready for public demo deployment.
 - Made `scripts/run-t1-evidence.sh` portable via `SUBVAULT_EVIDENCE_OUT` and `CARGO_HOME`.
 
-### Remaining Before Cutting `0.1.0`
-- Thin native desktop shell over the Rust/SQLite core.
+### Status
+- All five milestones on the path to `v0.1.0` are implemented and verified across Windows 11 NTFS and Linux x86_64.
