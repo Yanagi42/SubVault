@@ -38,23 +38,36 @@
     { id: "night", label: "深色" },
   ];
 
-  const CHART_PALETTE = [
+  const LIGHT_CHART_PALETTE = [
     "#2563eb",
     "#0d9488",
     "#7c3aed",
-    "#f59e0b",
+    "#d97706",
     "#e11d48",
     "#0284c7",
     "#10b981",
     "#6366f1",
   ];
+  const DARK_CHART_PALETTE = [
+    "#60a5fa",
+    "#34d399",
+    "#a78bfa",
+    "#fbbf24",
+    "#fb7185",
+    "#38bdf8",
+    "#2dd4bf",
+    "#818cf8",
+  ];
+  function getChartPalette() {
+    return state.theme === "night" ? DARK_CHART_PALETTE : LIGHT_CHART_PALETTE;
+  }
 
   const KIND_COLORS = {
-    hardware: "#6d28d9",
-    subscription: "#2563eb",
-    license: "#0d9488",
-    reimbursable: "#d97706",
-    general: "#94a3b8",
+    hardware: "var(--iris)",
+    subscription: "var(--blue)",
+    license: "var(--green)",
+    reimbursable: "var(--amber)",
+    general: "var(--ink-3)",
   };
 
   const BRAND_PRESETS = {
@@ -162,7 +175,7 @@
     }
     let h = 0;
     for (let i = 0; i < raw.length; i++) h = (h * 31 + raw.charCodeAt(i)) >>> 0;
-    const bg = CHART_PALETTE[h % CHART_PALETTE.length];
+    const bg = LIGHT_CHART_PALETTE[h % LIGHT_CHART_PALETTE.length];
     const first = Array.from(raw)[0] || "S";
     const mark = /[\u4e00-\u9fff]/.test(first) ? first : raw.slice(0, 2).toUpperCase();
     return { bg, mark };
@@ -288,6 +301,7 @@
     const idx = THEMES.findIndex((t) => t.id === state.theme);
     const next = THEMES[(idx + 1) % THEMES.length];
     applyTheme(next.id);
+    if (state.workspace) renderWorkspace();
     showToast(`已切换为${next.label}外观`);
   }
 
@@ -314,7 +328,7 @@
       dy: 2.6 + Math.random() * 4,
       rot: Math.random() * 360,
       drot: (Math.random() - 0.5) * 10,
-      color: CHART_PALETTE[Math.floor(Math.random() * CHART_PALETTE.length)],
+      color: getChartPalette()[Math.floor(Math.random() * 8)],
     }));
     let frame = 0;
     function tick() {
@@ -363,7 +377,7 @@
         remPct = Math.max(0, Math.min(100, Math.round(((end - now) / (end - start)) * 100)));
       }
     }
-    const color = daysLeft < 0 ? "#94a3b8" : daysLeft <= 60 ? "#d97706" : "#6d28d9";
+    const color = daysLeft < 0 ? "var(--ink-3)" : daysLeft <= 60 ? "var(--amber)" : "var(--iris)";
     const statusLabel = daysLeft > 0 ? `保修剩 ${daysLeft} 天` : daysLeft === 0 ? "今日到期" : `已过保 ${Math.abs(daysLeft)} 天`;
     const shortTag = daysLeft > 0 ? `${daysLeft}d` : "完";
     return { daysLeft, remPct, color, statusLabel, shortTag, warrantyEnd };
@@ -683,6 +697,8 @@
     document.querySelectorAll("[data-view-mode]").forEach((b) => {
       b.classList.toggle("active", b.getAttribute("data-view-mode") === state.viewMode);
     });
+    const viewToggleEl = document.querySelector(".view-toggle");
+    if (viewToggleEl) viewToggleEl.classList.toggle("hidden", state.collection === "csv");
 
     // Active filter chips
     const chips = [];
@@ -753,8 +769,151 @@
       return;
     }
 
-    if (state.viewMode === "cards") renderObjectGallery(list, stage);
-    else renderTableView(list, stage);
+    if (state.collection === "csv") {
+      renderCsvWorkspace(list, stage);
+    } else if (state.viewMode === "cards") {
+      renderObjectGallery(list, stage);
+    } else {
+      renderTableView(list, stage);
+    }
+  }
+
+  function renderFocusedContextStrip(ws, hero) {
+    const items = ws.items || [];
+    const col = state.collection;
+    hero.classList.add("single-col");
+
+    if (col === "hardware") {
+      const hws = items.filter((i) => i.annotation?.asset_kind === "hardware");
+      const byCur = {};
+      const cpdByCur = {};
+      let nearest = null;
+      for (const it of hws) {
+        const amt = it.amount_fact?.value;
+        if (amt?.amount_text) {
+          byCur[amt.currency] = (byCur[amt.currency] || 0) + amountToCents(amt.amount_text);
+          const cpd = costPerDayInfo(it.annotation?.bill_date, amt.currency, amt.amount_text);
+          if (cpd) {
+            const perDay = Math.max(1, Math.round(amountToCents(amt.amount_text) / cpd.daysUsed));
+            cpdByCur[amt.currency] = (cpdByCur[amt.currency] || 0) + perDay;
+          }
+        }
+        const w = warrantyInfo(it.annotation?.bill_date, it.annotation?.warranty_end);
+        if (w && w.daysLeft >= 0 && (!nearest || w.daysLeft < nearest.daysLeft)) {
+          nearest = { vendor: it.annotation?.vendor || it.display_name, daysLeft: w.daysLeft };
+        }
+      }
+      const totalStr = Object.entries(byCur).map(([c, v]) => formatMoneyShort(c, centsToText(v))).join(" · ") || "—";
+      const cpdStr = Object.entries(cpdByCur).map(([c, v]) => `${formatMoneyShort(c, centsToText(v))}/天`).join(" · ") || "—";
+      hero.innerHTML = `
+        <div class="context-strip">
+          <div class="ctx-title-group">
+            <div class="ctx-title">硬件与保修</div>
+            <div class="ctx-sub">${nearest ? `最近到期：${esc(nearest.vendor)}（还剩 ${nearest.daysLeft} 天）` : "记录购机发票、保修截止日与每日折算成本"}</div>
+          </div>
+          <div class="ctx-metrics">
+            <div class="ctx-metric"><span class="ctx-k">设备数</span><span class="ctx-v">${hws.length} 台</span></div>
+            <div class="ctx-metric"><span class="ctx-k">硬件合计</span><span class="ctx-v sensitive">${esc(totalStr)}</span></div>
+            <div class="ctx-metric"><span class="ctx-k">合计日均成本</span><span class="ctx-v sensitive">${esc(cpdStr)}</span></div>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    if (col === "license") {
+      const lics = items.filter((i) => i.annotation?.asset_kind === "license");
+      const keyCount = lics.filter((i) => i.annotation?.license_key).length;
+      const byCur = {};
+      for (const it of lics) {
+        const amt = it.amount_fact?.value;
+        if (amt?.amount_text) byCur[amt.currency] = (byCur[amt.currency] || 0) + amountToCents(amt.amount_text);
+      }
+      const totalStr = Object.entries(byCur).map(([c, v]) => formatMoneyShort(c, centsToText(v))).join(" · ") || "—";
+      hero.innerHTML = `
+        <div class="context-strip">
+          <div class="ctx-title-group">
+            <div class="ctx-title">买断软件与密钥</div>
+            <div class="ctx-sub">激活密钥单独加密保存在本地，导出表格时自动略过</div>
+          </div>
+          <div class="ctx-metrics">
+            <div class="ctx-metric"><span class="ctx-k">买断软件</span><span class="ctx-v">${lics.length} 款</span></div>
+            <div class="ctx-metric"><span class="ctx-k">已存密钥</span><span class="ctx-v">${keyCount} 个</span></div>
+            <div class="ctx-metric"><span class="ctx-k">买断合计</span><span class="ctx-v sensitive">${esc(totalStr)}</span></div>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    if (col === "reimbursable") {
+      const rsum = ws.reimburse_summary || [];
+      const sumBucket = (fieldAmt, fieldCnt) => {
+        let cnt = 0;
+        const parts = [];
+        for (const r of rsum) {
+          if (r[fieldCnt] > 0) {
+            cnt += r[fieldCnt];
+            parts.push(formatMoneyShort(r.currency, r[fieldAmt]));
+          }
+        }
+        return { cnt, text: parts.join(" · ") || "0" };
+      };
+      const bPend = sumBucket("pending_text", "pending_count");
+      const bSub = sumBucket("submitted_text", "submitted_count");
+      const bDone = sumBucket("reimbursed_text", "reimbursed_count");
+      hero.innerHTML = `
+        <div class="context-strip">
+          <div class="ctx-title-group">
+            <div class="ctx-title">报销记录</div>
+            <div class="ctx-sub">点击卡片右下角状态按钮，可依次切换 待报销 → 已提交 → 已到账</div>
+          </div>
+          <div class="ctx-buckets">
+            <div class="ctx-bucket"><span class="micro-pill amber">待报销</span><strong class="sensitive">${esc(bPend.text)}</strong><span style="color:var(--ink-3)">${bPend.cnt} 笔</span></div>
+            <div class="ctx-bucket"><span class="micro-pill blue">已提交</span><strong class="sensitive">${esc(bSub.text)}</strong><span style="color:var(--ink-3)">${bSub.cnt} 笔</span></div>
+            <div class="ctx-bucket"><span class="micro-pill green">已到账</span><strong class="sensitive">${esc(bDone.text)}</strong><span style="color:var(--ink-3)">${bDone.cnt} 笔</span></div>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    if (col === "subscription") {
+      const subs = items.filter((i) => i.annotation?.asset_kind === "subscription");
+      const curList = (ws.summary_by_currency || []).filter((c) => c.recurring_count > 0);
+      const monthStr = curList.map((c) => formatMoneyShort(c.currency, c.monthly_equiv_recurring)).join(" · ") || "—";
+      const yearStr = curList.map((c) => formatMoneyShort(c.currency, c.yearly_equiv_recurring)).join(" · ") || "—";
+      hero.innerHTML = `
+        <div class="context-strip">
+          <div class="ctx-title-group">
+            <div class="ctx-title">周期订阅</div>
+            <div class="ctx-sub">自动追踪服务周期与涨价变动，往期历史账单已折叠在下方</div>
+          </div>
+          <div class="ctx-metrics">
+            <div class="ctx-metric"><span class="ctx-k">订阅记录</span><span class="ctx-v">${subs.length} 笔</span></div>
+            <div class="ctx-metric"><span class="ctx-k">月均折算</span><span class="ctx-v sensitive">${esc(monthStr)}</span></div>
+            <div class="ctx-metric"><span class="ctx-k">年度折算</span><span class="ctx-v sensitive">${esc(yearStr)}</span></div>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    // CSV view
+    const csvs = items.filter((i) => i.status_flags?.is_csv_statement);
+    const totalRows = csvs.reduce((s, c) => s + (c.csv_row_count || 0), 0);
+    hero.innerHTML = `
+      <div class="context-strip">
+        <div class="ctx-title-group">
+          <div class="ctx-title">CSV 流水明细</div>
+          <div class="ctx-sub">可直接在下方筛选支付宝 / 微信流水，挑出订阅或重要消费一键加入账本</div>
+        </div>
+        <div class="ctx-metrics">
+          <div class="ctx-metric"><span class="ctx-k">流水文件</span><span class="ctx-v">${csvs.length} 份</span></div>
+          <div class="ctx-metric"><span class="ctx-k">解析明细</span><span class="ctx-v">${totalRows} 条</span></div>
+        </div>
+      </div>
+    `;
   }
 
   function renderEditorialHero(ws) {
@@ -765,6 +924,12 @@
       return;
     }
     hero.classList.remove("hidden");
+
+    if (state.collection !== "all") {
+      renderFocusedContextStrip(ws, hero);
+      return;
+    }
+    hero.classList.remove("single-col");
 
     const curList = ws.summary_by_currency || [];
     const curCodes = curList.map((c) => c.currency);
@@ -825,7 +990,7 @@
     for (let idx = 0; idx < Math.min(3, radar.length); idx++) {
       const r = radar[idx];
       if (r.kind === "warranty_expiring") {
-        const ring = renderRingGauge(Math.max(8, Math.round((r.days_left / 365) * 100)), r.days_left <= 14 ? "#dc2626" : "#6d28d9", `${r.days_left}d`);
+        const ring = renderRingGauge(Math.max(8, Math.round((r.days_left / 365) * 100)), r.days_left <= 14 ? "var(--rose)" : "var(--iris)", `${r.days_left}d`);
         signalCards.push(`
           <button type="button" class="signal-tile" data-sig-idx="${idx}">
             <div class="sig-left">
@@ -946,128 +1111,348 @@
     });
   }
 
-  function renderObjectGallery(list, stage) {
-    const html = list.map((item) => {
-      const ann = item.annotation || {};
-      const amtVal = item.amount_fact ? item.amount_fact.value : null;
-      const perVal = item.period_fact ? item.period_fact.value : null;
-      const flags = item.status_flags || {};
-      const kind = ann.asset_kind || "general";
-      const kindMeta = ASSET_KIND_META[kind] || ASSET_KIND_META.general;
-      const title = ann.vendor || item.display_name;
-      const sub = ann.plan_name || (ann.vendor ? item.display_name : item.media_type);
-      const brand = brandStyleFor(title);
-      const drift = item.price_drift || null;
+  function renderAssetCard(item, isWide) {
+    const ann = item.annotation || {};
+    const amtVal = item.amount_fact ? item.amount_fact.value : null;
+    const perVal = item.period_fact ? item.period_fact.value : null;
+    const flags = item.status_flags || {};
+    const kind = ann.asset_kind || "general";
+    const kindMeta = ASSET_KIND_META[kind] || ASSET_KIND_META.general;
+    const title = ann.vendor || item.display_name;
+    const sub = ann.plan_name || (ann.vendor ? item.display_name : item.media_type);
+    const brand = brandStyleFor(title);
+    const drift = item.price_drift || null;
+    const prog = kind === "subscription" ? periodProgressInfo(perVal) : null;
 
-      let driftPill = "";
-      if (drift) {
-        const up = drift.direction === "up";
-        driftPill = `<span class="micro-pill ${up ? "rose" : "green"}" title="较上期 ${esc(drift.prev_text)} 变动 ${esc(drift.diff_text)}">${up ? ICO.trendUp : ICO.trendDown} ${up ? `+${Math.abs(drift.pct_change)}%` : `-${Math.abs(drift.pct_change)}%`}</span>`;
-      }
+    let driftPill = "";
+    if (drift) {
+      const up = drift.direction === "up";
+      driftPill = `<span class="micro-pill ${up ? "rose" : "green"}" title="较上期 ${esc(drift.prev_text)} 变动 ${esc(drift.diff_text)}">${up ? ICO.trendUp : ICO.trendDown} ${up ? `+${Math.abs(drift.pct_change)}%` : `-${Math.abs(drift.pct_change)}%`}</span>`;
+    }
 
-      let priceHtml = "";
-      if (amtVal && amtVal.amount_text) {
-        const cyc = kind === "hardware" ? "一次购入" : kind === "license" ? "终身买断" : (CYCLE_LABELS[ann.billing_cycle] || "未标注");
-        priceHtml = `
-          <div class="oc-price-cluster">
-            <div class="oc-amount sensitive">${renderEditorialMoney(amtVal.currency, amtVal.amount_text, true)}</div>
-            ${driftPill}
-          </div>
-          <span class="oc-cycle">${esc(cyc)}</span>
-        `;
-      } else if (flags.is_csv_statement) {
-        priceHtml = `<span class="micro-pill slate">CSV 流水 · ${item.csv_row_count} 条</span><span class="oc-cycle">点击查看</span>`;
-      } else if (flags.is_credit_or_order_warning) {
-        priceHtml = `<span class="micro-pill amber">退款 / 未付订单</span><span class="oc-cycle">未计入</span>`;
-      } else {
-        priceHtml = `<span style="font-size:13px;font-weight:700;color:var(--amber)">缺少金额</span><span class="oc-cycle">点击补充</span>`;
-      }
+    let priceHtml = "";
+    if (amtVal && amtVal.amount_text) {
+      const cyc = kind === "hardware" ? "一次购入" : kind === "license" ? "终身买断" : (CYCLE_LABELS[ann.billing_cycle] || "未标注");
+      priceHtml = `
+        <div class="oc-price-cluster">
+          <div class="oc-amount sensitive">${renderEditorialMoney(amtVal.currency, amtVal.amount_text, true)}</div>
+          ${driftPill}
+        </div>
+        <span class="oc-cycle">${esc(cyc)}</span>
+      `;
+    } else if (flags.is_csv_statement) {
+      priceHtml = `<span class="micro-pill slate">CSV 流水 · ${item.csv_row_count} 条</span><span class="oc-cycle">点击查看</span>`;
+    } else if (flags.is_credit_or_order_warning) {
+      priceHtml = `<span class="micro-pill amber">退款 / 未付订单</span><span class="oc-cycle">未计入</span>`;
+    } else {
+      priceHtml = `<span style="font-size:13px;font-weight:700;color:var(--amber)">缺少金额</span><span class="oc-cycle">点击补充</span>`;
+    }
 
-      // Tailored tactile body per asset_kind
-      let bodyHtml = "";
-      if (kind === "hardware") {
-        const w = warrantyInfo(ann.bill_date, ann.warranty_end);
-        const cpd = amtVal ? costPerDayInfo(ann.bill_date, amtVal.currency, amtVal.amount_text) : null;
-        if (w || cpd) {
-          bodyHtml = `
-            <div class="hw-instrument">
-              <div>
-                ${cpd ? `<div class="hw-cpd-num sensitive">${esc(cpd.perDayText)} <span style="font-size:11.5px;font-weight:500;color:var(--ink-3)">/ 天</span></div><div class="hw-cpd-sub">已用 ${cpd.daysUsed} 天${w ? ` · ${esc(w.statusLabel)}` : ""}</div>` : `<div class="hw-cpd-sub">${esc(w.statusLabel)}</div>`}
-              </div>
-              ${w ? renderRingGauge(w.remPct, w.color, w.shortTag) : ""}
-            </div>
-          `;
-        }
-      } else if (kind === "license") {
-        const parts = [];
-        if (ann.license_scope) parts.push(`<div style="font-size:12px;color:var(--ink-2)">${esc(ann.license_scope)}</div>`);
-        if (ann.license_key) {
-          parts.push(`
-            <div class="serial-plate">
-              <span class="sensitive">${esc(maskLicenseKey(ann.license_key))}</span>
-              <button type="button" class="copy-key-pill" data-copy-key-sid="${esc(item.source_id)}">${ICO.copy} 复制密钥</button>
-            </div>
-          `);
-        }
-        bodyHtml = parts.join("");
-      } else if (kind === "subscription") {
-        const prog = periodProgressInfo(perVal);
-        if (prog) {
-          bodyHtml = `
-            <div>
-              <div class="meter-caption"><span>${esc(prog.range)}</span><span>${esc(prog.statusLabel)}</span></div>
-              ${renderTickMeter(prog.pct, prog.expired)}
-            </div>
-          `;
-        } else if (ann.bill_date) {
-          bodyHtml = `<div style="font-size:12px;color:var(--ink-3)">账单日 ${esc(ann.bill_date)}</div>`;
-        }
-      } else if (kind === "reimbursable") {
+    let bodyHtml = "";
+    if (kind === "hardware") {
+      const w = warrantyInfo(ann.bill_date, ann.warranty_end);
+      const cpd = amtVal ? costPerDayInfo(ann.bill_date, amtVal.currency, amtVal.amount_text) : null;
+      const extraMeta = isWide
+        ? `<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--ink-3)">${ann.bill_date ? `<span>购入 ${esc(ann.bill_date)}</span>` : ""}${ann.warranty_end ? `<span>保修至 ${esc(ann.warranty_end)}</span>` : ""}${ann.notes ? `<span>${esc(ann.notes)}</span>` : ""}</div>`
+        : "";
+      if (w || cpd) {
         bodyHtml = `
-          ${ann.bill_date ? `<div style="font-size:12px;color:var(--ink-3)">开票日期 ${esc(ann.bill_date)}${ann.notes ? ` · ${esc(ann.notes.slice(0, 22))}` : ""}</div>` : ""}
-          <div class="ticket-divider"></div>
+          <div class="hw-instrument">
+            <div>
+              ${cpd ? `<div class="hw-cpd-num sensitive">${esc(cpd.perDayText)} <span style="font-size:11.5px;font-weight:500;color:var(--ink-3)">/ 天</span></div><div class="hw-cpd-sub">已用 ${cpd.daysUsed} 天${w ? ` · ${esc(w.statusLabel)}` : ""}</div>` : `<div class="hw-cpd-sub">${esc(w.statusLabel)}</div>`}
+            </div>
+            ${w ? renderRingGauge(w.remPct, w.color, w.shortTag) : ""}
+          </div>
+          ${extraMeta}
+        `;
+      } else {
+        bodyHtml = extraMeta;
+      }
+    } else if (kind === "license") {
+      const parts = [];
+      if (ann.license_scope) parts.push(`<div style="font-size:12px;color:var(--ink-2)">${esc(ann.license_scope)}${isWide && ann.bill_date ? ` · 购于 ${esc(ann.bill_date)}` : ""}</div>`);
+      if (ann.license_key) {
+        parts.push(`
+          <div class="serial-plate">
+            <span class="sensitive">${esc(maskLicenseKey(ann.license_key))}</span>
+            <button type="button" class="copy-key-pill" data-copy-key-sid="${esc(item.source_id)}">${ICO.copy} 复制密钥</button>
+          </div>
+        `);
+      }
+      if (isWide && ann.notes) parts.push(`<div style="font-size:12px;color:var(--ink-3)">${esc(ann.notes)}</div>`);
+      bodyHtml = parts.join("");
+    } else if (kind === "subscription") {
+      if (prog) {
+        bodyHtml = `
+          <div>
+            <div class="meter-caption"><span>${esc(prog.range)}</span><span>${esc(prog.statusLabel)}</span></div>
+            ${renderTickMeter(prog.pct, prog.expired)}
+          </div>
         `;
       } else if (ann.bill_date) {
-        bodyHtml = `<div style="font-size:12px;color:var(--ink-3)">日期 ${esc(ann.bill_date)}</div>`;
+        bodyHtml = `<div style="font-size:12px;color:var(--ink-3)">账单日 ${esc(ann.bill_date)}</div>`;
       }
+    } else if (kind === "reimbursable") {
+      bodyHtml = `
+        ${ann.bill_date ? `<div style="font-size:12px;color:var(--ink-3)">开票日期 ${esc(ann.bill_date)}${ann.notes ? ` · ${esc(ann.notes.slice(0, 26))}` : ""}</div>` : ""}
+        <div class="ticket-divider"></div>
+      `;
+    } else if (ann.bill_date) {
+      bodyHtml = `<div style="font-size:12px;color:var(--ink-3)">日期 ${esc(ann.bill_date)}</div>`;
+    }
 
-      const reimbStatus = ann.reimburse_status && ann.reimburse_status !== "none"
-        ? ann.reimburse_status
-        : kind === "reimbursable" ? "pending" : null;
-      const stampHtml = reimbStatus && REIMBURSE_META[reimbStatus]
-        ? `<button type="button" class="stamp-btn ${REIMBURSE_META[reimbStatus].cls}" data-reimb-sid="${esc(item.source_id)}" data-reimb-cur="${esc(reimbStatus)}" title="点击切换报销进度">${REIMBURSE_META[reimbStatus].label} ${ICO.refresh}</button>`
+    const reimbStatus = ann.reimburse_status && ann.reimburse_status !== "none"
+      ? ann.reimburse_status
+      : kind === "reimbursable" ? "pending" : null;
+    const stampHtml = reimbStatus && REIMBURSE_META[reimbStatus]
+      ? `<button type="button" class="stamp-btn ${REIMBURSE_META[reimbStatus].cls}" data-reimb-sid="${esc(item.source_id)}" data-reimb-cur="${esc(reimbStatus)}" title="点击切换报销进度">${REIMBURSE_META[reimbStatus].label} ${ICO.refresh}</button>`
+      : "";
+
+    const metaStr = [ann.account_label, ann.category, flags.has_duplicate ? `防重 ×${item.occurrence_count}` : ""].filter(Boolean).join(" · ") || "未分组";
+    const spineHtml = kind === "subscription" ? `<span class="obj-spine" style="background:${brand.bg}"></span>` : "";
+
+    return `
+      <article class="obj-card kind-${esc(kind)} ${prog?.expired ? "is-expired" : ""}" data-source-id="${esc(item.source_id)}">
+        ${spineHtml}
+        <div class="oc-top">
+          <div class="oc-id">
+            <div class="brand-badge" style="background:${brand.bg}">${esc(brand.mark)}</div>
+            <div style="min-width:0">
+              <div class="oc-title">${esc(title)}</div>
+              <div class="oc-sub">${esc(sub)}</div>
+            </div>
+          </div>
+          <span class="micro-pill ${flags.has_conflict ? "amber" : prog?.expired ? "slate" : kindMeta.pill}">${flags.has_conflict ? "冲突" : prog?.expired ? "往期" : esc(kindMeta.label)}</span>
+        </div>
+
+        <div class="oc-price-row">${priceHtml}</div>
+        ${bodyHtml}
+
+        <div class="oc-foot ${kind === "reimbursable" ? "" : "ruled"}">
+          <span class="sensitive" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(metaStr)}</span>
+          ${stampHtml || (item.object_intact ? `<span class="verified-check" title="原件校验完整">${ICO.check}</span>` : "")}
+        </div>
+      </article>
+    `;
+  }
+
+  function renderFilingStripRow(item) {
+    const ann = item.annotation || {};
+    const amtVal = item.amount_fact ? item.amount_fact.value : null;
+    const perVal = item.period_fact ? item.period_fact.value : null;
+    const flags = item.status_flags || {};
+    const title = ann.vendor || item.display_name;
+    const brand = brandStyleFor(title);
+
+    let meta = "";
+    let rightHtml = "";
+    if (flags.is_csv_statement) {
+      meta = `${item.display_name} · ${item.csv_row_count || 0} 条流水${ann.account_label ? ` · ${ann.account_label}` : ""}`;
+      rightHtml = `<span class="micro-pill slate">CSV 流水</span><button type="button" class="btn btn-soft btn-sm" data-open-csv-view="1">查看流水</button>`;
+    } else if (flags.needs_manual_entry || flags.has_conflict) {
+      meta = `${item.media_type} · ${formatBytes(item.byte_length)} · ${flags.has_conflict ? "检测到多个金额待确认" : "尚未记录金额"}`;
+      rightHtml = `<span class="micro-pill amber">${flags.has_conflict ? "待确认" : "缺少金额"}</span><button type="button" class="btn btn-soft btn-sm" data-open-triage="1">去补充</button>`;
+    } else {
+      const range = perVal?.period_start ? `${perVal.period_start} — ${perVal.period_end}` : ann.bill_date || "";
+      meta = [ann.plan_name, range, ann.account_label].filter(Boolean).join(" · ");
+      const driftBadge = item.price_drift
+        ? `<span class="micro-pill ${item.price_drift.direction === "up" ? "rose" : "green"}">${item.price_drift.direction === "up" ? `+${Math.abs(item.price_drift.pct_change)}%` : `-${Math.abs(item.price_drift.pct_change)}%`}</span>`
         : "";
+      rightHtml = `${driftBadge}${amtVal?.amount_text ? `<strong class="sensitive num" style="font-size:13.5px">${esc(formatMoney(amtVal.currency, amtVal.amount_text))}</strong>` : ""}<span class="micro-pill slate">往期</span>`;
+    }
 
-      const metaStr = [ann.account_label, ann.category, flags.has_duplicate ? `防重 ×${item.occurrence_count}` : ""].filter(Boolean).join(" · ") || "未分组";
-      const spineHtml = kind === "subscription" ? `<span class="obj-spine" style="background:${brand.bg}"></span>` : "";
+    return `
+      <div class="filing-strip" data-source-id="${esc(item.source_id)}">
+        <div class="filing-left">
+          <div class="brand-badge brand-badge-sm" style="background:${brand.bg}">${esc(brand.mark)}</div>
+          <div style="min-width:0">
+            <div class="filing-title">${esc(title)}</div>
+            <div class="filing-meta sensitive">${esc(meta)}</div>
+          </div>
+        </div>
+        <div class="filing-right">${rightHtml}</div>
+      </div>
+    `;
+  }
+
+  function renderObjectGallery(list, stage) {
+    const isWide = state.collection === "hardware" || state.collection === "license";
+    let mainItems = list;
+    let secondaryItems = [];
+    let secondaryLabel = "";
+
+    if (state.collection === "all") {
+      mainItems = [];
+      secondaryItems = [];
+      for (const it of list) {
+        const f = it.status_flags || {};
+        if (f.is_csv_statement || f.needs_manual_entry || f.is_credit_or_order_warning) {
+          secondaryItems.push(it);
+        } else {
+          mainItems.push(it);
+        }
+      }
+      secondaryLabel = "流水与待处理文件";
+    } else if (state.collection === "subscription") {
+      // Group expired past-period bills below active subscriptions when there are active ones
+      const active = [];
+      const expired = [];
+      for (const it of list) {
+        const p = periodProgressInfo(it.period_fact?.value);
+        if (p && p.expired) expired.push(it);
+        else active.push(it);
+      }
+      if (active.length > 0 && expired.length > 0) {
+        mainItems = active;
+        secondaryItems = expired;
+        secondaryLabel = "往期历史账单";
+      }
+    }
+
+    const gridClass = isWide
+      ? (mainItems.length === 1 ? "wide-grid solo-grid" : "wide-grid")
+      : "";
+    const primaryHtml = mainItems.length
+      ? `<div class="object-gallery ${gridClass}">${mainItems.map((it) => renderAssetCard(it, isWide)).join("")}</div>`
+      : "";
+
+    const secondaryHtml = secondaryItems.length
+      ? `
+        <div class="stage-section" ${mainItems.length === 0 ? 'style="margin-top:0"' : ""}>
+          <div class="stage-section-head">
+            <span class="stage-section-title">${esc(secondaryLabel)} <span class="micro-pill slate">${secondaryItems.length}</span></span>
+          </div>
+          <div class="filing-list">${secondaryItems.map(renderFilingStripRow).join("")}</div>
+        </div>
+      `
+      : "";
+
+    stage.innerHTML = `${primaryHtml}${secondaryHtml}`;
+    bindStageActions(stage);
+  }
+
+  function renderCsvWorkspace(list, stage) {
+    const cardsHtml = list.map((item, cIdx) => {
+      const ann = item.annotation || {};
+      const title = ann.vendor || item.display_name;
+      const brand = brandStyleFor(title);
+      const rows = (item.candidates || [])
+        .filter((c) => c.kind === "csv_transaction")
+        .map((c) => ({ ...c.value, raw_line: c.excerpt }));
 
       return `
-        <article class="obj-card kind-${esc(kind)}" data-source-id="${esc(item.source_id)}">
-          ${spineHtml}
-          <div class="oc-top">
-            <div class="oc-id">
-              <div class="brand-badge" style="background:${brand.bg}">${esc(brand.mark)}</div>
+        <section class="csv-ws-card" data-csv-card="${cIdx}" data-csv-sid="${esc(item.source_id)}">
+          <div class="csv-ws-head">
+            <div class="csv-ws-id">
+              <div class="brand-badge brand-badge-sm" style="background:${brand.bg}">${esc(brand.mark)}</div>
               <div style="min-width:0">
-                <div class="oc-title">${esc(title)}</div>
-                <div class="oc-sub">${esc(sub)}</div>
+                <div style="font-size:14.5px;font-weight:700">${esc(title)}</div>
+                <div style="font-size:12px;color:var(--ink-3)" class="sensitive">${esc(item.display_name)} · 共 ${rows.length} 条${ann.account_label ? ` · ${esc(ann.account_label)}` : ""}</div>
               </div>
             </div>
-            <span class="micro-pill ${flags.has_conflict ? "amber" : kindMeta.pill}">${flags.has_conflict ? "冲突" : esc(kindMeta.label)}</span>
+            <div class="csv-ws-tools">
+              <div class="search-capsule" style="width:200px">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+                <input type="search" data-csv-filter-q="${cIdx}" placeholder="筛选商户或说明…">
+              </div>
+              <label class="check-row compact">
+                <input type="checkbox" data-csv-filter-exp="${cIdx}" checked>
+                <span>仅看支出</span>
+              </label>
+              <button type="button" class="btn btn-soft btn-sm" data-csv-open-detail="${esc(item.source_id)}">原件与详情</button>
+            </div>
           </div>
-
-          <div class="oc-price-row">${priceHtml}</div>
-          ${bodyHtml}
-
-          <div class="oc-foot ${kind === "reimbursable" ? "" : "ruled"}">
-            <span class="sensitive" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(metaStr)}</span>
-            ${stampHtml || (item.object_intact ? `<span class="verified-check" title="原件校验完整">${ICO.check}</span>` : "")}
+          <div style="overflow-x:auto">
+            <table class="csv-ws-table">
+              <thead>
+                <tr>
+                  <th>日期</th>
+                  <th>商户</th>
+                  <th>商品说明</th>
+                  <th class="right">金额</th>
+                  <th class="right">操作</th>
+                </tr>
+              </thead>
+              <tbody data-csv-tbody="${cIdx}"></tbody>
+            </table>
           </div>
-        </article>
+        </section>
       `;
     }).join("");
 
-    stage.innerHTML = `<div class="object-gallery">${html}</div>`;
-    bindStageActions(stage);
+    stage.innerHTML = `<div class="csv-workspace-stack">${cardsHtml}</div>`;
+
+    list.forEach((item, cIdx) => {
+      const allRows = (item.candidates || [])
+        .filter((c) => c.kind === "csv_transaction")
+        .map((c) => ({ ...c.value, raw_line: c.excerpt }));
+      const tbody = stage.querySelector(`[data-csv-tbody="${cIdx}"]`);
+      const qInput = stage.querySelector(`[data-csv-filter-q="${cIdx}"]`);
+      const expChk = stage.querySelector(`[data-csv-filter-exp="${cIdx}"]`);
+
+      const paintRows = () => {
+        const q = (qInput.value || "").trim().toLowerCase();
+        const expOnly = expChk.checked;
+        const filtered = allRows.filter((r) => {
+          if (expOnly && r.direction !== "expense") return false;
+          if (q && !`${r.merchant || ""} ${r.description || ""} ${r.date || ""} ${r.amount_text || ""}`.toLowerCase().includes(q)) return false;
+          return true;
+        });
+        if (!filtered.length) {
+          tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--ink-3);padding:24px">没有符合条件的流水记录</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = filtered.slice(0, 150).map((r, rIdx) => `
+          <tr>
+            <td style="font-size:12px;color:var(--ink-3);white-space:nowrap" class="num">${esc(r.date || "—")}</td>
+            <td style="font-weight:600">${esc(r.merchant || "未标注商户")}</td>
+            <td style="color:var(--ink-2)">${esc(r.description || "—")}</td>
+            <td class="right sensitive num" style="font-weight:700;white-space:nowrap">${esc(formatMoney(r.currency || "CNY", r.amount_text))}</td>
+            <td class="right"><button type="button" class="btn btn-soft btn-sm" data-ws-promote="${rIdx}">加入账本</button></td>
+          </tr>
+        `).join("");
+
+        tbody.querySelectorAll("[data-ws-promote]").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const r = filtered[Number(btn.getAttribute("data-ws-promote"))];
+            if (!r) return;
+            btn.disabled = true;
+            btn.textContent = "加入中…";
+            try {
+              const res = await api("POST", "/api/csv/promote", {
+                parent_source_id: item.source_id,
+                row_number: r.row_number,
+                merchant: r.merchant || "",
+                description: r.description || "",
+                date: r.date || "",
+                currency: r.currency || "CNY",
+                amount_text: r.amount_text || "",
+                billing_cycle: "unknown",
+                account_label: r.account_hint || undefined,
+                raw_line: r.raw_line || "",
+              });
+              showToast(res.storage_reused ? "这条流水已经加过，已跳过重复" : `已将「${r.merchant || "该笔流水"}」加入账本`, "ok");
+              await refreshWorkspace();
+            } catch (err) {
+              showToast(err.message, "error");
+              btn.disabled = false;
+              btn.textContent = "加入账本";
+            }
+          });
+        });
+      };
+
+      qInput.addEventListener("input", paintRows);
+      expChk.addEventListener("change", paintRows);
+      paintRows();
+    });
+
+    stage.querySelectorAll("[data-csv-open-detail]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const found = (state.workspace.items || []).find((i) => i.source_id === btn.getAttribute("data-csv-open-detail"));
+        if (found) openDrawer(found, "evidence");
+      });
+    });
   }
 
   function renderTableView(list, stage) {
@@ -1129,6 +1514,19 @@
   }
 
   function bindStageActions(stage) {
+    stage.querySelectorAll("[data-open-csv-view]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        state.collection = "csv";
+        renderAssetsPane(state.workspace);
+      });
+    });
+    stage.querySelectorAll("[data-open-triage]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        navigateTo("triage");
+      });
+    });
     stage.querySelectorAll("[data-copy-key-sid]").forEach((btn) => {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -1192,13 +1590,14 @@
       }
       if (!amtVal?.amount_text) continue;
       const money = formatMoneyShort(amtVal.currency, amtVal.amount_text);
+      const cents = amountToCents(amtVal.amount_text);
       const realDateStr = ann.bill_date || perVal?.period_start;
       let matchedRealDay = null;
       if (realDateStr && /^\d{4}-\d{2}-\d{2}$/.test(realDateStr)) {
         const [ry, rm, rd] = realDateStr.split("-").map(Number);
         if (ry === year && rm === month + 1) {
           matchedRealDay = rd;
-          addEvt(rd, { kind: "real", source_id: item.source_id, title, money, sub: "账单日" });
+          addEvt(rd, { kind: "real", source_id: item.source_id, title, money, currency: amtVal.currency, cents, sub: "账单日" });
         }
       }
       if (!projectable.has(item.source_id)) continue;
@@ -1213,13 +1612,26 @@
           else if (ann.billing_cycle === "quarterly" && diff % 3 === 0) hits = true;
           else if (ann.billing_cycle === "yearly" && diff % 12 === 0) hits = true;
           if (hits && !(diff === 0 && perVal?.period_end && matchedRealDay === clampedDay)) {
-            addEvt(clampedDay, { kind: "projected", source_id: item.source_id, title, money, sub: "预计续费" });
+            addEvt(clampedDay, { kind: "projected", source_id: item.source_id, title, money, currency: amtVal.currency, cents, sub: "预计续费" });
           }
         }
       }
     }
 
     agenda.sort((a, b) => a.day - b.day);
+    const monthTotals = {};
+    for (const ev of agenda) {
+      if (ev.currency && ev.cents) monthTotals[ev.currency] = (monthTotals[ev.currency] || 0) + ev.cents;
+    }
+    const monthTotalRows = Object.entries(monthTotals);
+    const monthFootHtml = monthTotalRows.length
+      ? `
+        <div class="agenda-total-foot">
+          <div style="font-size:11.5px;font-weight:700;color:var(--ink-3)">${month + 1} 月合计（含预计续费）</div>
+          ${monthTotalRows.map(([cur, c]) => `<div class="agenda-total-row"><span>${esc(cur)} · ${esc(CURRENCY_NAMES[cur] || cur)}</span><strong class="sensitive">${esc(formatMoneyShort(cur, centsToText(c)))}</strong></div>`).join("")}
+        </div>
+      `
+      : "";
 
     let cells = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"].map((w) => `<div class="cal-wk">${w}</div>`).join("");
     for (let i = startWeekday - 1; i >= 0; i--) cells += `<div class="cal-cell other"><div class="cal-day">${prevMonthDays - i}</div></div>`;
@@ -1275,6 +1687,7 @@
             <h3 class="folio-h3">${month + 1} 月日程（${agenda.length} 项）</h3>
           </div>
           ${agendaHtml}
+          ${monthFootHtml}
         </aside>
       </div>
     `;
@@ -1336,20 +1749,21 @@
     const accRows = (analytics.accounts && analytics.accounts[cur]) || [];
     const monthRows = (analytics.monthly_trend && analytics.monthly_trend[cur]) || [];
 
+    const palette = getChartPalette();
     const totalCat = catRows.reduce((s, r) => s + (r.cents || 0), 0) || 1;
-    const r = 68, circ = 2 * Math.PI * r;
+    const r = 66, circ = 2 * Math.PI * r;
     let offset = 0;
     const slicesSvg = catRows.map((row, idx) => {
       const frac = row.cents / totalCat;
       const dash = Math.max(2, frac * circ);
-      const seg = `<circle class="donut-seg" cx="88" cy="88" r="${r}" fill="none" stroke="${CHART_PALETTE[idx % CHART_PALETTE.length]}" stroke-width="16" stroke-dasharray="${dash.toFixed(2)} ${(circ - dash).toFixed(2)}" stroke-dashoffset="${(-offset).toFixed(2)}" transform="rotate(-90 88 88)" data-cat-slice="${esc(row.name)}" data-cat-amt="${esc(row.amount_text)}" data-cat-pct="${Math.round(frac * 100)}" />`;
+      const seg = `<circle class="donut-seg" cx="85" cy="85" r="${r}" fill="none" stroke="${palette[idx % palette.length]}" stroke-width="16" stroke-dasharray="${dash.toFixed(2)} ${(circ - dash).toFixed(2)}" stroke-dashoffset="${(-offset).toFixed(2)}" transform="rotate(-90 85 85)" data-cat-slice="${esc(row.name)}" data-cat-amt="${esc(row.amount_text)}" data-cat-pct="${Math.round(frac * 100)}" />`;
       offset += dash;
       return seg;
     }).join("");
 
     const legendHtml = catRows.map((row, idx) => `
       <div class="legend-row" data-jump-cat="${esc(row.name)}">
-        <div class="legend-l"><span class="swatch" style="background:${CHART_PALETTE[idx % CHART_PALETTE.length]}"></span><span>${esc(row.name)}</span></div>
+        <div class="legend-l"><span class="swatch" style="background:${palette[idx % palette.length]}"></span><span>${esc(row.name)}</span></div>
         <strong class="sensitive num">${esc(formatMoneyShort(cur, row.amount_text))} · ${Math.round((row.cents / totalCat) * 100)}%</strong>
       </div>
     `).join("");
@@ -1360,16 +1774,16 @@
       : `<div class="bars-row">${monthRows.slice(-10).map((m) => `
           <div class="bar-col">
             <span class="bar-num sensitive">${esc(formatMoneyShort(cur, m.amount_text))}</span>
-            <div class="bar-fill" style="height:${Math.max(8, Math.round((m.cents / maxMonth) * 106))}px"></div>
+            <div class="bar-fill" style="height:${Math.max(8, Math.round((m.cents / maxMonth) * 86))}px"></div>
             <span class="bar-lbl">${esc(m.month)}</span>
           </div>
         `).join("")}</div>`;
 
     const totalAcc = accRows.reduce((s, r) => s + (r.cents || 0), 0) || 1;
-    const allocSegs = accRows.map((row, idx) => `<div class="alloc-seg" style="width:${Math.max(4, Math.round((row.cents / totalAcc) * 100))}%;background:${CHART_PALETTE[(idx + 1) % CHART_PALETTE.length]}"></div>`).join("");
+    const allocSegs = accRows.map((row, idx) => `<div class="alloc-seg" style="width:${Math.max(4, Math.round((row.cents / totalAcc) * 100))}%;background:${palette[(idx + 1) % palette.length]}"></div>`).join("");
     const accLegend = accRows.map((row, idx) => `
       <div class="legend-row" data-jump-acc="${esc(row.name)}">
-        <div class="legend-l"><span class="swatch" style="background:${CHART_PALETTE[(idx + 1) % CHART_PALETTE.length]}"></span><span class="sensitive">${esc(row.name)}（${row.count} 笔）</span></div>
+        <div class="legend-l"><span class="swatch" style="background:${palette[(idx + 1) % palette.length]}"></span><span class="sensitive">${esc(row.name)}（${row.count} 笔）</span></div>
         <strong class="sensitive num">${esc(formatMoneyShort(cur, row.amount_text))} · ${Math.round((row.cents / totalAcc) * 100)}%</strong>
       </div>
     `).join("");
@@ -1387,7 +1801,7 @@
             const badge = drift
               ? `<span class="micro-pill ${drift.direction === "up" ? "rose" : "green"}">${drift.direction === "up" ? `+${Math.abs(drift.pct_change)}%` : `-${Math.abs(drift.pct_change)}%`}</span>`
               : `<span class="micro-pill ${km.pill}">${esc(km.label)}</span>`;
-            const spark = buildMiniSparkline(vp.history || [], drift?.direction === "up" ? "#dc2626" : "#2563eb");
+            const spark = buildMiniSparkline(vp.history || [], drift?.direction === "up" ? "var(--rose)" : "var(--blue)");
             return `
               <div class="vendor-tile" data-jump-vendor="${esc(vp.vendor)}">
                 <div class="vt-head">
@@ -1448,12 +1862,12 @@
           <span style="font-size:12px;color:var(--ink-3)">各币种分开统计，不做汇率换算</span>
         </div>
 
-        <div class="sec-grid-2">
+        <div class="insights-top-grid">
           <div class="folio-card pad-24">
             <h3 class="folio-h3">分类占比</h3>
             <div class="donut-wrap">
               <div class="donut-box">
-                <svg viewBox="0 0 176 176" width="176" height="176">${slicesSvg}</svg>
+                <svg viewBox="0 0 170 170" width="170" height="170">${slicesSvg}</svg>
                 <div class="donut-center">
                   <div id="donut-center-label" class="donut-center-k">${esc(cur)} 总额</div>
                   <div id="donut-center-val" class="donut-center-v sensitive">${esc(formatMoneyShort(cur, centsToText(totalCat)))}</div>
@@ -1474,21 +1888,21 @@
         ${portfolioHtml}
 
         <div class="sim-studio">
-          <div class="sim-head">
-            <div>
-              <div style="display:flex;align-items:center;gap:8px">
-                <h3 class="folio-h3" style="margin:0">取消订阅试算</h3>
-                <span class="micro-pill slate">仅试算，不修改账本</span>
-              </div>
-              <div class="sim-figure sensitive">每年少花 ${renderEditorialMoney(cur, centsToText(yearlySave), true)}</div>
-              <div class="folio-p" style="margin-top:3px">${esc(buildSavingsNote(cur, yearlySave, cutList.length))}</div>
+          <div class="sim-side">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <h3 class="folio-h3" style="margin:0">取消订阅试算</h3>
+              <span class="micro-pill slate">仅试算，不修改账本</span>
             </div>
-            <div class="btn-row">
+            <div class="sim-figure sensitive">每年少花 ${renderEditorialMoney(cur, centsToText(yearlySave), true)}</div>
+            <div class="folio-p">${esc(buildSavingsNote(cur, yearlySave, cutList.length))}</div>
+            <div class="btn-row" style="margin-top:4px">
               <button type="button" id="btn-sim-copy" class="btn btn-ink btn-sm" ${cutList.length === 0 ? "disabled" : ""}>复制清单 (${cutList.length})</button>
               <button type="button" id="btn-sim-reset" class="btn btn-soft btn-sm" ${cutList.length === 0 ? "disabled" : ""}>重置</button>
             </div>
           </div>
-          ${recurring.length ? `<div class="sim-grid">${simRows}</div>` : `<p class="folio-p">当前 ${esc(cur)} 下还没有周期订阅。</p>`}
+          <div>
+            ${recurring.length ? `<div class="sim-grid">${simRows}</div>` : `<p class="folio-p">当前 ${esc(cur)} 下还没有周期订阅。</p>`}
+          </div>
         </div>
       </div>
     `;
