@@ -20,7 +20,9 @@ use crate::journal::{
     self, path as journal_path, read_file as read_journal_file, staging_path,
     write as write_journal, Journal,
 };
-use crate::lockfile::{self, sigstop, VaultLock, LOCK_TEXT};
+#[cfg(target_os = "linux")]
+use crate::lockfile::sigstop;
+use crate::lockfile::{self, VaultLock, LOCK_TEXT};
 use crate::model::{
     capabilities, db_fail, honesty, io_fail, platform_limits, unseen_db, unseen_io, Fail, Report,
     EXIT_DAMAGED, EXIT_FAULT_MISSED, EXIT_INTEGRITY, EXIT_LOCKED, EXIT_NOT_PRESERVED,
@@ -107,6 +109,7 @@ pub enum InjectAction {
 #[derive(Clone)]
 pub struct Hooks {
     pub stop_at: Option<String>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub checkpoint: Option<PathBuf>,
     pub inject_action: Option<InjectAction>,
     pub inject_point: Option<String>,
@@ -195,15 +198,26 @@ pub(super) fn stop_checkpoint(
     if hooks.stop_at.as_deref() != Some(point) {
         return Ok(());
     }
-    let path = hooks.checkpoint.clone().ok_or_else(|| {
-        Fail::new(EXIT_USAGE, "Usage", "checkpoint_required").extra("point", json!(point))
-    })?;
-    details.insert("point".into(), json!(point));
-    let bytes = serde_json::to_vec_pretty(&Value::Object(details))
-        .map_err(|_| Fail::new(EXIT_USAGE, "Usage", "checkpoint_encode"))?;
-    atomic_write(&path, &bytes).map_err(|err| io_fail(err, "checkpoint"))?;
-    sigstop();
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = &mut details;
+        Err(
+            Fail::new(EXIT_USAGE, "Usage", "stop_hook_not_supported_on_platform")
+                .extra("point", json!(point)),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = hooks.checkpoint.clone().ok_or_else(|| {
+            Fail::new(EXIT_USAGE, "Usage", "checkpoint_required").extra("point", json!(point))
+        })?;
+        details.insert("point".into(), json!(point));
+        let bytes = serde_json::to_vec_pretty(&Value::Object(details))
+            .map_err(|_| Fail::new(EXIT_USAGE, "Usage", "checkpoint_encode"))?;
+        atomic_write(&path, &bytes).map_err(|err| io_fail(err, "checkpoint"))?;
+        sigstop();
+        Ok(())
+    }
 }
 
 fn action_name(action: InjectAction) -> &'static str {
@@ -457,12 +471,9 @@ fn init_inner(path: &Path, format: u8, hooks: Hooks) -> Result<Report, Fail> {
         Err(fail) => return Err(finish_init_scratch(&scratch, fail)),
     };
     // Rename has succeeded. Later returns are published receipts. Dropping
-    // `published` only closes the fd; it does not sync.
+    // `published` only closes the handle; it does not sync.
     let mut point = init_point(true, format);
-    if let Ok((dev, ino)) = published.device_and_inode() {
-        point.insert("parent_dev".into(), json!(dev));
-        point.insert("parent_ino".into(), json!(ino));
-    }
+    published.checkpoint_identity(&mut point);
     if let Err(fail) = hooks.stop("before_parent_sync", point) {
         return Ok(report_published_init(
             fail, &vault_id, format, magic, path, false,
@@ -528,7 +539,7 @@ fn publish_init_dir(scratch: &Path, path: &Path) -> Result<crate::platform::Publ
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent_file = File::open(parent)
+    let parent_file = crate::platform::open_dir_for_publish(parent)
         .map_err(|err| io_fail(err, "init_rename").extra("created_new_vault", json!(false)))?;
     let from = scratch.file_name().ok_or_else(|| {
         io_fail(
@@ -1099,9 +1110,7 @@ fn require_final_set(scratch: &Path) -> Result<(), Fail> {
 }
 
 fn sync_regular_file(path: &Path, during: &'static str) -> Result<(), Fail> {
-    let file = File::open(path).map_err(|err| unpublished(io_fail(err, during)))?;
-    file.sync_all()
-        .map_err(|err| unpublished(io_fail(err, during)))
+    crate::platform::sync_file(path).map_err(|err| unpublished(io_fail(err, during)))
 }
 
 fn sync_directory(path: &Path, during: &'static str) -> Result<(), Fail> {
@@ -1418,9 +1427,7 @@ fn import_attempt(
             "object_fsync",
             checkpoint_map(&command_id, len, Some(len), Some(&hash), true, false),
         )?;
-        File::open(&dest)
-            .and_then(|file| file.sync_all())
-            .map_err(|err| io_fail(err, "object_fsync"))?;
+        crate::platform::sync_file(&dest).map_err(|err| io_fail(err, "object_fsync"))?;
         fsutil::fsync_dir(dest.parent().unwrap_or(&session.root))
             .map_err(|err| io_fail(err, "object_dir_fsync"))?;
         (object_id, false)
@@ -1851,8 +1858,9 @@ enum Place {
 }
 
 /// Where a new `--out` file would be created, before this call creates anything.
-/// Ancestor symlinks are followed. The final component is not. Identity is the
-/// directory's device and inode, not a string prefix. Linux only.
+/// Ancestor symlinks and junctions are followed. The final component is not.
+/// Identity is the OS directory identity (`(dev, ino)` on Linux; 128-bit
+/// `FILE_ID_INFO` on Windows), never a string prefix.
 fn place_output(vault: &Path, dst: &Path) -> Place {
     let vault_id = match vault_identity(vault) {
         Ok(id) => id,
@@ -1862,17 +1870,23 @@ fn place_output(vault: &Path, dst: &Path) -> Place {
         Ok(path) => path,
         Err(err) => return Place::Unresolved(err.to_string()),
     };
-    let mut parts = path_parts(&abs);
+    let (mut cur, mut parts) = root_and_parts(&abs);
     let Some(file_name) = parts.pop() else {
         return Place::Unresolved("output path has no final component".into());
     };
-    let mut cur = PathBuf::from("/");
     let mut missing = false;
     for part in parts {
         if missing {
             break;
         }
-        let next = cur.join(&part);
+        let next = if cfg!(windows) && part == ".." {
+            match cur.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => cur.clone(),
+            }
+        } else {
+            cur.join(&part)
+        };
         match fs::symlink_metadata(&next) {
             Ok(_) => match resolved_directory(&next) {
                 Ok(dir) => cur = dir,
@@ -1897,7 +1911,7 @@ fn place_output(vault: &Path, dst: &Path) -> Place {
     }
 }
 
-fn vault_identity(vault: &Path) -> io::Result<(u64, u64)> {
+fn vault_identity(vault: &Path) -> io::Result<crate::platform::DirectoryId> {
     let real = fs::canonicalize(vault)?;
     directory_id(&real)
 }
@@ -1910,14 +1924,22 @@ fn absolute_existing_base(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn path_parts(path: &Path) -> Vec<OsString> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_os_string()),
-            Component::ParentDir => Some(OsString::from("..")),
-            Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
-        })
-        .collect()
+fn root_and_parts(path: &Path) -> (PathBuf, Vec<OsString>) {
+    let mut root = PathBuf::new();
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            Component::RootDir => root.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_os_string()),
+            Component::ParentDir => parts.push(OsString::from("..")),
+        }
+    }
+    if root.as_os_str().is_empty() {
+        root.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    (root, parts)
 }
 
 fn resolved_directory(path: &Path) -> io::Result<PathBuf> {
@@ -1932,18 +1954,27 @@ fn resolved_directory(path: &Path) -> io::Result<PathBuf> {
     Ok(real)
 }
 
-fn directory_id(path: &Path) -> io::Result<(u64, u64)> {
-    crate::platform::directory_device_and_inode(path)
+fn directory_id(path: &Path) -> io::Result<crate::platform::DirectoryId> {
+    crate::platform::directory_id(path)
 }
 
-fn directory_is_vault_or_inside(vault_id: (u64, u64), dir: &Path) -> io::Result<bool> {
+fn directory_is_vault_or_inside(
+    vault_id: crate::platform::DirectoryId,
+    dir: &Path,
+) -> io::Result<bool> {
     let mut cursor = fs::canonicalize(dir)?;
     for _ in 0..256 {
-        if directory_id(&cursor)? == vault_id {
+        let cur_id = directory_id(&cursor)?;
+        if cur_id == vault_id {
             return Ok(true);
         }
+        #[cfg(target_os = "linux")]
         let parent = cursor.join("..");
-        if directory_id(&parent)? == directory_id(&cursor)? {
+        #[cfg(target_os = "windows")]
+        let Some(parent) = cursor.parent().map(Path::to_path_buf) else {
+            return Ok(false);
+        };
+        if directory_id(&parent)? == cur_id {
             return Ok(false);
         }
         let next = fs::canonicalize(&parent)?;
@@ -2382,14 +2413,37 @@ fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
         .canonicalize()
         .map_err(|err| unseen_io(err, "canonicalize"))?;
     let text = abs.to_string_lossy();
-    if text.contains('?') || text.contains('#') {
-        return Err(Fail::new(
-            EXIT_REJECTED,
-            "Rejected",
-            "vault_path_unsupported",
-        ));
+    #[cfg(target_os = "windows")]
+    {
+        if text.starts_with(r"\\?\UNC\") || text.starts_with(r"\\?\unc\") {
+            return Err(Fail::new(
+                EXIT_UNSUPPORTED_FS,
+                "UnsupportedFilesystem",
+                "network_filesystem",
+            ));
+        }
+        let stripped = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        if stripped.contains('?') || stripped.contains('#') {
+            return Err(Fail::new(
+                EXIT_REJECTED,
+                "Rejected",
+                "vault_path_unsupported",
+            ));
+        }
+        let slash = stripped.replace('\\', "/");
+        Ok(format!("file:///{slash}?{query}"))
     }
-    Ok(format!("file:{text}?{query}"))
+    #[cfg(not(target_os = "windows"))]
+    {
+        if text.contains('?') || text.contains('#') {
+            return Err(Fail::new(
+                EXIT_REJECTED,
+                "Rejected",
+                "vault_path_unsupported",
+            ));
+        }
+        Ok(format!("file:{text}?{query}"))
+    }
 }
 
 /// Version inspection only. immutable=1 does not see a commit that is still in the WAL.
@@ -3554,6 +3608,7 @@ mod rename_receipts {
         note_uncommitted(init_rename_failure(err)).into_report()
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rename_errno_receipts_stay_in_their_existing_classes() {
         let exists = init_report(os(libc::EEXIST));
@@ -3668,6 +3723,36 @@ mod rename_receipts {
         assert_ne!(export_access.body["os_error"], export_busy.body["os_error"]);
         assert_ne!(export_busy.body["os_error"], export_full.body["os_error"]);
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rename_win32_receipts_stay_in_their_classes() {
+        let exists = init_report(os(183)); // ERROR_ALREADY_EXISTS
+        assert_eq!(exists.code, EXIT_REJECTED);
+        assert_eq!(exists.body["outcome"], "Rejected");
+        assert_eq!(exists.body["reason"], "vault_path_exists");
+        assert_eq!(exists.body["created_new_vault"], false);
+
+        let unavailable = init_report(os(50)); // ERROR_NOT_SUPPORTED
+        assert_eq!(unavailable.code, EXIT_UNSUPPORTED_FS);
+        assert_eq!(unavailable.body["reason"], "rename_noreplace_unavailable");
+
+        let cross = init_report(os(17)); // ERROR_NOT_SAME_DEVICE
+        assert_eq!(cross.code, EXIT_NOT_PRESERVED);
+        assert_eq!(cross.body["reason"], "io_error");
+
+        let full = init_report(os(112)); // ERROR_DISK_FULL
+        assert_eq!(full.code, EXIT_NOT_PRESERVED);
+        assert_eq!(full.body["reason"], "enospc");
+
+        let export_exists = export::export_publish_failure(os(80)).into_report(); // ERROR_FILE_EXISTS
+        assert_eq!(export_exists.code, EXIT_REJECTED);
+        assert_eq!(export_exists.body["reason"], "output_exists");
+
+        let export_full = export::export_publish_failure(os(112)).into_report();
+        assert_eq!(export_full.code, EXIT_INTEGRITY);
+        assert_eq!(export_full.body["reason"], "enospc");
+    }
 }
 
 #[cfg(test)]
@@ -3678,8 +3763,12 @@ mod published_sync_static {
     /// an observed fsync failure, and it is not EACCES from `File::open`.
     #[test]
     fn constructed_sync_error_stays_published_with_the_actual_reason() {
-        for (code, reason) in [(libc::ENOSPC, "enospc"), (libc::EIO, "io_error")] {
-            let fail = io_fail(io::Error::from_raw_os_error(code), "publish_dir_fsync");
+        let cases = [
+            (crate::platform::test_enospc_error(), "enospc"),
+            (io::Error::other("simulated sync io error"), "io_error"),
+        ];
+        for (err, reason) in cases {
+            let fail = io_fail(err, "publish_dir_fsync");
             let report = report_published_init(
                 fail,
                 "vlt_static",

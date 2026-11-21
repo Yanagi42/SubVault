@@ -3,7 +3,7 @@
 //! copy of the live vault directory, a backup, or a protection choice.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -143,7 +143,7 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
         );
     }
     fsutil::fsync_dir(&scratch.temp).map_err(|err| scratch.fail(copy_fail(err, "export_sync")))?;
-    match fs::symlink_metadata(&req.out) {
+    match fs::symlink_metadata(crate::platform::final_directory_entry(&req.out)) {
         Ok(_) => return Err(scratch.fail(rejected("output_exists"))),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(scratch.fail(copy_fail(err, "export_publish"))),
@@ -158,13 +158,10 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
     };
     // Rename succeeded. scratch still names the old temporary path, so a
     // later scratch.fail must not represent this package. Dropping `published`
-    // only closes the fd; it does not sync.
+    // only closes the handle; it does not sync.
     let mut held = Map::new();
     held.insert("published".into(), json!(true));
-    if let Ok((dev, ino)) = published.device_and_inode() {
-        held.insert("parent_dev".into(), json!(dev));
-        held.insert("parent_ino".into(), json!(ino));
-    }
+    published.checkpoint_identity(&mut held);
     if let Err(fail) = super::stop_checkpoint(&req.hooks, "before_parent_sync", held) {
         return Ok((
             EXIT_INTEGRITY,
@@ -1367,7 +1364,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<()> {
             let text = rel.to_str().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "package path is not utf-8")
             })?;
-            out.push(text.to_string());
+            out.push(text.replace('\\', "/"));
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1482,18 +1479,19 @@ fn chain_fail(fact_id: &str) -> Fail {
 }
 
 fn publish_export_dir(temp: &Path, out: &Path) -> io::Result<crate::platform::PublishedDir> {
-    let parent = out
+    let destination = crate::platform::final_directory_entry(out);
+    let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let parent_file = File::open(parent)?;
+    let parent_file = crate::platform::open_dir_for_publish(parent)?;
     let from = temp.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "export staging has no file name",
         )
     })?;
-    let to = out.file_name().ok_or_else(|| {
+    let to = destination.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "export target has no file name",
@@ -1616,10 +1614,7 @@ mod published_sync_static {
     /// fsync failure, and not EACCES from opening a path.
     #[test]
     fn constructed_sync_error_stays_published_with_the_actual_reason() {
-        let fail = sync_io(
-            io::Error::from_raw_os_error(libc::ENOSPC),
-            "export_dir_fsync",
-        );
+        let fail = sync_io(crate::platform::test_enospc_error(), "export_dir_fsync");
         let body = export_published_fault(&req(), "complete", "snap", &loaded(), &fail, false);
         assert_eq!(body["outcome"], "Exported");
         assert_eq!(body["reason"], "enospc");

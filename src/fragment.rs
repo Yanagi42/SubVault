@@ -1741,9 +1741,7 @@ fn place_object(
     crate::fsutil::atomic_write(&staging, bytes).map_err(|err| io_fail(err, "write_staging"))?;
     let dest = root.join("objects").join(&object_id);
     fs::hard_link(&staging, &dest).map_err(|err| io_fail(err, "publish_object"))?;
-    File::open(&dest)
-        .and_then(|file| file.sync_all())
-        .map_err(|err| io_fail(err, "object_fsync"))?;
+    crate::platform::sync_file(&dest).map_err(|err| io_fail(err, "object_fsync"))?;
     crate::fsutil::fsync_dir(dest.parent().unwrap_or(root))
         .map_err(|err| io_fail(err, "object_dir_fsync"))?;
     let _ = fs::remove_file(&staging);

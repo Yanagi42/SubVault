@@ -59,8 +59,19 @@ pub fn file_identity(volume_serial: u64, file_id: &[u8]) -> Result<FileIdentity,
 }
 
 impl FileIdentity {
+    #[allow(dead_code)]
     pub fn same_file(self, other: Self) -> bool {
         self.volume_serial == other.volume_serial && self.file_id == other.file_id
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn volume_serial(self) -> u64 {
+        self.volume_serial
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn file_id_bytes(&self) -> &[u8; 16] {
+        &self.file_id
     }
 }
 

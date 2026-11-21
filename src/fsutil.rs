@@ -7,17 +7,7 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
-const NFS_SUPER_MAGIC: i64 = 0x6969;
-const SMB_SUPER_MAGIC: i64 = 0xFF534D42;
-const SMB2_SUPER_MAGIC: i64 = 0xFE534D42;
-
-pub use crate::platform::filesystem_magic;
-
-pub fn network_filesystem(magic: i64) -> bool {
-    matches!(magic, NFS_SUPER_MAGIC | SMB_SUPER_MAGIC | SMB2_SUPER_MAGIC)
-}
-
-pub use crate::platform::fsync_dir;
+pub use crate::platform::{filesystem_magic, fsync_dir, network_filesystem};
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));

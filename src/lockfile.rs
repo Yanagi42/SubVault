@@ -1,19 +1,28 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 pub const LOCK_TEXT: &str =
     "# This file is a flock target. Its text is not a lock, a lease, or a pid authority.\n";
 
+#[cfg(target_os = "linux")]
 pub struct VaultLock {
-    file: File,
+    file: std::fs::File,
+}
+
+#[cfg(target_os = "windows")]
+pub struct VaultLock {
+    _inner: crate::windows_lock::WindowsVaultLock,
 }
 
 impl VaultLock {
-    /// Exclusive non-blocking flock. The file's text is never a lease:
-    /// a dead pid or an old expiry written into it does not grant the lock,
-    /// and a live pid written into it does not withhold the lock.
+    /// Exclusive non-blocking OS lock (`flock` on Linux, `LockFileEx` on Windows).
+    /// The file's text is never a lease: a dead pid or an old expiry written into
+    /// it does not grant the lock, and a live pid written into it does not
+    /// withhold the lock.
+    #[cfg(target_os = "linux")]
     pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
+        use std::fs::OpenOptions;
+        use std::io::Write;
         let existed = path.exists();
         let mut file = OpenOptions::new()
             .read(true)
@@ -31,14 +40,28 @@ impl VaultLock {
             crate::lock_contract::LockAcquire::Failure(err) => Err(err),
         }
     }
+
+    #[cfg(target_os = "windows")]
+    pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
+        match crate::windows_lock::try_acquire(path) {
+            crate::windows_lock::WindowsLock::Acquired(lock) => {
+                lock.ensure_lock_text(LOCK_TEXT.as_bytes())?;
+                Ok(Some(Self { _inner: lock }))
+            }
+            crate::windows_lock::WindowsLock::Busy => Ok(None),
+            crate::windows_lock::WindowsLock::Failure(err) => Err(err),
+        }
+    }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for VaultLock {
     fn drop(&mut self) {
         crate::platform::unlock_exclusive(&self.file);
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn sigstop() {
     crate::platform::raise_sigstop();
 }

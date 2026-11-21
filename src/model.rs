@@ -161,6 +161,7 @@ fn unseen(during: &str, detail: String) -> Fail {
         .extra("injected", Value::Bool(false))
 }
 
+#[cfg(target_os = "linux")]
 pub fn platform_limits(magic: Option<i64>) -> Value {
     serde_json::json!({
         "writer_lock": "unix_flock_exclusive_nonblocking",
@@ -170,6 +171,24 @@ pub fn platform_limits(magic: Option<i64>) -> Value {
         "bad_disk": "not_tested",
         "sync_directory": "not_supported_and_not_detected",
         "network_filesystem": "nfs_and_cifs_magic_refused_not_mounted_in_tests",
+        "filesystem_magic": magic.map(|m| format!("0x{m:x}")),
+        "source_snapshot": "read_loop_not_atomic"
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub fn platform_limits(magic: Option<i64>) -> Value {
+    serde_json::json!({
+        "writer_lock": "windows_lockfileex_exclusive_nonblocking",
+        "pid_and_expiry_are_not_a_lock": true,
+        "windows_native": "tested_x86_64_windows_msvc",
+        "directory_identity": "windows_file_id_128",
+        "directory_publish": "windows_file_rename_info_noreplace",
+        "directory_fsync": "windows_flush_or_ntfs_metadata_journal",
+        "power_loss": "not_tested",
+        "bad_disk": "not_tested",
+        "sync_directory": "not_supported_and_not_detected",
+        "network_filesystem": "windows_drive_remote_and_unc_refused",
         "filesystem_magic": magic.map(|m| format!("0x{m:x}")),
         "source_snapshot": "read_loop_not_atomic"
     })

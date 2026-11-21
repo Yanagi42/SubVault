@@ -1,10 +1,4 @@
-//! Windows byte-range lock. This module is compiled only for `cfg(windows)`.
-//!
-//! `VaultLock` does not call it. A non-Linux build still stops in `platform`
-//! at `compile_error`, so these calls do not make a vault command Ready and
-//! do not relax a formal write. Nothing in this file was executed on the
-//! Linux host that added it: no Windows compile, no two-process occupancy,
-//! no release after process exit, and no inheritance check.
+//! Windows byte-range lock. Compiled for `cfg(windows)` and used by `VaultLock`.
 //!
 //! The calls follow the documented signatures:
 //! `CreateFileW` with `bInheritHandle = FALSE` and without
@@ -17,10 +11,8 @@
 //!
 //! `LockFileEx` remarks: if a process exits with a region locked, or closes a
 //! file that still has outstanding locks, the system unlocks them, but the
-//! time depends on available resources. Drop does not promise that the range
-//! can be acquired again immediately.
-
-#![allow(dead_code)]
+//! time depends on available resources. Drop calls `UnlockFileEx` before
+//! `CloseHandle`.
 
 use std::ffi::c_void;
 use std::io;
@@ -49,6 +41,7 @@ struct SecurityAttributes {
     b_inherit_handle: i32,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct OverlappedOffset {
     offset: u32,
@@ -62,8 +55,7 @@ union OverlappedOffsetOrPointer {
 }
 
 /// Documented `OVERLAPPED`: `Internal`, `InternalHigh`, the offset/pointer
-/// union, then `hEvent`. `hEvent` stays null. This layout was not compiled
-/// or sized on Windows here.
+/// union, then `hEvent`. `hEvent` stays null.
 #[repr(C)]
 struct Overlapped {
     internal: usize,
@@ -72,13 +64,16 @@ struct Overlapped {
     h_event: *mut c_void,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Overlapped>() == 32);
+
 #[link(name = "kernel32")]
 extern "system" {
     fn CreateFileW(
         name: *const u16,
         access: u32,
         share: u32,
-        security: *const SecurityAttributes,
+        security: *const c_void,
         disposition: u32,
         flags: u32,
         template: *mut c_void,
@@ -98,6 +93,15 @@ extern "system" {
         length_high: u32,
         overlapped: *mut Overlapped,
     ) -> i32;
+    fn GetFileSizeEx(file: *mut c_void, file_size: *mut i64) -> i32;
+    fn WriteFile(
+        file: *mut c_void,
+        buffer: *const u8,
+        bytes_to_write: u32,
+        bytes_written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn FlushFileBuffers(file: *mut c_void) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn GetLastError() -> u32;
 }
@@ -122,6 +126,58 @@ fn lock_overlapped() -> Overlapped {
 
 pub struct WindowsVaultLock {
     handle: *mut c_void,
+}
+
+// SAFETY: A Win32 file handle is process-scoped rather than thread-affine,
+// and `WindowsVaultLock` owns the sole reference until `Drop` unlocks & closes it.
+unsafe impl Send for WindowsVaultLock {}
+
+impl WindowsVaultLock {
+    /// Populate the informational lock banner only when we hold the exclusive
+    /// byte-range lock and the newly created file is still empty.
+    pub fn ensure_lock_text(&self, text: &[u8]) -> io::Result<()> {
+        let mut size: i64 = 0;
+        let ok = unsafe { GetFileSizeEx(self.handle, &mut size) };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        if size > 0 {
+            return Ok(());
+        }
+        let mut offset = 0usize;
+        while offset < text.len() {
+            let chunk = &text[offset..];
+            let to_write = chunk.len().min(u32::MAX as usize) as u32;
+            let mut written: u32 = 0;
+            let ok = unsafe {
+                WriteFile(
+                    self.handle,
+                    chunk.as_ptr(),
+                    to_write,
+                    &mut written,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let code = unsafe { GetLastError() };
+                return Err(io::Error::from_raw_os_error(code as i32));
+            }
+            if written == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write writer.lock text",
+                ));
+            }
+            offset += written as usize;
+        }
+        let flushed = unsafe { FlushFileBuffers(self.handle) };
+        if flushed == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(io::Error::from_raw_os_error(code as i32));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for WindowsVaultLock {
@@ -175,7 +231,7 @@ pub fn try_acquire(path: &Path) -> WindowsLock {
             wide.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &security,
+            &security as *const SecurityAttributes as *const c_void,
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
             ptr::null_mut(),

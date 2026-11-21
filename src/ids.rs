@@ -1,9 +1,8 @@
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 
 pub fn random_id(prefix: &str) -> io::Result<String> {
     let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    crate::platform::fill_random(&mut bytes)?;
     Ok(format!("{prefix}{}", hex_encode(&bytes)))
 }
 

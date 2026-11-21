@@ -8,6 +8,7 @@
 
 use std::io;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug)]
 pub enum LockAcquire {
     Acquired,
@@ -28,16 +29,17 @@ pub const ERROR_LOCK_VIOLATION: u32 = 33;
 
 /// `WinError.h`: the process cannot access the file because it is being used
 /// by another process. This is an open-sharing failure, not a byte-range lock.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 pub const ERROR_SHARING_VIOLATION: u32 = 32;
 
 /// `WinError.h`: overlapped I/O operation is in progress.
 /// `LockFileEx` documents this for an asynchronous request that has not finished.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 pub const ERROR_IO_PENDING: u32 = 997;
 
 /// `rc == 0` is acquired. `EWOULDBLOCK` and `EAGAIN` are busy. Every other
 /// result, including a missing errno, is a failure.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn classify_flock(rc: i32, raw_os_error: Option<i32>, busy_errnos: &[i32]) -> LockClass {
     if rc == 0 {
         LockClass::Acquired

@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -247,9 +247,7 @@ fn place_object(
     if let Err(err) = fs::hard_link(&staging, &dest) {
         return Err(io_fail(err, "publish_object"));
     }
-    File::open(&dest)
-        .and_then(|file| file.sync_all())
-        .map_err(|err| io_fail(err, "object_fsync"))?;
+    crate::platform::sync_file(&dest).map_err(|err| io_fail(err, "object_fsync"))?;
     crate::fsutil::fsync_dir(dest.parent().unwrap_or(root))
         .map_err(|err| io_fail(err, "object_dir_fsync"))?;
     let _ = fs::remove_file(&staging);
