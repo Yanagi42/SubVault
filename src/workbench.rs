@@ -786,6 +786,41 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
         let batch_id = ids::random_id("b_").unwrap_or_else(|_| "b_demo".into());
         let auth = active.auth();
 
+        // 0a. Scanned-receipt style image (unextracted, lets user try Quick Triage!)
+        let tiny_png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let shot_path = tmp_dir.join("示例-待补录收据截图.png");
+        let _ = fs::write(&shot_path, tiny_png);
+        let _ = engine::import_file(engine::ImportRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_img".into()),
+            batch_id: Some(batch_id.clone()),
+            media_type: "image/png".into(),
+            source: shot_path,
+            display_name: Some("示例-待补录收据截图.png".into()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+
+        // 0b. Alipay GBK CSV sample statement
+        let alipay_str = "支付宝交易记录明细查询（示例）\n账号:[personal@example.com]\n------------------------------------\n交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态\n2026-10-01 09:00:00,云服务,Apple,iCloud+ 2TB 连续包月,支出,68.00,招商银行,交易成功\n2026-10-06 14:20:00,影音娱乐,哔哩哔哩,大会员连续包月,支出,15.00,余额宝,交易成功\n2026-10-12 20:00:00,开发工具,JetBrains,All Products Pack 年付,支出,1980.00,信用卡,交易成功\n";
+        let (gbk_bytes, _, _) = encoding_rs::GB18030.encode(alipay_str);
+        let csv_path = tmp_dir.join("示例-支付宝账单明细.csv");
+        let _ = fs::write(&csv_path, gbk_bytes.as_ref());
+        let _ = engine::submit_csv(engine::CsvRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_4".into()),
+            source: csv_path,
+            batch_id: Some(batch_id.clone()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+
         // 1. Chinese electronic invoice PDF (WPS ¥98.00 yearly)
         let zh_stream = format!(
             "BT\n{} Tj\nT* {} Tj\nT* {} Tj\nT* {} Tj\nT* {} Tj\nET",
@@ -1079,42 +1114,6 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
                 auth: auth.clone(),
             });
         }
-
-        // 9. Scanned-receipt style image (unextracted, lets user try Quick Triage!)
-        // Minimal valid 1x1 PNG so image preview renders cleanly
-        let tiny_png: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
-            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-        let shot_path = tmp_dir.join("示例-待补录收据截图.png");
-        let _ = fs::write(&shot_path, tiny_png);
-        let _ = engine::import_file(engine::ImportRequest {
-            vault: active.path.clone(),
-            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_img".into()),
-            batch_id: Some(batch_id.clone()),
-            media_type: "image/png".into(),
-            source: shot_path,
-            display_name: Some("示例-待补录收据截图.png".into()),
-            auth: auth.clone(),
-            hooks: Hooks::default(),
-        });
-
-        // 7. Alipay GBK CSV sample statement
-        let alipay_str = "支付宝交易记录明细查询（示例）\n账号:[personal@example.com]\n------------------------------------\n交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态\n2026-10-01 09:00:00,云服务,Apple,iCloud+ 2TB 连续包月,支出,68.00,招商银行,交易成功\n2026-10-06 14:20:00,影音娱乐,哔哩哔哩,大会员连续包月,支出,15.00,余额宝,交易成功\n2026-10-12 20:00:00,开发工具,JetBrains,All Products Pack 年付,支出,1980.00,信用卡,交易成功\n";
-        let (gbk_bytes, _, _) = encoding_rs::GB18030.encode(alipay_str);
-        let csv_path = tmp_dir.join("示例-支付宝账单明细.csv");
-        let _ = fs::write(&csv_path, gbk_bytes.as_ref());
-        let _ = engine::submit_csv(engine::CsvRequest {
-            vault: active.path.clone(),
-            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_4".into()),
-            source: csv_path,
-            batch_id: Some(batch_id),
-            auth,
-            hooks: Hooks::default(),
-        });
 
         let _ = fs::remove_dir_all(&tmp_dir);
         match build_workspace_snapshot(active) {
