@@ -1,6 +1,6 @@
 # SubVault v0.1.0 Release Notes (Draft — Pre-Release)
 
-> **Status:** Draft notes for the upcoming first usable **`v0.1.0`** release. SubVault stays on `0.1.0` (unreleased) while remaining real-data milestones in [`docs/ROADMAP.md`](./docs/ROADMAP.md) (Windows native wiring, at-rest encryption, desktop shell) are completed.
+> **Status:** Draft notes for the upcoming first usable **`v0.1.0`** release. SubVault stays on `0.1.0` (unreleased) while remaining real-data milestones in [`docs/ROADMAP.md`](./docs/ROADMAP.md) (at-rest encryption and desktop shell) are completed.
 
 **Target tag:** `v0.1.0`  
 **Live Demo:** <https://yanagi42.github.io/SubVault/>
@@ -31,7 +31,8 @@
 | Asset | Contents |
 | --- | --- |
 | `subvault-v0.1.0-linux-x86_64.zip` | Portable Linux x86_64 `subvault` CLI binary (Formats 1–5), static Web Demo (`web/`), verified T0 synthetic corpus, `run-demo.sh`, and documentation |
-| `subvault-v0.1.0-linux-x86_64.tar.gz` | Same portable bundle in `.tar.gz` format |
+| `subvault-v0.1.0-linux-x86_64.tar.gz` | Same Linux portable bundle in `.tar.gz` format |
+| `subvault-v0.1.0-windows-x86_64.zip` | Portable Windows x86_64 `subvault.exe` CLI binary (Formats 1–5), static Web Demo (`web/`), verified T0 synthetic corpus, `run-demo.ps1`, and documentation |
 | `subvault-v0.1.0-web-demo.zip` | Pure-static Web Demo files ready for any static host or offline folder |
 | `SHA256SUMS.txt` | SHA-256 checksums for all archives |
 
@@ -53,6 +54,5 @@ cd subvault-v0.1.0-linux-x86_64
 
 ## Remaining Scope Before Publishing `v0.1.0`
 
-- **Windows Native Runtime & CI:** Wire `src/windows_lock.rs` and `src/windows_file_id.rs` and verify on `windows-latest`.
 - **At-Rest Protection & Removing `SYNTHETIC_ONLY`:** Finalize encryption and key recovery for real personal billing data.
 - **Thin Desktop Shell:** Wrap the verified Rust/SQLite core for everyday local use.

@@ -18,14 +18,15 @@ SubVault will **not** cut premature version bumps during pre-release development
 - [x] Verified against all 9 real `%PDF-1.4` files + renamed byte-identical duplicate in `synthetic/corpus/originals/`, plus compressed `FlateDecode` PDFs, encrypted PDFs (`preservation=preserved`, `extraction=unsupported`), and fake renamed text files (`invalid_pdf_header`).
 - [x] Real binary `.pdf` drag-and-drop & exact SHA-256 deduplication in the Web Demo (`web/pdf.js`) plus bidirectional Format 5 Rust CLI ↔ Web interop tests.
 
+### Milestone 3: Native Windows Platform Wiring & CI Matrix
+- [x] Wired `src/windows_lock.rs` (`CreateFileW` + `LockFileEx`, `bInheritHandle = FALSE`, mandatory byte-range lock) into `VaultLock` under `cfg(windows)`, with verified two-process `writer_busy` contention (`EXIT_LOCKED = 11`) and lock release recovery.
+- [x] Wired `src/windows_file_id.rs` (`GetFileInformationByHandleEx(FileIdInfo)`, 8-byte volume serial + 16-byte `FILE_ID_128`) into `place_output`, covering Windows drive prefixes, verbatim `\\?\` paths, case-insensitive aliases, `..` traversals, and NTFS directory junctions (`mklink /J`).
+- [x] Implemented Windows atomic no-replace directory publishing (`SetFileInformationByHandle(FileRenameInfo)` with `ReplaceIfExists = FALSE` and `GetFinalPathNameByHandleW` moved-parent tracking), `CREATE_NEW | FILE_FLAG_OPEN_REPARSE_POINT`, `BCryptGenRandom`, `GetDriveTypeW`/UNC network-filesystem refusal, and SQLite `file:///C:/...` URI normalization.
+- [x] Verified natively on Windows 11 NTFS (`x86_64-pc-windows-msvc`) across 48 tests (`lib` unit tests, `windows_native`, `verify_package`, `pdf_bill`, `review_sheet`, and concurrent `review_snapshot`), plus added `windows-latest` jobs to `.github/workflows/ci.yml` and `.github/workflows/release.yml` and portable Windows packaging (`scripts/package-release-windows.ps1`).
+
 ---
 
 ## Remaining Milestones Before Cutting `v0.1.0`
-
-### Milestone 3: Native Windows Platform Wiring & CI Matrix
-- Wire `src/windows_lock.rs` (`CreateFileW` + `LockFileEx`) into `VaultLock` under `cfg(windows)`.
-- Wire `src/windows_file_id.rs` (`GetFileInformationByHandleEx` / `FileIdInfo`) into `place_output`, covering case-insensitivity and NTFS junctions/reparse points.
-- Implement atomic no-replace directory publication on Windows and add a `windows-latest` job to `.github/workflows/ci.yml` and `release.yml`.
 
 ### Milestone 4: At-Rest Protection Mode & Real-Data Vault Format
 - Finalize local at-rest encryption and offline recovery-key design (`protection_preference`), plus a redacted-template export helper for sharing broken real-world vendor invoice layouts safely.

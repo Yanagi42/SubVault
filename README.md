@@ -163,11 +163,11 @@ bash scripts/package-release.sh
 | Path | Purpose |
 | --- | --- |
 | `src/` | Rust preservation engine, SQLite WAL store, static text, HTML & PDF (`FlateDecode`) extractors, append-only decision chain, offline exporter, standalone verifier, and review sheet renderer |
-| `tests/` | 21 integration & backward-compatibility test suites (including `pdf_bill.rs`, `verify_package.rs`, crash/fault hooks, WAL/header consistency, `renameat2(RENAME_NOREPLACE)`, parent fd `fsync`) |
+| `tests/` | 22 integration & backward-compatibility test suites (including `windows_native.rs`, `pdf_bill.rs`, `verify_package.rs`, crash/fault hooks, WAL/header consistency, Linux `renameat2(RENAME_NOREPLACE)`, and Windows `LockFileEx`/`FileIdInfo`/junctions) |
 | `web/` | Zero-dependency, subpath-safe pure-static interactive Web Demo (`index.html`, `app.js`, `engine.js`, `demo-data.js`, `pdf.js`, `zip.js`, `styles.css`) |
 | `synthetic/` | Deterministic T0 corpus generator and independent byte/logical expectations |
-| `scripts/` | Release packaging (`package-release.sh`), Web Demo & CLI-interop checks (`test-web.mjs`), screenshot capture (`capture-screenshots.py`), and T1 evidence script |
-| `.github/workflows/` | Automated CI (`ci.yml`), GitHub Pages deployment (`pages.yml`), and tag-driven release publishing (`release.yml`) |
+| `scripts/` | Release packaging (`package-release.sh`, `package-release-windows.ps1`), Web Demo & CLI-interop checks (`test-web.mjs`), screenshot capture (`capture-screenshots.py`), and T1 evidence script |
+| `.github/workflows/` | Automated Linux + Windows CI (`ci.yml`), GitHub Pages deployment (`pages.yml`), and multi-platform release publishing (`release.yml`) |
 | `docs/` | Real UI screenshots (`docs/screenshots/`), next-iteration roadmap (`docs/ROADMAP.md`), and the complete Chinese technical specification (`docs/SPEC-zh.md`) |
 
 ---
@@ -176,7 +176,10 @@ bash scripts/package-release.sh
 
 SubVault intentionally separates **verified guarantees** from **unbuilt milestones**:
 
-- **Verified today (pre-`v0.1.0`):** Linux `ext4` single-writer preservation (`flock`, SQLite 3.46 WAL `synchronous=FULL`, `renameat2(RENAME_NOREPLACE)`), Format 1–5 isolation, deterministic UTF-8 fragment, constrained static HTML (`tl` 0.7.8), and static text-PDF (`FlateDecode` via `miniz_oxide`, 1-based `pdf_page` locators) extraction, append-only human `correct`/`undo`, verifiable `offline-exit-1` export & standalone `verify-package`, read-only `review` sheets, and the pure-static interactive Web Demo with real binary PDF drop.
-- **Remaining before cutting `v0.1.0` (see [`docs/ROADMAP.md`](./docs/ROADMAP.md)):** Native Windows runtime wiring & CI (`src/windows_lock.rs` & `src/windows_file_id.rs` are staged behind `cfg(windows)`), at-rest encryption & removing the `SYNTHETIC_ONLY` guard for real data, and a thin native desktop UI shell.
+- **Verified today (pre-`v0.1.0`):**
+  - **Linux (`x86_64-unknown-linux-gnu`):** Single-writer preservation (`flock`, SQLite 3.46 WAL `synchronous=FULL`, `renameat2(RENAME_NOREPLACE)` + parent fd `fsync`), Format 1–5 isolation, deterministic UTF-8 fragment, constrained static HTML (`tl` 0.7.8), and static text-PDF (`FlateDecode` via `miniz_oxide`, 1-based `pdf_page` locators) extraction, append-only human `correct`/`undo`, verifiable `offline-exit-1` export & standalone `verify-package`, and read-only `review` sheets.
+  - **Windows (`x86_64-pc-windows-msvc`):** Native Win32 `CreateFileW` + `LockFileEx` two-process single-writer locking, 128-bit `GetFileInformationByHandleEx(FileIdInfo)` directory identity (blocking case-insensitive vault aliases and NTFS junctions), atomic no-replace directory publish (`SetFileInformationByHandle(FileRenameInfo)`), `BCryptGenRandom`, `GetDriveTypeW`/UNC network refusal, and verified Format 5 PDF+HTML+export+verify-package+review+concurrent stress tests on Windows 11 NTFS.
+  - **Pure-Static Web Demo (`web/`):** Preloaded 12-file synthetic corpus, real binary `.pdf` hashing/extraction, `.zip` offline exit, and bidirectional Format 5 CLI↔Web verification.
+- **Remaining before cutting `v0.1.0` (see [`docs/ROADMAP.md`](./docs/ROADMAP.md)):** At-rest encryption & removing the `SYNTHETIC_ONLY` guard for real personal data, plus a thin native desktop UI shell.
 
 For the exhaustive contract of exit codes (0–21), crash/recovery semantics, and Format 1–4 invariants, see [`docs/SPEC-zh.md`](./docs/SPEC-zh.md).
