@@ -25,7 +25,9 @@
     eye: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>`,
     download: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>`,
     lock: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`,
-    sun: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>`,
+    sun: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>`,
+    paper: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/><path d="M19 3v4M21 5h-4"/></svg>`,
+    moon: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>`,
     laptop: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="16" height="12" x="4" y="4" rx="2"/><path d="M2 20h20"/></svg>`,
     refresh: `<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>`,
     arrowRight: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>`,
@@ -132,6 +134,7 @@
     collection: "all",
     viewMode: "cards",
     heroCurrency: "",
+    reimburseFilter: "",
     accountFilter: "",
     currencyFilter: "",
     categoryFilter: "",
@@ -289,11 +292,24 @@
   }
 
   // --- Theme & Privacy ---
+  function themeIconFor(themeId) {
+    if (themeId === "night") return ICO.moon;
+    if (themeId === "paper") return ICO.paper;
+    return ICO.sun;
+  }
+
   function applyTheme(themeId) {
     const found = THEMES.find((t) => t.id === themeId) || THEMES[0];
     state.theme = found.id;
     document.documentElement.setAttribute("data-theme", found.id);
     if ($("lobby-theme-label")) $("lobby-theme-label").textContent = found.label;
+    const lobbyBtnSvg = $("lobby-theme-btn")?.querySelector("svg");
+    if (lobbyBtnSvg) lobbyBtnSvg.outerHTML = themeIconFor(found.id);
+    const topBtn = $("btn-theme-cycle");
+    if (topBtn) {
+      topBtn.innerHTML = themeIconFor(found.id);
+      topBtn.title = `当前：${found.label}外观（点击切换）`;
+    }
     try { localStorage.setItem("subvault_ui_theme_v3", found.id); } catch (_) {}
   }
 
@@ -346,6 +362,20 @@
   }
 
   // --- Metric Helpers ---
+  function localTodayStr() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  }
+
+  function localCalendarDaysDiff(dateStr) {
+    if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+    const [y, m, d] = dateStr.split("-").map(Number);
+    const now = new Date();
+    const targetUtc = Date.UTC(y, m - 1, d);
+    const todayUtc = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+    return Math.round((targetUtc - todayUtc) / 86400000);
+  }
+
   function maskLicenseKey(key) {
     const s = String(key || "").trim();
     if (!s) return "";
@@ -357,24 +387,24 @@
     const s = new Date(`${perVal.period_start}T00:00:00`);
     const e = new Date(`${perVal.period_end}T00:00:00`);
     if (isNaN(s.getTime()) || isNaN(e.getTime()) || e <= s) return null;
-    const now = new Date();
-    const pct = Math.max(0, Math.min(100, Math.round(((now - s) / (e - s)) * 100)));
-    const daysLeft = Math.ceil((e - now) / (1000 * 60 * 60 * 24));
+    const daysLeft = localCalendarDaysDiff(perVal.period_end);
+    const totalDays = Math.max(1, Math.round((e - s) / 86400000));
+    const elapsedDays = totalDays - daysLeft;
+    const pct = Math.max(0, Math.min(100, Math.round((elapsedDays / totalDays) * 100)));
     const statusLabel = daysLeft > 0 ? `还剩 ${daysLeft} 天` : `${perVal.period_end} 已到期`;
     return { pct, expired: daysLeft <= 0, range: `${perVal.period_start} — ${perVal.period_end}`, statusLabel };
   }
 
   function warrantyInfo(buyDate, warrantyEnd) {
-    if (!warrantyEnd || !/^\d{4}-\d{2}-\d{2}$/.test(warrantyEnd)) return null;
-    const end = new Date(`${warrantyEnd}T00:00:00`);
-    if (isNaN(end.getTime())) return null;
-    const now = new Date();
-    const daysLeft = Math.ceil((end - now) / (1000 * 60 * 60 * 24));
+    const daysLeft = localCalendarDaysDiff(warrantyEnd);
+    if (daysLeft === null) return null;
     let remPct = daysLeft <= 0 ? 0 : 65;
     if (buyDate && /^\d{4}-\d{2}-\d{2}$/.test(buyDate)) {
       const start = new Date(`${buyDate}T00:00:00`);
-      if (!isNaN(start.getTime()) && end > start) {
-        remPct = Math.max(0, Math.min(100, Math.round(((end - now) / (end - start)) * 100)));
+      const end = new Date(`${warrantyEnd}T00:00:00`);
+      if (!isNaN(start.getTime()) && !isNaN(end.getTime()) && end > start) {
+        const totalDays = Math.max(1, Math.round((end - start) / 86400000));
+        remPct = Math.max(0, Math.min(100, Math.round((daysLeft / totalDays) * 100)));
       }
     }
     const color = daysLeft < 0 ? "var(--ink-3)" : daysLeft <= 60 ? "var(--amber)" : "var(--iris)";
@@ -385,10 +415,9 @@
 
   function costPerDayInfo(buyDate, currency, amountText) {
     if (!buyDate || !/^\d{4}-\d{2}-\d{2}$/.test(buyDate) || !amountText) return null;
-    const start = new Date(`${buyDate}T00:00:00`);
-    const now = new Date();
-    if (isNaN(start.getTime()) || start > now) return null;
-    const daysUsed = Math.max(1, Math.floor((now - start) / (1000 * 60 * 60 * 24)));
+    const diff = localCalendarDaysDiff(buyDate);
+    if (diff === null || diff > 0) return null;
+    const daysUsed = Math.max(1, -diff);
     const cents = amountToCents(amountText);
     if (cents <= 0) return null;
     const perDayCents = Math.max(1, Math.round(cents / daysUsed));
@@ -646,6 +675,8 @@
       if (state.collection === "hardware" && kind !== "hardware") return false;
       if (state.collection === "reimbursable") {
         if (kind !== "reimbursable" && (!ann.reimburse_status || ann.reimburse_status === "none")) return false;
+        const st = ann.reimburse_status && ann.reimburse_status !== "none" ? ann.reimburse_status : "pending";
+        if (state.reimburseFilter && st !== state.reimburseFilter) return false;
       }
       if (state.collection === "csv" && !flags.is_csv_statement) return false;
 
@@ -762,6 +793,7 @@
           state.accountFilter = "";
           state.currencyFilter = "";
           state.categoryFilter = "";
+          state.reimburseFilter = "";
           state.collection = "all";
           renderWorkspace();
         });
@@ -866,15 +898,22 @@
         <div class="context-strip">
           <div class="ctx-title-group">
             <div class="ctx-title">报销记录</div>
-            <div class="ctx-sub">点击卡片右下角状态按钮，可依次切换 待报销 → 已提交 → 已到账</div>
+            <div class="ctx-sub">点击右侧状态卡片可筛选，点击单条卡片右下角按钮可切换进度</div>
           </div>
           <div class="ctx-buckets">
-            <div class="ctx-bucket"><span class="micro-pill amber">待报销</span><strong class="sensitive">${esc(bPend.text)}</strong><span style="color:var(--ink-3)">${bPend.cnt} 笔</span></div>
-            <div class="ctx-bucket"><span class="micro-pill blue">已提交</span><strong class="sensitive">${esc(bSub.text)}</strong><span style="color:var(--ink-3)">${bSub.cnt} 笔</span></div>
-            <div class="ctx-bucket"><span class="micro-pill green">已到账</span><strong class="sensitive">${esc(bDone.text)}</strong><span style="color:var(--ink-3)">${bDone.cnt} 笔</span></div>
+            <button type="button" class="ctx-bucket ${state.reimburseFilter === "pending" ? "active" : ""}" data-reimb-filter="pending"><span class="micro-pill amber">待报销</span><strong class="sensitive">${esc(bPend.text)}</strong><span style="color:var(--ink-3)">${bPend.cnt} 笔</span></button>
+            <button type="button" class="ctx-bucket ${state.reimburseFilter === "submitted" ? "active" : ""}" data-reimb-filter="submitted"><span class="micro-pill blue">已提交</span><strong class="sensitive">${esc(bSub.text)}</strong><span style="color:var(--ink-3)">${bSub.cnt} 笔</span></button>
+            <button type="button" class="ctx-bucket ${state.reimburseFilter === "reimbursed" ? "active" : ""}" data-reimb-filter="reimbursed"><span class="micro-pill green">已到账</span><strong class="sensitive">${esc(bDone.text)}</strong><span style="color:var(--ink-3)">${bDone.cnt} 笔</span></button>
           </div>
         </div>
       `;
+      hero.querySelectorAll("[data-reimb-filter]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const v = btn.getAttribute("data-reimb-filter");
+          state.reimburseFilter = state.reimburseFilter === v ? "" : v;
+          renderAssetsPane(ws);
+        });
+      });
       return;
     }
 
@@ -990,14 +1029,16 @@
     for (let idx = 0; idx < Math.min(3, radar.length); idx++) {
       const r = radar[idx];
       if (r.kind === "warranty_expiring") {
-        const ring = renderRingGauge(Math.max(8, Math.round((r.days_left / 365) * 100)), r.days_left <= 14 ? "var(--rose)" : "var(--iris)", `${r.days_left}d`);
+        const localDays = localCalendarDaysDiff(r.warranty_end);
+        const daysLeft = localDays !== null ? localDays : r.days_left;
+        const ring = renderRingGauge(Math.max(8, Math.round((Math.max(0, daysLeft) / 365) * 100)), daysLeft <= 14 ? "var(--rose)" : "var(--iris)", `${Math.max(0, daysLeft)}d`);
         signalCards.push(`
           <button type="button" class="signal-tile" data-sig-idx="${idx}">
             <div class="sig-left">
               ${ring}
               <div style="min-width:0">
                 <div class="sig-title">${esc(r.vendor)} 保修提醒</div>
-                <div class="sig-detail">还剩 ${r.days_left} 天 · ${esc(r.warranty_end)} 截止</div>
+                <div class="sig-detail">${daysLeft > 0 ? `还剩 ${daysLeft} 天` : "今日到期"} · ${esc(r.warranty_end)} 截止</div>
               </div>
             </div>
             <span style="color:var(--ink-3)">${ICO.arrowRight}</span>
@@ -1376,17 +1417,36 @@
               <tbody data-csv-tbody="${cIdx}"></tbody>
             </table>
           </div>
+          <div class="csv-ws-foot" data-csv-foot="${cIdx}"></div>
         </section>
       `;
     }).join("");
 
     stage.innerHTML = `<div class="csv-workspace-stack">${cardsHtml}</div>`;
 
+    const allVaultItems = state.workspace?.items || [];
+    const findExistingCsvItem = (r) => {
+      const rDate = String(r.date || "").slice(0, 10);
+      const rMerch = String(r.merchant || "").trim().toLowerCase();
+      const rAmt = String(r.amount_text || "").trim();
+      const rCur = String(r.currency || "CNY").trim();
+      return allVaultItems.find((it) => {
+        if (it.status_flags?.is_csv_statement) return false;
+        const a = it.annotation || {};
+        const v = it.amount_fact?.value;
+        if (!v || v.currency !== rCur || v.amount_text !== rAmt) return false;
+        const sameVendor = (a.vendor || "").trim().toLowerCase() === rMerch;
+        const sameDate = rDate && (a.bill_date || "").slice(0, 10) === rDate;
+        return sameVendor && sameDate;
+      });
+    };
+
     list.forEach((item, cIdx) => {
       const allRows = (item.candidates || [])
         .filter((c) => c.kind === "csv_transaction")
         .map((c) => ({ ...c.value, raw_line: c.excerpt }));
       const tbody = stage.querySelector(`[data-csv-tbody="${cIdx}"]`);
+      const foot = stage.querySelector(`[data-csv-foot="${cIdx}"]`);
       const qInput = stage.querySelector(`[data-csv-filter-q="${cIdx}"]`);
       const expChk = stage.querySelector(`[data-csv-filter-exp="${cIdx}"]`);
 
@@ -1398,19 +1458,41 @@
           if (q && !`${r.merchant || ""} ${r.description || ""} ${r.date || ""} ${r.amount_text || ""}`.toLowerCase().includes(q)) return false;
           return true;
         });
+
+        const sums = {};
+        for (const r of filtered) {
+          const c = r.currency || "CNY";
+          sums[c] = (sums[c] || 0) + amountToCents(r.amount_text);
+        }
+        const sumText = Object.entries(sums).map(([c, v]) => formatMoney(c, centsToText(v))).join(" · ") || "—";
+        foot.innerHTML = `<span>当前显示 <strong>${filtered.length}</strong> 条${expOnly ? "支出" : "记录"}</span><span>合计 <strong class="sensitive">${esc(sumText)}</strong></span>`;
+
         if (!filtered.length) {
           tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--ink-3);padding:24px">没有符合条件的流水记录</td></tr>`;
           return;
         }
-        tbody.innerHTML = filtered.slice(0, 150).map((r, rIdx) => `
-          <tr>
-            <td style="font-size:12px;color:var(--ink-3);white-space:nowrap" class="num">${esc(r.date || "—")}</td>
-            <td style="font-weight:600">${esc(r.merchant || "未标注商户")}</td>
-            <td style="color:var(--ink-2)">${esc(r.description || "—")}</td>
-            <td class="right sensitive num" style="font-weight:700;white-space:nowrap">${esc(formatMoney(r.currency || "CNY", r.amount_text))}</td>
-            <td class="right"><button type="button" class="btn btn-soft btn-sm" data-ws-promote="${rIdx}">加入账本</button></td>
-          </tr>
-        `).join("");
+        tbody.innerHTML = filtered.slice(0, 150).map((r, rIdx) => {
+          const existing = findExistingCsvItem(r);
+          const actBtn = existing
+            ? `<button type="button" class="csv-added-btn" data-ws-open-existing="${esc(existing.source_id)}">${ICO.check} 已在账本</button>`
+            : `<button type="button" class="btn btn-soft btn-sm" data-ws-promote="${rIdx}">加入账本</button>`;
+          return `
+            <tr>
+              <td style="font-size:12px;color:var(--ink-3);white-space:nowrap" class="num">${esc(r.date || "—")}</td>
+              <td style="font-weight:600">${esc(r.merchant || "未标注商户")}</td>
+              <td style="color:var(--ink-2)">${esc(r.description || "—")}</td>
+              <td class="right sensitive num" style="font-weight:700;white-space:nowrap">${esc(formatMoney(r.currency || "CNY", r.amount_text))}</td>
+              <td class="right">${actBtn}</td>
+            </tr>
+          `;
+        }).join("");
+
+        tbody.querySelectorAll("[data-ws-open-existing]").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const found = allVaultItems.find((i) => i.source_id === btn.getAttribute("data-ws-open-existing"));
+            if (found) openDrawer(found);
+          });
+        });
 
         tbody.querySelectorAll("[data-ws-promote]").forEach((btn) => {
           btn.addEventListener("click", async () => {
@@ -1638,9 +1720,13 @@
     for (let d = 1; d <= daysInMonth; d++) {
       const isToday = today.getFullYear() === year && today.getMonth() === month && today.getDate() === d;
       const evts = eventsByDay[d] || [];
+      const dayIso = `${year}-${String(month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
       cells += `
         <div class="cal-cell ${isToday ? "today" : ""}">
-          <div class="cal-day">${d}${isToday ? " · 今天" : ""}</div>
+          <div class="cal-day-row">
+            <span class="cal-day">${d}${isToday ? " · 今天" : ""}</span>
+            <button type="button" class="cal-add-btn" data-cal-add-date="${dayIso}" title="在 ${dayIso} 记一笔">+</button>
+          </div>
           ${evts.map((ev) => `<button type="button" class="cal-evt ${ev.kind}" data-cal-sid="${esc(ev.source_id)}"><span class="cal-evt-name">${esc(ev.title)}</span><span class="${ev.kind === "warranty" ? "" : "sensitive num"}">${esc(ev.money)}</span></button>`).join("")}
         </div>
       `;
@@ -1714,11 +1800,19 @@
         if (found) openDrawer(found);
       });
     });
+    pane.querySelectorAll("[data-cal-add-date]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openManualModal(btn.getAttribute("data-cal-add-date"));
+      });
+    });
   }
 
   // --- View C: Insights, Vendor Folio & Savings Studio ---
-  function buildMiniSparkline(history, strokeColor) {
-    if (!history || history.length < 2) return `<span style="font-size:11px;color:var(--ink-3)">单期记录</span>`;
+  function buildMiniSparkline(history, strokeColor, fallbackDate) {
+    if (!history || history.length < 2) {
+      return fallbackDate ? `<span style="font-size:11px;color:var(--ink-3)" class="num">${esc(fallbackDate)}</span>` : "";
+    }
     const vals = history.slice(-8).map((h) => h.cents || 0);
     const min = Math.min(...vals);
     const max = Math.max(...vals);
@@ -1801,7 +1895,7 @@
             const badge = drift
               ? `<span class="micro-pill ${drift.direction === "up" ? "rose" : "green"}">${drift.direction === "up" ? `+${Math.abs(drift.pct_change)}%` : `-${Math.abs(drift.pct_change)}%`}</span>`
               : `<span class="micro-pill ${km.pill}">${esc(km.label)}</span>`;
-            const spark = buildMiniSparkline(vp.history || [], drift?.direction === "up" ? "var(--rose)" : "var(--blue)");
+            const spark = buildMiniSparkline(vp.history || [], drift?.direction === "up" ? "var(--rose)" : "var(--blue)", vp.latest_date);
             return `
               <div class="vendor-tile" data-jump-vendor="${esc(vp.vendor)}">
                 <div class="vt-head">
@@ -1828,10 +1922,18 @@
       </div>
     `;
 
-    const recurring = (ws.items || []).filter((it) => {
+    // Deduplicate recurring subscriptions by (vendor, currency, cycle) keeping only the latest bill
+    const latestSubMap = new Map();
+    for (const it of ws.items || []) {
+      const ann = it.annotation || {};
       const amt = it.amount_fact?.value;
-      return amt && amt.currency === cur && ["monthly", "yearly", "quarterly", "weekly"].includes(it.annotation?.billing_cycle);
-    });
+      if (!amt || amt.currency !== cur || !["monthly", "yearly", "quarterly", "weekly"].includes(ann.billing_cycle)) continue;
+      const key = `${(ann.vendor || it.display_name).trim().toLowerCase()}|${ann.billing_cycle}`;
+      const dStr = ann.bill_date || it.period_fact?.value?.period_start || "";
+      const prev = latestSubMap.get(key);
+      if (!prev || dStr >= prev.dStr) latestSubMap.set(key, { it, dStr });
+    }
+    const recurring = [...latestSubMap.values()].map((v) => v.it);
     let yearlySave = 0;
     const cutList = [];
     const simRows = recurring.map((it) => {
@@ -1908,18 +2010,34 @@
     `;
 
     pane.querySelectorAll("[data-ins-cur]").forEach((b) => b.addEventListener("click", () => { state.insightsCurrency = b.getAttribute("data-ins-cur"); renderInsightsPane(ws); }));
-    pane.querySelectorAll("[data-cat-slice]").forEach((c) => {
-      c.addEventListener("mouseenter", () => {
-        $("donut-center-label").textContent = `${c.getAttribute("data-cat-slice")} · ${c.getAttribute("data-cat-pct")}%`;
-        $("donut-center-val").textContent = formatMoneyShort(cur, c.getAttribute("data-cat-amt"));
+    const slices = [...pane.querySelectorAll("[data-cat-slice]")];
+    const catLegends = [...pane.querySelectorAll("[data-jump-cat]")];
+    const highlightCat = (catName) => {
+      slices.forEach((s) => {
+        const hit = s.getAttribute("data-cat-slice") === catName;
+        s.classList.toggle("is-hover", Boolean(catName && hit));
+        s.classList.toggle("dimmed", Boolean(catName && !hit));
+        if (hit) {
+          $("donut-center-label").textContent = `${catName} · ${s.getAttribute("data-cat-pct")}%`;
+          $("donut-center-val").textContent = formatMoneyShort(cur, s.getAttribute("data-cat-amt"));
+        }
       });
-      c.addEventListener("mouseleave", () => {
+      catLegends.forEach((r) => r.classList.toggle("is-hover", Boolean(catName && r.getAttribute("data-jump-cat") === catName)));
+      if (!catName) {
         $("donut-center-label").textContent = `${cur} 总额`;
         $("donut-center-val").textContent = formatMoneyShort(cur, centsToText(totalCat));
-      });
+      }
+    };
+    slices.forEach((c) => {
+      c.addEventListener("mouseenter", () => highlightCat(c.getAttribute("data-cat-slice")));
+      c.addEventListener("mouseleave", () => highlightCat(""));
       c.addEventListener("click", () => { state.categoryFilter = c.getAttribute("data-cat-slice"); state.currencyFilter = cur; navigateTo("assets", "all"); });
     });
-    pane.querySelectorAll("[data-jump-cat]").forEach((r) => r.addEventListener("click", () => { state.categoryFilter = r.getAttribute("data-jump-cat"); state.currencyFilter = cur; navigateTo("assets", "all"); }));
+    catLegends.forEach((r) => {
+      r.addEventListener("mouseenter", () => highlightCat(r.getAttribute("data-jump-cat")));
+      r.addEventListener("mouseleave", () => highlightCat(""));
+      r.addEventListener("click", () => { state.categoryFilter = r.getAttribute("data-jump-cat"); state.currencyFilter = cur; navigateTo("assets", "all"); });
+    });
     pane.querySelectorAll("[data-jump-acc]").forEach((r) => r.addEventListener("click", () => { const a = r.getAttribute("data-jump-acc"); state.accountFilter = a === "未分组" ? "" : a; navigateTo("assets", "all"); }));
     pane.querySelectorAll("[data-jump-vendor]").forEach((t) => t.addEventListener("click", () => { const v = t.getAttribute("data-jump-vendor") || ""; state.searchQuery = v; $("search-box").value = v; navigateTo("assets", "all"); }));
     pane.querySelectorAll("[data-sim-sid]").forEach((chk) => chk.addEventListener("change", () => {
@@ -1963,16 +2081,18 @@
     const item = queue[0];
     const ann = item.annotation || {};
     const rawUrl = tokenUrl(`/api/sources/${encodeURIComponent(item.source_id)}/raw`);
+    const isImage = item.media_type.startsWith("image/");
     const previewHtml = item.media_type === "application/pdf"
       ? `<iframe src="${esc(rawUrl)}" title="PDF 原件"></iframe>`
-      : item.media_type.startsWith("image/")
+      : isImage
         ? `<img src="${esc(rawUrl)}" alt="${esc(item.display_name)}">`
         : item.media_type.startsWith("text/html")
           ? `<iframe sandbox="" src="${esc(rawUrl)}" title="静态 HTML"></iframe>`
           : `<pre id="triage-text-preview" class="code-sheet" style="margin:0">加载中…</pre>`;
 
+    const defaultCur = state.heroCurrency || "CNY";
     const curs = (state.bootstrap?.currencies || ["CNY", "USD", "EUR", "GBP", "JPY", "HKD"])
-      .map((c) => `<option value="${esc(c)}">${esc(c)} ${esc(CURRENCY_SYMBOLS[c] || "")}</option>`).join("");
+      .map((c) => `<option value="${esc(c)}" ${c === defaultCur ? "selected" : ""}>${esc(c)} ${esc(CURRENCY_SYMBOLS[c] || "")}</option>`).join("");
 
     pane.innerHTML = `
       <div class="folio-card triage-bar">
@@ -1986,7 +2106,7 @@
       <div class="triage-split">
         <div class="folio-card pad-24">
           <div class="micro-eyebrow" style="margin-bottom:10px">原件预览 · ${formatBytes(item.byte_length)}</div>
-          <div class="preview-frame" style="margin-bottom:0">${previewHtml}</div>
+          <div class="preview-frame ${isImage ? "is-image" : ""}" style="margin-bottom:0">${previewHtml}</div>
         </div>
         <div class="folio-card pad-24">
           <h3 class="folio-h3" style="margin-bottom:14px">补充信息</h3>
@@ -2229,8 +2349,10 @@
     if (!item) return;
     const box = $("evidence-preview-box"), textBox = $("evidence-text-box");
     const rawUrl = tokenUrl(`/api/sources/${encodeURIComponent(sourceId)}/raw`);
+    const isImg = item.media_type.startsWith("image/");
+    box.classList.toggle("is-image", isImg);
     if (item.media_type === "application/pdf") { box.innerHTML = `<iframe src="${esc(rawUrl)}" title="PDF 原件"></iframe>`; box.classList.remove("hidden"); }
-    else if (item.media_type.startsWith("image/")) { box.innerHTML = `<img src="${esc(rawUrl)}" alt="${esc(item.display_name)}">`; box.classList.remove("hidden"); }
+    else if (isImg) { box.innerHTML = `<img src="${esc(rawUrl)}" alt="${esc(item.display_name)}">`; box.classList.remove("hidden"); }
     else if (item.media_type.startsWith("text/html")) { box.innerHTML = `<iframe sandbox="" src="${esc(rawUrl)}" title="静态 HTML 原件"></iframe>`; box.classList.remove("hidden"); }
     else { box.classList.add("hidden"); state.textViewActive = true; }
     textBox.classList.toggle("hidden", !state.textViewActive);
@@ -2339,6 +2461,7 @@
       { ico: ICO.calendar, label: "打开日历", sub: "账单日、预计续费和保修截止", run: () => navigateTo("calendar") },
       { ico: ICO.chart, label: "打开统计", sub: "分类占比、商家汇总和试算", run: () => navigateTo("insights") },
       { ico: ICO.bolt, label: "打开待整理", sub: "对照原件补充信息", run: () => navigateTo("triage") },
+      { ico: ICO.download, label: "导出 Excel 表格 (.csv)", sub: "包含分类、保修与报销状态", run: () => { window.location.href = tokenUrl("/api/export/csv"); } },
       { ico: ICO.sun, label: "切换外观", sub: "浅色 / 暖白 / 深色", run: () => cycleTheme() },
       { ico: ICO.eye, label: "隐藏或显示金额", sub: "快捷键 P", run: () => togglePrivacy() },
       { ico: ICO.lock, label: "锁定账本", sub: "返回解锁界面", run: () => $("btn-lock-vault").click() },
@@ -2356,7 +2479,7 @@
     });
 
     const filtered = [...acts, ...assets].filter((a) => !q || a.label.toLowerCase().includes(q) || a.sub.toLowerCase().includes(q));
-    state.cmdActions = filtered.slice(0, 12);
+    state.cmdActions = filtered.slice(0, 14);
     state.cmdIndex = Math.min(state.cmdIndex, Math.max(0, state.cmdActions.length - 1));
 
     const el = $("cmd-list");
@@ -2371,6 +2494,8 @@
       const act = state.cmdActions[Number(btn.getAttribute("data-cmd-idx"))];
       closeCmdPalette(); if (act) act.run();
     }));
+    const selEl = el.querySelector(".cmd-item.selected");
+    if (selEl) selEl.scrollIntoView({ block: "nearest" });
   }
 
   // --- Manual Entry Modal ---
@@ -2386,12 +2511,14 @@
     document.querySelectorAll("[data-man-cycle]").forEach((x) => x.classList.toggle("active", x.getAttribute("data-man-cycle") === state.manualCycle));
   }
 
-  function openManualModal() {
+  function openManualModal(prefillDate) {
     $("modal-manual").classList.remove("hidden");
     $("man-vendor").value = ""; $("man-plan").value = ""; $("man-amount").value = ""; $("man-notes").value = "";
     $("man-license-key").value = ""; $("man-license-key").type = "password"; $("btn-man-toggle-key").textContent = "显示";
     $("man-license-scope").value = ""; $("man-warranty-end").value = ""; $("man-reimburse-status").value = "pending";
-    $("man-bill-date").value = new Date().toISOString().slice(0, 10);
+    const defCur = state.heroCurrency || "CNY";
+    if ([...$("man-currency").options].some((o) => o.value === defCur)) $("man-currency").value = defCur;
+    $("man-bill-date").value = (typeof prefillDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(prefillDate)) ? prefillDate : localTodayStr();
     setManualAssetKind("subscription");
     $("man-vendor").focus();
   }
@@ -2639,6 +2766,7 @@
     document.querySelectorAll("[data-nav]").forEach((btn) => btn.addEventListener("click", () => navigateTo(btn.getAttribute("data-nav"))));
     document.querySelectorAll("[data-collection]").forEach((btn) => btn.addEventListener("click", () => {
       state.collection = btn.getAttribute("data-collection");
+      if (state.collection !== "reimbursable") state.reimburseFilter = "";
       if (state.workspace) renderAssetsPane(state.workspace);
     }));
 
