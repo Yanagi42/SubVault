@@ -33,9 +33,9 @@
   };
 
   const THEMES = [
-    { id: "gallery", label: "白昼画廊" },
-    { id: "paper", label: "晨光宣纸" },
-    { id: "night", label: "静谧夜览" },
+    { id: "gallery", label: "浅色" },
+    { id: "paper", label: "暖白" },
+    { id: "night", label: "深色" },
   ];
 
   const CHART_PALETTE = [
@@ -99,7 +99,7 @@
     license: { label: "买断", pill: "blue" },
     hardware: { label: "硬件", pill: "iris" },
     reimbursable: { label: "报销", pill: "amber" },
-    general: { label: "档案", pill: "slate" },
+    general: { label: "账单", pill: "slate" },
   };
 
   const REIMBURSE_META = {
@@ -288,15 +288,15 @@
     const idx = THEMES.findIndex((t) => t.id === state.theme);
     const next = THEMES[(idx + 1) % THEMES.length];
     applyTheme(next.id);
-    showToast(`已切换至「${next.label}」`);
+    showToast(`已切换为${next.label}外观`);
   }
 
   function togglePrivacy(forceVal) {
     state.privacyBlur = forceVal !== undefined ? forceVal : !state.privacyBlur;
     document.body.classList.toggle("privacy-blur", state.privacyBlur);
     $("btn-privacy-toggle").classList.toggle("active", state.privacyBlur);
-    if (state.privacyBlur) showToast("防窥已开启：金额、账号与密钥已模糊（悬停可临时查看）");
-    else if (forceVal === undefined) showToast("防窥模式已关闭");
+    if (state.privacyBlur) showToast("已隐藏金额、账号和密钥，鼠标放上去可临时查看");
+    else if (forceVal === undefined) showToast("已恢复显示金额");
   }
 
   function launchConfetti() {
@@ -346,7 +346,7 @@
     const now = new Date();
     const pct = Math.max(0, Math.min(100, Math.round(((now - s) / (e - s)) * 100)));
     const daysLeft = Math.ceil((e - now) / (1000 * 60 * 60 * 24));
-    const statusLabel = daysLeft > 0 ? `还剩 ${daysLeft} 天` : `已于 ${perVal.period_end} 届满`;
+    const statusLabel = daysLeft > 0 ? `还剩 ${daysLeft} 天` : `${perVal.period_end} 已到期`;
     return { pct, expired: daysLeft <= 0, range: `${perVal.period_start} — ${perVal.period_end}`, statusLabel };
   }
 
@@ -417,9 +417,9 @@
         btnEl.innerHTML = `${ICO.check} 已复制`;
         setTimeout(() => { btnEl.classList.remove("copied"); btnEl.innerHTML = orig; }, 1600);
       }
-      showToast(`「${vendor || "该授权"}」激活密钥已复制`, "ok");
+      showToast("已复制密钥", "ok");
     } catch (_) {
-      showToast("剪贴板受限，请点开详情查看密钥", "error");
+      showToast("复制失败，请点开详情手动复制", "error");
     }
   }
 
@@ -430,7 +430,7 @@
       const snap = await api("POST", "/api/sources/reimburse", { source_id: sourceId, reimburse_status: next });
       state.workspace = snap;
       renderWorkspace();
-      showToast(`已盖章更新为「${REIMBURSE_META[next].label}」`, "ok");
+      showToast(`报销状态已改为「${REIMBURSE_META[next].label}」`, "ok");
     } catch (err) {
       showToast(err.message, "error");
     }
@@ -445,7 +445,7 @@
     }
     bindEvents();
     if (!SESSION_TOKEN) {
-      showToast("缺少本地访问凭证，请通过双击 subvault-app 打开。", "error");
+      showToast("请通过双击 subvault-app 打开程序。", "error");
       return;
     }
     try {
@@ -582,7 +582,7 @@
 
     $("mh-vault-name").textContent = v.name || "我的账本";
     $("mh-vault-dot").className = `vp-dot ${v.encrypted ? "green" : "slate"}`;
-    $("vp-vault-status").textContent = v.encrypted ? "本机已加密保护 · 离线运行" : "系统磁盘模式 · 本机运行";
+    $("vp-vault-status").textContent = v.encrypted ? "本地加密 · 离线运行" : "系统盘免密 · 离线运行";
     $("vp-vault-path").textContent = v.path || "";
 
     $("zip-ack-row").classList.toggle("hidden", !v.encrypted);
@@ -667,7 +667,7 @@
     const demoCount = ws.vault?.demo_count || 0;
     const demoBar = $("demo-notice-bar");
     if (demoCount > 0) {
-      $("demo-notice-msg").textContent = `当前账本包含 ${demoCount} 项体验示例数据，随时可一键清除且不影响你的真实账单。`;
+      $("demo-notice-msg").textContent = `当前有 ${demoCount} 条示例数据，可随时清除，不会影响你自己的账单。`;
       demoBar.classList.remove("hidden");
     } else {
       demoBar.classList.add("hidden");
@@ -706,12 +706,12 @@
         stage.innerHTML = `
           <div class="empty-gallery">
             <div class="empty-emblem">${ICO.inbox}</div>
-            <h3>开始陈列你的第一份资产或票据</h3>
-            <p>把 PDF 发票、邮件 HTML、支付宝 / 微信 CSV 或收据截图拖进窗口，原件自动加密防重，也可手动记入买断密钥与硬件保修。</p>
+            <h3>账本里还没有记录</h3>
+            <p>把 PDF 发票、邮件 HTML、支付宝 / 微信 CSV 或收据截图拖进窗口，也可以直接手动记一笔。</p>
             <div class="btn-row" style="justify-content:center">
-              <button type="button" id="btn-empty-import" class="btn btn-ink btn-sm">选择本地文件导入</button>
-              <button type="button" id="btn-empty-manual" class="btn btn-soft btn-sm">手动记一笔</button>
-              <button type="button" id="btn-load-demo-pack" class="btn btn-ghost btn-sm">载入体验示例（随时可一键清空）</button>
+              <button type="button" id="btn-empty-import" class="btn btn-ink btn-sm">选择文件导入</button>
+              <button type="button" id="btn-empty-manual" class="btn btn-soft btn-sm">记一笔</button>
+              <button type="button" id="btn-load-demo-pack" class="btn btn-ghost btn-sm">加载示例数据（可随时清除）</button>
             </div>
           </div>
         `;
@@ -720,24 +720,24 @@
         const demoBtn = $("btn-load-demo-pack");
         demoBtn.addEventListener("click", async () => {
           demoBtn.disabled = true;
-          demoBtn.textContent = "正在载入示例…";
+          demoBtn.textContent = "加载中…";
           try {
             const snap = await api("POST", "/api/import-demo-pack", {});
             state.workspace = snap;
             renderWorkspace();
-            showToast("示例资产包已载入，顶部随时可一键清空", "ok");
+            showToast("已加载示例数据，顶部可随时清除", "ok");
           } catch (err) {
             showToast(err.message, "error");
             demoBtn.disabled = false;
-            demoBtn.textContent = "载入体验示例（随时可一键清空）";
+            demoBtn.textContent = "加载示例数据（可随时清除）";
           }
         });
       } else {
         stage.innerHTML = `
           <div class="empty-gallery">
-            <h3>当前筛选下没有匹配的资产</h3>
-            <p>清空搜索词或切回「全部」即可查看所有已归档凭证。</p>
-            <button type="button" id="btn-reset-filters" class="btn btn-soft btn-sm">查看全部资产</button>
+            <h3>没有找到匹配的记录</h3>
+            <p>换个关键词，或者切回「全部」查看。</p>
+            <button type="button" id="btn-reset-filters" class="btn btn-soft btn-sm">查看全部</button>
           </div>
         `;
         $("btn-reset-filters").addEventListener("click", () => {
@@ -786,11 +786,11 @@
     }
 
     const kindMetaOrder = [
-      { key: "hardware", label: "硬件资产", color: KIND_COLORS.hardware },
-      { key: "subscription", label: "周期订阅", color: KIND_COLORS.subscription },
-      { key: "license", label: "买断授权", color: KIND_COLORS.license },
-      { key: "reimbursable", label: "报销垫付", color: KIND_COLORS.reimbursable },
-      { key: "general", label: "其他账单", color: KIND_COLORS.general },
+      { key: "hardware", label: "硬件", color: KIND_COLORS.hardware },
+      { key: "subscription", label: "订阅", color: KIND_COLORS.subscription },
+      { key: "license", label: "买断", color: KIND_COLORS.license },
+      { key: "reimbursable", label: "报销", color: KIND_COLORS.reimbursable },
+      { key: "general", label: "其他", color: KIND_COLORS.general },
     ].filter((m) => kindTotals[m.key] > 0);
 
     const ribbonHtml = grand > 0
@@ -809,7 +809,7 @@
                 return `<button type="button" class="comp-leg-btn" data-ribbon-kind="${m.key}"><span class="c-dot" style="background:${m.color}"></span>${m.label} <strong class="sensitive num">${pct}%</strong></button>`;
               }).join("")}
             </div>
-            <span style="color:var(--ink-3)">按原件币种独立统计 · 绝不虚构汇率</span>
+            <span style="color:var(--ink-3)">按币种分开统计，不做汇率换算</span>
           </div>
         </div>
       `
@@ -817,7 +817,7 @@
 
     const curTabsHtml = curList.length > 0
       ? `<div class="cur-switcher">${curList.map((c) => `<button type="button" class="cur-tab ${c.currency === activeCur.currency ? "active" : ""}" data-hero-cur="${esc(c.currency)}">${esc(c.currency)} · ${esc(CURRENCY_NAMES[c.currency] || c.currency)}</button>`).join("")}</div>`
-      : `<span class="micro-eyebrow">ARCHIVE LEDGER</span>`;
+      : `<span class="micro-eyebrow">账本概览</span>`;
 
     // Living Signals Column (up to 3 crisp tactile cards)
     const radar = ws.asset_radar || [];
@@ -831,8 +831,8 @@
             <div class="sig-left">
               ${ring}
               <div style="min-width:0">
-                <div class="sig-title">${esc(r.vendor)} 保修倒计时</div>
-                <div class="sig-detail">还剩 ${r.days_left} 天 · 截止 ${esc(r.warranty_end)}</div>
+                <div class="sig-title">${esc(r.vendor)} 保修提醒</div>
+                <div class="sig-detail">还剩 ${r.days_left} 天 · ${esc(r.warranty_end)} 截止</div>
               </div>
             </div>
             <span style="color:var(--ink-3)">${ICO.arrowRight}</span>
@@ -844,7 +844,7 @@
             <div class="sig-left">
               <div class="sig-badge-box rose">${ICO.trendUp}</div>
               <div style="min-width:0">
-                <div class="sig-title">${esc(r.vendor)} 价格上调 +${Math.abs(r.pct_change || 0)}%</div>
+                <div class="sig-title">${esc(r.vendor)} 涨价 +${Math.abs(r.pct_change || 0)}%</div>
                 <div class="sig-detail sensitive">${esc(r.detail)}</div>
               </div>
             </div>
@@ -858,7 +858,7 @@
               <div class="sig-badge-box amber">${ICO.receipt}</div>
               <div style="min-width:0">
                 <div class="sig-title sensitive">${esc(r.label)}</div>
-                <div class="sig-detail">点击进入报销联一键流转进度</div>
+                <div class="sig-detail">点击查看并更新报销状态</div>
               </div>
             </div>
             <span style="color:var(--ink-3)">${ICO.arrowRight}</span>
@@ -874,8 +874,8 @@
           <div class="sig-left">
             <div class="sig-badge-box green">${ICO.shield}</div>
             <div>
-              <div class="sig-title">${v.source_count} 份原件 100% 校验完整</div>
-              <div class="sig-detail">已拦截重复 ${v.duplicate_count} 次 · 随时可明文导出带走</div>
+              <div class="sig-title">${v.source_count} 份原件均完整</div>
+              <div class="sig-detail">${v.duplicate_count > 0 ? `已跳过重复 ${v.duplicate_count} 次 · ` : ""}随时可导出备份</div>
             </div>
           </div>
           <span style="color:var(--ink-3)">${ICO.arrowRight}</span>
@@ -887,21 +887,21 @@
       <div class="hero-primary">
         <div class="hero-top-bar">
           ${curTabsHtml}
-          <span class="micro-pill slate">${activeCur.bill_count} 笔已入账</span>
+          <span class="micro-pill slate">${activeCur.bill_count} 笔</span>
         </div>
 
         <div class="hero-figures">
           <div>
-            <div class="hero-big-label">${esc(activeCur.currency)} 已归档总价值</div>
+            <div class="hero-big-label">${esc(activeCur.currency)} 合计</div>
             <div class="hero-big-num sensitive">${renderEditorialMoney(activeCur.currency, activeCur.total_recorded, false)}</div>
           </div>
           <div class="hero-secondary-stats">
             <div>
-              <div class="mini-stat-k">周期订阅月均</div>
+              <div class="mini-stat-k">订阅月均</div>
               <div class="mini-stat-v sensitive">${esc(formatMoneyShort(activeCur.currency, activeCur.monthly_equiv_recurring))}<span style="font-size:11.5px;color:var(--ink-3);font-weight:500"> /月</span></div>
             </div>
             <div>
-              <div class="mini-stat-k">折合年度订阅</div>
+              <div class="mini-stat-k">订阅年计</div>
               <div class="mini-stat-v sensitive">${esc(formatMoneyShort(activeCur.currency, activeCur.yearly_equiv_recurring))}</div>
             </div>
           </div>
@@ -976,11 +976,11 @@
           <span class="oc-cycle">${esc(cyc)}</span>
         `;
       } else if (flags.is_csv_statement) {
-        priceHtml = `<span class="micro-pill slate">CSV 流水 · ${item.csv_row_count} 条可挑拣</span><span class="oc-cycle">点击展开</span>`;
+        priceHtml = `<span class="micro-pill slate">CSV 流水 · ${item.csv_row_count} 条</span><span class="oc-cycle">点击查看</span>`;
       } else if (flags.is_credit_or_order_warning) {
         priceHtml = `<span class="micro-pill amber">退款 / 未付订单</span><span class="oc-cycle">未计入</span>`;
       } else {
-        priceHtml = `<span style="font-size:13px;font-weight:700;color:var(--amber)">待补录金额</span><span class="oc-cycle">点击完善</span>`;
+        priceHtml = `<span style="font-size:13px;font-weight:700;color:var(--amber)">缺少金额</span><span class="oc-cycle">点击补充</span>`;
       }
 
       // Tailored tactile body per asset_kind
@@ -992,7 +992,7 @@
           bodyHtml = `
             <div class="hw-instrument">
               <div>
-                ${cpd ? `<div class="hw-cpd-num sensitive">${esc(cpd.perDayText)} <span style="font-size:11.5px;font-weight:500;color:var(--ink-3)">/ 天</span></div><div class="hw-cpd-sub">已陪伴 ${cpd.daysUsed} 天${w ? ` · ${esc(w.statusLabel)}` : ""}</div>` : `<div class="hw-cpd-sub">${esc(w.statusLabel)}</div>`}
+                ${cpd ? `<div class="hw-cpd-num sensitive">${esc(cpd.perDayText)} <span style="font-size:11.5px;font-weight:500;color:var(--ink-3)">/ 天</span></div><div class="hw-cpd-sub">已用 ${cpd.daysUsed} 天${w ? ` · ${esc(w.statusLabel)}` : ""}</div>` : `<div class="hw-cpd-sub">${esc(w.statusLabel)}</div>`}
               </div>
               ${w ? renderRingGauge(w.remPct, w.color, w.shortTag) : ""}
             </div>
@@ -1060,7 +1060,7 @@
 
           <div class="oc-foot ${kind === "reimbursable" ? "" : "ruled"}">
             <span class="sensitive" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(metaStr)}</span>
-            ${stampHtml || (item.object_intact ? `<span class="verified-check" title="原件字节校验完整">${ICO.check}</span>` : "")}
+            ${stampHtml || (item.object_intact ? `<span class="verified-check" title="原件校验完整">${ICO.check}</span>` : "")}
           </div>
         </article>
       `;
@@ -1120,7 +1120,7 @@
     stage.innerHTML = `
       <div class="table-sheet">
         <table class="clean-table">
-          <thead><tr><th>资产与归属</th><th>类型</th><th>周期</th><th class="right">金额</th><th>日期 / 保修</th><th class="right">操作</th></tr></thead>
+          <thead><tr><th>名称</th><th>类型</th><th>周期</th><th class="right">金额</th><th>日期 / 保修</th><th class="right">操作</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
@@ -1198,7 +1198,7 @@
         const [ry, rm, rd] = realDateStr.split("-").map(Number);
         if (ry === year && rm === month + 1) {
           matchedRealDay = rd;
-          addEvt(rd, { kind: "real", source_id: item.source_id, title, money, sub: "真实账单日" });
+          addEvt(rd, { kind: "real", source_id: item.source_id, title, money, sub: "账单日" });
         }
       }
       if (!projectable.has(item.source_id)) continue;
@@ -1213,7 +1213,7 @@
           else if (ann.billing_cycle === "quarterly" && diff % 3 === 0) hits = true;
           else if (ann.billing_cycle === "yearly" && diff % 12 === 0) hits = true;
           if (hits && !(diff === 0 && perVal?.period_end && matchedRealDay === clampedDay)) {
-            addEvt(clampedDay, { kind: "projected", source_id: item.source_id, title, money, sub: "按周期推算续费" });
+            addEvt(clampedDay, { kind: "projected", source_id: item.source_id, title, money, sub: "预计续费" });
           }
         }
       }
@@ -1237,7 +1237,7 @@
     for (let nd = 1; nd <= trailing; nd++) cells += `<div class="cal-cell other"><div class="cal-day">${nd}</div></div>`;
 
     const agendaHtml = agenda.length === 0
-      ? `<p class="folio-p">本月暂无账单、预计续费或保修到期日程，可点上方翻看其他月份。</p>`
+      ? `<p class="folio-p">本月没有账单、预计续费或保修到期。</p>`
       : `<div class="agenda-list">${agenda.map((ev) => `
           <div class="agenda-row" data-cal-sid="${esc(ev.source_id)}">
             <div style="display:flex;align-items:center;gap:10px;min-width:0">
@@ -1262,7 +1262,7 @@
               <button type="button" id="cal-today" class="btn btn-ghost btn-sm">本月</button>
             </div>
             <div class="cal-legend">
-              <span><i class="ldot real"></i>真实账单</span>
+              <span><i class="ldot real"></i>账单日</span>
               <span><i class="ldot proj"></i>预计续费</span>
               <span><i class="ldot war"></i>保修截止</span>
             </div>
@@ -1272,8 +1272,7 @@
 
         <aside class="agenda-card">
           <div>
-            <div class="micro-eyebrow">MONTH AGENDA</div>
-            <h3 class="folio-h3">${month + 1} 月日程清单（${agenda.length} 项）</h3>
+            <h3 class="folio-h3">${month + 1} 月日程（${agenda.length} 项）</h3>
           </div>
           ${agendaHtml}
         </aside>
@@ -1317,27 +1316,16 @@
     return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="overflow:visible"><polyline fill="none" stroke="${strokeColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${pts}"/><circle cx="${last[0]}" cy="${last[1]}" r="3" fill="${strokeColor}"/></svg>`;
   }
 
-  function buildFunEquivalence(cur, cents) {
-    if (cents <= 0) return "拨动下方任意订阅开关，实时测算停掉后一年可释放的预算";
-    const val = cents / 100;
-    if (cur === "CNY") {
-      const coffees = Math.max(1, Math.round(val / 30));
-      const dinners = Math.round(val / 180);
-      return dinners >= 2 ? `相当于省下约 ${coffees} 杯精品咖啡，或 ${dinners} 顿双人火锅` : `相当于省下约 ${coffees} 杯精品咖啡`;
-    }
-    if (["USD", "EUR", "GBP"].includes(cur)) {
-      const coffees = Math.max(1, Math.round(val / 5));
-      const games = Math.round(val / 60);
-      return games >= 1 ? `大约相当于 ${coffees} 杯咖啡，或 ${games} 款 3A 游戏` : `大约相当于 ${coffees} 杯精品咖啡`;
-    }
-    return `一年可减少 ${formatMoney(cur, centsToText(cents))} 周期支出`;
+  function buildSavingsNote(cur, cents, cutCount) {
+    if (cutCount === 0 || cents <= 0) return "勾选下方订阅，算算取消后一年能少花多少";
+    return `相当于每月少花 ${formatMoneyShort(cur, centsToText(Math.round(cents / 12)))}（已选 ${cutCount} 项）`;
   }
 
   function renderInsightsPane(ws) {
     const pane = $("pane-insights");
     const curList = (ws.summary_by_currency || []).map((c) => c.currency);
     if (!curList.length) {
-      pane.innerHTML = `<div class="empty-gallery"><h3>收入几笔资产后，这里将自动生成图表与退订沙盘</h3><p>按币种独立绘出分类占比、月度节奏、商家长期投入轨迹与省钱模拟器。</p></div>`;
+      pane.innerHTML = `<div class="empty-gallery"><h3>录入几笔账单后，这里会显示统计</h3><p>按币种查看分类占比、月度支出、商家汇总，以及取消订阅试算。</p></div>`;
       return;
     }
 
@@ -1368,7 +1356,7 @@
 
     const maxMonth = Math.max(...monthRows.map((m) => m.cents || 0), 1);
     const barsHtml = monthRows.length === 0
-      ? `<p class="folio-p" style="margin-top:12px">补充账单日期后会自动生成按月节奏图。</p>`
+      ? `<p class="folio-p" style="margin-top:12px">填写账单日期后会显示按月支出。</p>`
       : `<div class="bars-row">${monthRows.slice(-10).map((m) => `
           <div class="bar-col">
             <span class="bar-num sensitive">${esc(formatMoneyShort(cur, m.amount_text))}</span>
@@ -1389,9 +1377,8 @@
     const portfolioRows = (ws.vendor_portfolio || []).filter((p) => p.currency === cur);
     const portfolioHtml = portfolioRows.length === 0 ? "" : `
       <div class="folio-card pad-24">
-        <div class="micro-eyebrow">VENDOR FOLIO</div>
-        <h3 class="folio-h3">商家资产档案与价格轨迹</h3>
-        <p class="folio-p" style="margin-top:2px">点击任意商家卡片，直接回资产馆查看该商家的全部历史凭证</p>
+        <h3 class="folio-h3">按商家汇总</h3>
+        <p class="folio-p" style="margin-top:2px">点击商家卡片，可筛选该商家的所有记录</p>
         <div class="vendor-grid">
           ${portfolioRows.map((vp) => {
             const brand = brandStyleFor(vp.vendor);
@@ -1415,7 +1402,7 @@
                 </div>
                 <div class="vt-foot">
                   <div>
-                    <div style="font-size:11px;color:var(--ink-3)">累计投入</div>
+                    <div style="font-size:11px;color:var(--ink-3)">累计支出</div>
                     <div class="vt-ltv sensitive">${renderEditorialMoney(cur, vp.total_text, false)}</div>
                   </div>
                   ${spark}
@@ -1458,13 +1445,12 @@
       <div class="insights-stack">
         <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
           <div class="cur-switcher">${curList.map((c) => `<button type="button" class="cur-tab ${c === cur ? "active" : ""}" data-ins-cur="${esc(c)}">${esc(c)} · ${esc(CURRENCY_NAMES[c] || c)}</button>`).join("")}</div>
-          <span style="font-size:12px;color:var(--ink-3)">按原件币种独立分析，绝不虚构汇率折算</span>
+          <span style="font-size:12px;color:var(--ink-3)">各币种分开统计，不做汇率换算</span>
         </div>
 
         <div class="sec-grid-2">
           <div class="folio-card pad-24">
-            <div class="micro-eyebrow">CATEGORY SHARE</div>
-            <h3 class="folio-h3">分类花费占比</h3>
+            <h3 class="folio-h3">分类占比</h3>
             <div class="donut-wrap">
               <div class="donut-box">
                 <svg viewBox="0 0 176 176" width="176" height="176">${slicesSvg}</svg>
@@ -1478,8 +1464,7 @@
           </div>
 
           <div class="folio-card pad-24">
-            <div class="micro-eyebrow">RHYTHM &amp; ACCOUNTS</div>
-            <h3 class="folio-h3">月度账单与账号分布</h3>
+            <h3 class="folio-h3">月度支出与账号分布</h3>
             ${barsHtml}
             <div class="alloc-bar">${allocSegs}</div>
             <div class="legend-list">${accLegend}</div>
@@ -1492,18 +1477,18 @@
           <div class="sim-head">
             <div>
               <div style="display:flex;align-items:center;gap:8px">
-                <span class="micro-eyebrow">WHAT-IF SAVINGS STUDIO</span>
-                <span class="micro-pill slate">纯模拟 · 不改真实账本</span>
+                <h3 class="folio-h3" style="margin:0">取消订阅试算</h3>
+                <span class="micro-pill slate">仅试算，不修改账本</span>
               </div>
-              <div class="sim-figure sensitive">每年可省 ${renderEditorialMoney(cur, centsToText(yearlySave), true)}</div>
-              <div class="folio-p" style="margin-top:3px">${esc(buildFunEquivalence(cur, yearlySave))}</div>
+              <div class="sim-figure sensitive">每年少花 ${renderEditorialMoney(cur, centsToText(yearlySave), true)}</div>
+              <div class="folio-p" style="margin-top:3px">${esc(buildSavingsNote(cur, yearlySave, cutList.length))}</div>
             </div>
             <div class="btn-row">
-              <button type="button" id="btn-sim-copy" class="btn btn-ink btn-sm" ${cutList.length === 0 ? "disabled" : ""}>复制精简清单 (${cutList.length})</button>
+              <button type="button" id="btn-sim-copy" class="btn btn-ink btn-sm" ${cutList.length === 0 ? "disabled" : ""}>复制清单 (${cutList.length})</button>
               <button type="button" id="btn-sim-reset" class="btn btn-soft btn-sm" ${cutList.length === 0 ? "disabled" : ""}>重置</button>
             </div>
           </div>
-          ${recurring.length ? `<div class="sim-grid">${simRows}</div>` : `<p class="folio-p">当前 ${esc(cur)} 下暂无周期订阅，标记月付或年付即可开启省钱模拟。</p>`}
+          ${recurring.length ? `<div class="sim-grid">${simRows}</div>` : `<p class="folio-p">当前 ${esc(cur)} 下还没有周期订阅。</p>`}
         </div>
       </div>
     `;
@@ -1530,8 +1515,8 @@
     }));
     if ($("btn-sim-reset")) $("btn-sim-reset").addEventListener("click", () => { state.simCutIds.clear(); renderInsightsPane(ws); });
     if ($("btn-sim-copy")) $("btn-sim-copy").addEventListener("click", async () => {
-      const text = `【SubVault 待精简订阅清单（${cur}）】\n预计每年可省：${formatMoney(cur, centsToText(yearlySave))}\n` + cutList.map((n, i) => `${i + 1}. ${n}`).join("\n");
-      try { await navigator.clipboard.writeText(text); showToast("待精简清单已复制", "ok"); }
+      const text = `【SubVault 待取消订阅清单（${cur}）】\n预计每年少花：${formatMoney(cur, centsToText(yearlySave))}\n` + cutList.map((n, i) => `${i + 1}. ${n}`).join("\n");
+      try { await navigator.clipboard.writeText(text); showToast("已复制清单", "ok"); }
       catch (_) { downloadTextFile("subvault-cancel-plan.txt", text); }
     });
   }
@@ -1549,10 +1534,10 @@
       pane.innerHTML = `
         <div class="empty-gallery">
           <div class="empty-emblem" style="background:var(--green-bg);color:var(--green)">${ICO.sparkle}</div>
-          <h3>观片台已全部整理清空</h3>
-          <p>下次拖入扫描件发票、收据截图或出现多金额候选的文件时，可以随时来这里对照极速补录。</p>
+          <h3>待处理项已清空</h3>
+          <p>以后导入扫描件、截图或金额有歧义的账单时，可以在这里对照原件补充信息。</p>
           <div class="btn-row" style="justify-content:center">
-            ${skipped > 0 ? `<button type="button" id="btn-reset-skip" class="btn btn-soft btn-sm">重新查看跳过的 ${skipped} 项</button>` : `<button type="button" id="btn-back-assets" class="btn btn-ink btn-sm">回到资产馆</button>`}
+            ${skipped > 0 ? `<button type="button" id="btn-reset-skip" class="btn btn-soft btn-sm">重新查看跳过的 ${skipped} 项</button>` : `<button type="button" id="btn-back-assets" class="btn btn-ink btn-sm">返回账本</button>`}
           </div>
         </div>
       `;
@@ -1586,11 +1571,11 @@
       </div>
       <div class="triage-split">
         <div class="folio-card pad-24">
-          <div class="micro-eyebrow" style="margin-bottom:10px">ORIGINAL ARTIFACT · ${formatBytes(item.byte_length)}</div>
+          <div class="micro-eyebrow" style="margin-bottom:10px">原件预览 · ${formatBytes(item.byte_length)}</div>
           <div class="preview-frame" style="margin-bottom:0">${previewHtml}</div>
         </div>
         <div class="folio-card pad-24">
-          <h3 class="folio-h3" style="margin-bottom:14px">快速补录卡片</h3>
+          <h3 class="folio-h3" style="margin-bottom:14px">补充信息</h3>
           ${item.status_flags.has_conflict ? `<div class="warning-note" style="margin-bottom:12px">检测到多个候选金额，请对照左侧原件填写真实金额。</div>` : ""}
           <form id="form-triage" class="form-stack">
             <label class="field"><span>商家 / 服务名</span><input id="tr-vendor" type="text" value="${esc(ann.vendor || "")}" placeholder="如 JetBrains、Apple、电信宽带" required></label>
@@ -1651,8 +1636,8 @@
           category: $("tr-category").value, bill_date: $("tr-date").value,
         });
         state.workspace = snap; renderWorkspace();
-        if (getTriageQueue(snap).length === 0) { launchConfetti(); showToast("全部待整理账单已清零", "ok"); }
-        else showToast("已保存，切入下一张", "ok");
+        if (getTriageQueue(snap).length === 0) { launchConfetti(); showToast("待整理项已全部处理", "ok"); }
+        else showToast("已保存，进入下一项", "ok");
       } catch (err) {
         showToast(err.message, "error"); btn.disabled = false; btn.textContent = "保存并切下一张";
       }
@@ -1667,21 +1652,21 @@
     const needs = items.filter((i) => i.status_flags.needs_manual_entry || i.status_flags.has_conflict || i.status_flags.is_credit_or_order_warning);
     const dups = items.filter((i) => i.status_flags.has_duplicate);
 
-    const needsHtml = !needs.length ? `<p class="folio-p">目前没有待补录或存在金额冲突的文件。</p>` : `<div class="stack-8">${needs.map((it) => `
+    const needsHtml = !needs.length ? `<p class="folio-p">目前没有待补充或金额有歧义的文件。</p>` : `<div class="stack-8">${needs.map((it) => `
       <div class="attn-row">
         <div>
           <div style="font-weight:700">${esc(it.annotation?.vendor || it.display_name)}</div>
-          <div style="font-size:12px;color:var(--ink-3)">${it.status_flags.has_conflict ? "存在多个候选金额，等待确认" : it.status_flags.is_credit_or_order_warning ? "疑似退款或未支付订单" : "扫描件或截图，点击补录"}</div>
+          <div style="font-size:12px;color:var(--ink-3)">${it.status_flags.has_conflict ? "存在多个候选金额，需要确认" : it.status_flags.is_credit_or_order_warning ? "疑似退款或未支付订单" : "扫描件或截图，点击补充信息"}</div>
         </div>
         <button type="button" class="btn btn-soft btn-sm" data-open-sid="${esc(it.source_id)}">核对</button>
       </div>
     `).join("")}</div>`;
 
-    const dupsHtml = !dups.length ? `<p class="folio-p">暂未遇到重复导入的文件；以后即便改名拖入同一份发票，系统也会按原件指纹自动防重。</p>` : `<div class="stack-8">${dups.map((it) => `
+    const dupsHtml = !dups.length ? `<p class="folio-p">目前没有重复导入的文件。同一份文件改名后再导入，也会自动跳过。</p>` : `<div class="stack-8">${dups.map((it) => `
       <div class="attn-row">
         <div>
           <div style="font-weight:700">${esc(it.annotation?.vendor || it.display_name)}</div>
-          <div style="font-size:12px;color:var(--ink-3)">共导入 ${it.occurrence_count} 次，拦截重复 ${it.duplicate_hits} 次 · ${esc((it.occurrences || []).map((o) => o.display_name).join("、"))}</div>
+          <div style="font-size:12px;color:var(--ink-3)">共导入 ${it.occurrence_count} 次，跳过重复 ${it.duplicate_hits} 次 · ${esc((it.occurrences || []).map((o) => o.display_name).join("、"))}</div>
         </div>
         <button type="button" class="btn btn-soft btn-sm" data-open-sid="${esc(it.source_id)}">查看</button>
       </div>
@@ -1690,11 +1675,11 @@
     wrap.innerHTML = `
       <div class="sec-grid-2">
         <div class="folio-card pad-24 stack-12">
-          <div style="display:flex;align-items:center;justify-content:space-between"><h3 class="folio-h3">待补录与冲突核对</h3><span class="micro-pill ${needs.length ? "amber" : "slate"}">${needs.length}</span></div>
+          <div style="display:flex;align-items:center;justify-content:space-between"><h3 class="folio-h3">待核对文件</h3><span class="micro-pill ${needs.length ? "amber" : "slate"}">${needs.length}</span></div>
           ${needsHtml}
         </div>
         <div class="folio-card pad-24 stack-12">
-          <div style="display:flex;align-items:center;justify-content:space-between"><h3 class="folio-h3">已自动拦截的重复账单</h3><span class="micro-pill ${dups.length ? "green" : "slate"}">${dups.length}</span></div>
+          <div style="display:flex;align-items:center;justify-content:space-between"><h3 class="folio-h3">重复导入记录</h3><span class="micro-pill ${dups.length ? "green" : "slate"}">${dups.length}</span></div>
           ${dupsHtml}
         </div>
       </div>
@@ -1764,7 +1749,7 @@
     const w = warrantyInfo(buy, wend);
     if (w) pills.push(`<span class="micro-pill ${w.daysLeft <= 60 ? "amber" : "iris"}">${esc(w.statusLabel)}</span>`);
     const cpd = costPerDayInfo(buy, cur, amt);
-    if (cpd) pills.push(`<span class="micro-pill slate sensitive num">已陪伴 ${cpd.daysUsed} 天 · 日均 ${esc(cpd.perDayText)}</span>`);
+    if (cpd) pills.push(`<span class="micro-pill slate sensitive num">已用 ${cpd.daysUsed} 天 · 日均 ${esc(cpd.perDayText)}</span>`);
     if (pills.length) { box.innerHTML = pills.join(""); box.classList.remove("hidden"); }
     else box.classList.add("hidden");
   }
@@ -1811,8 +1796,8 @@
 
     $("evidence-meta").innerHTML = `
       <div><strong>文件名：</strong>${esc(item.display_name)}（${formatBytes(item.byte_length)}）</div>
-      <div><strong>原件指纹：</strong><code>${esc(item.content_sha256)}</code></div>
-      <div><strong>完整性：</strong>${item.object_intact ? "已实时核验一致，原件零改动" : "校验异常，请检查账本"}</div>
+      <div><strong>SHA-256：</strong><code>${esc(item.content_sha256)}</code></div>
+      <div><strong>完整性：</strong>${item.object_intact ? "校验一致，原件未改动" : "校验异常，请检查账本"}</div>
     `;
     $("btn-download-raw").href = tokenUrl(`/api/sources/${encodeURIComponent(item.source_id)}/raw?download=1`);
 
@@ -1857,23 +1842,23 @@
           <strong>${esc(r.merchant || "未标注商户")} · <span class="sensitive num">${esc(formatMoney(r.currency || "CNY", r.amount_text))}</span></strong>
           <small>${esc(r.date || "")} · ${esc(r.description || "")}</small>
         </div>
-        <button type="button" class="btn btn-soft btn-sm" data-csv-promote="${idx}">收入资产</button>
+        <button type="button" class="btn btn-soft btn-sm" data-csv-promote="${idx}">加入账本</button>
       </div>
     `).join("");
     box.querySelectorAll("[data-csv-promote]").forEach((btn) => btn.addEventListener("click", async () => {
       const r = rows[Number(btn.getAttribute("data-csv-promote"))];
       if (!r) return;
-      btn.disabled = true; btn.textContent = "登记中…";
+      btn.disabled = true; btn.textContent = "加入中…";
       try {
         const res = await api("POST", "/api/csv/promote", {
           parent_source_id: item.source_id, row_number: r.row_number, merchant: r.merchant || "", description: r.description || "",
           date: r.date || "", currency: r.currency || "CNY", amount_text: r.amount_text || "", billing_cycle: "unknown",
           account_label: r.account_hint || undefined, raw_line: r.raw_line || "",
         });
-        showToast(res.storage_reused ? "这条流水已登记过，已自动防重" : `已将「${r.merchant || "该笔流水"}」收入资产馆`, "ok");
+        showToast(res.storage_reused ? "这条流水已经加过，已跳过重复" : `已将「${r.merchant || "该笔流水"}」加入账本`, "ok");
         await refreshWorkspace();
       } catch (err) { showToast(err.message, "error"); }
-      finally { btn.disabled = false; btn.textContent = "收入资产"; }
+      finally { btn.disabled = false; btn.textContent = "加入账本"; }
     }));
   }
 
@@ -1929,20 +1914,20 @@
     const q = query.trim().toLowerCase();
     const acts = [];
     if ((state.workspace?.vault?.demo_count || 0) > 0) {
-      acts.push({ ico: ICO.trash, label: "一键清空全部体验示例数据", sub: "仅清除示例，保留真实账单", run: () => $("btn-clear-demo-pack").click() });
+      acts.push({ ico: ICO.trash, label: "清除示例数据", sub: "仅删除示例，保留真实账单", run: () => $("btn-clear-demo-pack").click() });
     }
     acts.push(
-      { ico: ICO.plus, label: "手动收入一笔资产或账单", sub: "订阅 / 密钥 / 保修 / 报销", run: () => openManualModal() },
-      { ico: ICO.download, label: "导入本地账单文件", sub: "PDF / HTML / CSV / 截图", run: () => $("file-picker-input").click() },
-      { ico: ICO.key, label: "查看买断授权与密钥库", sub: "一键复制加密激活码", run: () => navigateTo("assets", "license") },
-      { ico: ICO.laptop, label: "查看硬件保修与日均成本", sub: "保修环 + 每日成本", run: () => navigateTo("assets", "hardware") },
-      { ico: ICO.receipt, label: "查看报销凭证联", sub: "一键盖章切状态", run: () => navigateTo("assets", "reimbursable") },
-      { ico: ICO.calendar, label: "打开时间轴日历与月度清单", sub: "续费与保修截止日", run: () => navigateTo("calendar") },
-      { ico: ICO.chart, label: "打开洞察图表与省钱沙盘", sub: "占比 / 商家轨迹 / 模拟器", run: () => navigateTo("insights") },
-      { ico: ICO.bolt, label: "进入观片台极速整理", sub: "左右对照补录扫描件", run: () => navigateTo("triage") },
-      { ico: ICO.sun, label: "切换画廊光感外观", sub: "白昼画廊 / 晨光宣纸 / 静谧夜览", run: () => cycleTheme() },
-      { ico: ICO.eye, label: "开关隐私防窥模糊", sub: "快捷键 P", run: () => togglePrivacy() },
-      { ico: ICO.lock, label: "立即锁定当前账本", sub: "清空内存密钥", run: () => $("btn-lock-vault").click() },
+      { ico: ICO.plus, label: "记一笔", sub: "订阅、买断、硬件或报销", run: () => openManualModal() },
+      { ico: ICO.download, label: "导入本地文件", sub: "PDF、HTML、CSV 或截图", run: () => $("file-picker-input").click() },
+      { ico: ICO.key, label: "查看买断与密钥", sub: "查看和复制软件密钥", run: () => navigateTo("assets", "license") },
+      { ico: ICO.laptop, label: "查看硬件保修", sub: "保修剩余天数和日均成本", run: () => navigateTo("assets", "hardware") },
+      { ico: ICO.receipt, label: "查看报销记录", sub: "查看并更新报销进度", run: () => navigateTo("assets", "reimbursable") },
+      { ico: ICO.calendar, label: "打开日历", sub: "账单日、预计续费和保修截止", run: () => navigateTo("calendar") },
+      { ico: ICO.chart, label: "打开统计", sub: "分类占比、商家汇总和试算", run: () => navigateTo("insights") },
+      { ico: ICO.bolt, label: "打开待整理", sub: "对照原件补充信息", run: () => navigateTo("triage") },
+      { ico: ICO.sun, label: "切换外观", sub: "浅色 / 暖白 / 深色", run: () => cycleTheme() },
+      { ico: ICO.eye, label: "隐藏或显示金额", sub: "快捷键 P", run: () => togglePrivacy() },
+      { ico: ICO.lock, label: "锁定账本", sub: "返回解锁界面", run: () => $("btn-lock-vault").click() },
     );
 
     const assets = (state.workspace?.items || []).map((it) => {
@@ -1951,7 +1936,7 @@
       return {
         ico: ICO.receipt,
         label: ann.vendor || it.display_name,
-        sub: [ann.plan_name, amt ? formatMoney(amt.currency, amt.amount_text) : "待补录", ann.account_label].filter(Boolean).join(" · "),
+        sub: [ann.plan_name, amt ? formatMoney(amt.currency, amt.amount_text) : "缺少金额", ann.account_label].filter(Boolean).join(" · "),
         run: () => openDrawer(it),
       };
     });
@@ -1961,7 +1946,7 @@
     state.cmdIndex = Math.min(state.cmdIndex, Math.max(0, state.cmdActions.length - 1));
 
     const el = $("cmd-list");
-    if (!state.cmdActions.length) { el.innerHTML = `<div style="padding:20px;text-align:center;color:var(--ink-3)">没有匹配的资产或指令</div>`; return; }
+    if (!state.cmdActions.length) { el.innerHTML = `<div style="padding:20px;text-align:center;color:var(--ink-3)">没有匹配的结果</div>`; return; }
     el.innerHTML = state.cmdActions.map((a, idx) => `
       <button type="button" class="cmd-item ${idx === state.cmdIndex ? "selected" : ""}" data-cmd-idx="${idx}">
         <span class="cmd-item-l"><span style="color:var(--ink-3);display:inline-flex">${a.ico}</span><span>${esc(a.label)}</span></span>
@@ -2008,7 +1993,7 @@
     let added = 0, reused = 0, failed = 0, lastError = "";
     for (let i = 0; i < valid.length; i++) {
       const f = valid[i];
-      prog.textContent = `入库 ${i + 1}/${valid.length} · ${f.name}`;
+      prog.textContent = `导入 ${i + 1}/${valid.length} · ${f.name}`;
       try {
         const res = await api("POST", "/api/import", { filename: f.name, content_base64: arrayBufferToBase64(await f.arrayBuffer()), batch_id: batchId });
         if (res.reused) reused += 1; else added += 1;
@@ -2017,8 +2002,8 @@
     prog.classList.add("hidden");
     await refreshWorkspace();
     const parts = [];
-    if (added) parts.push(`新收入 ${added} 份`);
-    if (reused) parts.push(`防重跳过 ${reused} 份`);
+    if (added) parts.push(`已导入 ${added} 份`);
+    if (reused) parts.push(`跳过重复 ${reused} 份`);
     if (failed) parts.push(`失败 ${failed} 份（${lastError}）`);
     showToast(parts.join("，") || "导入完成", failed && !added ? "error" : "ok");
   }
@@ -2146,9 +2131,9 @@
         else if (state.unlockMode === "recovery") payload.recovery_key = $("unlock-recovery").value.trim();
         const snap = await api("POST", "/api/vault/unlock", payload);
         $("unlock-passphrase").value = ""; $("unlock-recovery").value = "";
-        state.workspace = snap; showWorkspaceScreen(); showToast("资产馆已解锁，欢迎回来", "ok");
+        state.workspace = snap; showWorkspaceScreen(); showToast("账本已打开", "ok");
       } catch (err) { errBox.textContent = err.message; errBox.classList.remove("hidden"); }
-      finally { btn.disabled = false; btn.textContent = "解锁并进入资产馆"; }
+      finally { btn.disabled = false; btn.textContent = "打开账本"; }
     });
 
     $("form-create-vault").addEventListener("submit", async (e) => {
@@ -2165,10 +2150,10 @@
         const res = await api("POST", "/api/vault/init", { path: $("create-path").value.trim(), protection: prot, passphrase: prot === "passphrase" ? pass : "" });
         $("create-passphrase").value = ""; $("create-passphrase-confirm").value = "";
         await refreshWorkspace();
-        if (res.recovery_key) openRecoveryModal(res.recovery_key, () => { showWorkspaceScreen(); showToast("新资产馆已就绪", "ok"); });
-        else { showWorkspaceScreen(); showToast("新资产馆已就绪", "ok"); }
+        if (res.recovery_key) openRecoveryModal(res.recovery_key, () => { showWorkspaceScreen(); showToast("账本已创建", "ok"); });
+        else { showWorkspaceScreen(); showToast("账本已创建", "ok"); }
       } catch (err) { errBox.textContent = err.message; errBox.classList.remove("hidden"); }
-      finally { btn.disabled = false; btn.textContent = "创建私人资产馆"; }
+      finally { btn.disabled = false; btn.textContent = "创建账本"; }
     });
 
     // Recovery modal
@@ -2209,7 +2194,7 @@
         else if (state.manualKind === "hardware") payload.warranty_end = $("man-warranty-end").value;
         else if (state.manualKind === "reimbursable") payload.reimburse_status = $("man-reimburse-status").value;
         const snap = await api("POST", "/api/manual-entry", payload);
-        state.workspace = snap; closeManualModal(); renderWorkspace(); showToast("已收入资产馆", "ok");
+        state.workspace = snap; closeManualModal(); renderWorkspace(); showToast("已保存", "ok");
       } catch (err) { showToast(err.message, "error"); }
       finally { btn.disabled = false; }
     });
@@ -2220,20 +2205,20 @@
       try {
         const snap = await api("POST", "/api/clear-demo-pack", {});
         state.workspace = snap; closeDrawer(); renderWorkspace();
-        showToast(`已清除 ${snap.removed_count || 0} 项示例数据，真实账单完好无损`, "ok");
+        showToast(`已清除 ${snap.removed_count || 0} 条示例数据`, "ok");
       } catch (err) { showToast(err.message, "error"); }
-      finally { btn.disabled = false; btn.textContent = "一键清空示例数据"; }
+      finally { btn.disabled = false; btn.textContent = "清除示例"; }
     });
     $("btn-ask-delete-item").addEventListener("click", () => { $("btn-ask-delete-item").classList.add("hidden"); $("delete-confirm-bar").classList.remove("hidden"); });
     $("btn-cancel-delete-item").addEventListener("click", () => { $("delete-confirm-bar").classList.add("hidden"); $("btn-ask-delete-item").classList.remove("hidden"); });
     $("btn-confirm-delete-item").addEventListener("click", async () => {
       if (!state.selectedSourceId) return;
-      const btn = $("btn-confirm-delete-item"); btn.disabled = true; btn.textContent = "移出中…";
+      const btn = $("btn-confirm-delete-item"); btn.disabled = true; btn.textContent = "删除中…";
       try {
         const snap = await api("POST", "/api/sources/delete", { source_id: state.selectedSourceId });
-        state.workspace = snap; closeDrawer(); renderWorkspace(); showToast("已移出当前账本", "ok");
+        state.workspace = snap; closeDrawer(); renderWorkspace(); showToast("已删除", "ok");
       } catch (err) { showToast(err.message, "error"); }
-      finally { btn.disabled = false; btn.textContent = "确认移出"; }
+      finally { btn.disabled = false; btn.textContent = "确认删除"; }
     });
 
     // Floating dock & collection pills
@@ -2252,11 +2237,11 @@
       state.workspace = null;
       const info = await api("GET", "/api/bootstrap");
       renderRecentVaults(info.recent_vaults || []);
-      showLobbyScreen(); showToast("账本已锁定，内存密钥已清空", "ok");
+      showLobbyScreen(); showToast("账本已锁定", "ok");
     });
     $("btn-shutdown-app").addEventListener("click", async () => {
       try { await api("POST", "/api/shutdown", {}); } catch (_) {}
-      document.body.innerHTML = `<div style="max-width:440px;margin:130px auto;text-align:center;font-family:var(--font-sans);padding:24px"><h2 style="margin:0 0 8px">SubVault 已安全锁定并退出</h2><p style="margin:0;color:var(--ink-2)">内存密钥已清空，本机服务已停止，可以安全关闭此页面。</p></div>`;
+      document.body.innerHTML = `<div style="max-width:440px;margin:130px auto;text-align:center;font-family:var(--font-sans);padding:24px"><h2 style="margin:0 0 8px">SubVault 已退出</h2><p style="margin:0;color:var(--ink-2)">本地服务已停止，可以直接关闭这个页面。</p></div>`;
     });
 
     // Global drag & drop

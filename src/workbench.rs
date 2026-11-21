@@ -1048,7 +1048,7 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
                 billing_cycle: Some("one_time".into()),
                 category: Some("数码硬件".into()),
                 bill_date: Some(hw_buy_date),
-                notes: Some("官方商城一年有限保修，序列号原件已归档".into()),
+                notes: Some("官方一年保修，电子发票已保存".into()),
                 asset_kind: Some("hardware".into()),
                 warranty_end: Some(hw_warranty_end),
                 license_key: None,
@@ -1094,7 +1094,7 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
                 billing_cycle: Some("one_time".into()),
                 category: Some("办公效率".into()),
                 bill_date: Some("2026-08-15".into()),
-                notes: Some("激活密钥已单独加密存放在本地密钥库".into()),
+                notes: Some("密钥已加密保存在本地".into()),
                 asset_kind: Some("license".into()),
                 warranty_end: None,
                 license_key: Some("RCST-DEMO-8842-K9X2".into()),
@@ -1133,7 +1133,7 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
                 billing_cycle: Some("one_time".into()),
                 category: Some("云服务".into()),
                 bill_date: Some("2026-11-15".into()),
-                notes: Some("Q4 研发测试垫付费用，待月底统一提交财务报销".into()),
+                notes: Some("测试环境费用，待提交报销".into()),
                 asset_kind: Some("reimbursable".into()),
                 warranty_end: None,
                 license_key: None,
@@ -2195,7 +2195,7 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
                     "pending_text": pending_text,
                     "pending_count": racc.pending_count,
                     "label": format!("待报销 {cur} {pending_text}（{} 笔）", racc.pending_count),
-                    "detail": "点击查看待报销凭证并一键流转状态",
+                    "detail": "点击查看并更新报销状态",
                 }));
             } else if racc.submitted_count > 0 {
                 radar_reimburse.push(json!({
