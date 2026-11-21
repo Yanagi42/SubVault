@@ -140,6 +140,7 @@ fn accept(journal: &Journal) -> Result<(), ()> {
         && journal.kind != "decision"
         && journal.kind != "html"
         && journal.kind != "pdf"
+        && journal.kind != "csv"
     {
         return Err(());
     }

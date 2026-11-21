@@ -110,7 +110,7 @@ fn submit_inner(req: PdfRequest) -> Result<Value, Fail> {
     journal.state = "object_ready".into();
     journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
 
-    let extracted = pdf_parse::extract(&bytes);
+    let (extracted, hints) = extract_for_session(&bytes, session.vault_format);
     let committed = match commit(
         &session,
         &req,
@@ -119,6 +119,7 @@ fn submit_inner(req: PdfRequest) -> Result<Value, Fail> {
         &hash,
         &key,
         &extracted,
+        &hints,
     ) {
         Ok(body) => body,
         Err(fail) => {
@@ -568,6 +569,51 @@ fn replay(
     Ok(body)
 }
 
+fn extract_for_session(
+    bytes: &[u8],
+    vault_format: i64,
+) -> (PdfExtraction, crate::real_extract::ExtractedHints) {
+    let strict = pdf_parse::extract(bytes);
+    if vault_format < 6 {
+        return (strict, crate::real_extract::ExtractedHints::default());
+    }
+    let real = crate::real_extract::extract_real_pdf(bytes);
+    let hints = real.hints;
+    if strict.adopt_amount_idx.is_some()
+        || strict.adopt_period_idx.is_some()
+        || strict.status == "conflict"
+    {
+        return (strict, hints);
+    }
+    if real.adopt_amount_idx.is_some()
+        || real.adopt_period_idx.is_some()
+        || real.status == "conflict"
+        || !real.candidates.is_empty()
+    {
+        let converted = PdfExtraction {
+            status: real.status,
+            reason: real.reason,
+            page_count: real.page_count,
+            candidates: real
+                .candidates
+                .into_iter()
+                .map(|c| pdf_parse::PdfCandidate {
+                    kind: c.kind,
+                    usable: c.usable,
+                    excerpt: c.excerpt,
+                    value: c.value,
+                    locator: c.locator,
+                })
+                .collect(),
+            adopt_amount_idx: real.adopt_amount_idx,
+            adopt_period_idx: real.adopt_period_idx,
+        };
+        return (converted, hints);
+    }
+    (strict, hints)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn commit(
     session: &super::Session,
     req: &PdfRequest,
@@ -576,6 +622,7 @@ fn commit(
     hash: &str,
     key: &str,
     extracted: &PdfExtraction,
+    hints: &crate::real_extract::ExtractedHints,
 ) -> Result<Value, Fail> {
     let tx = session
         .conn
@@ -764,6 +811,17 @@ fn commit(
         &drafts,
         &session.cipher,
     )?;
+
+    if session.vault_format >= 6 {
+        store::seed_annotation_hints_with_cipher(
+            &tx,
+            &source_id,
+            hints,
+            super::now_ms(),
+            &session.cipher,
+        )
+        .map_err(|err| db_fail(err, "seed_annotation"))?;
+    }
 
     let mut body = receipt(
         session,

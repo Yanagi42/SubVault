@@ -107,12 +107,49 @@ pub struct AuthInput {
     pub passphrase_stdin: bool,
     pub recovery_key_file: Option<PathBuf>,
     pub recovery_key_stdin: bool,
+    pub(crate) session_cipher: Option<VaultCipher>,
+    pub(crate) direct_passphrase: Option<Zeroizing<String>>,
+    pub(crate) direct_recovery_key: Option<Zeroizing<String>>,
+}
+
+impl AuthInput {
+    pub(crate) fn from_cipher(cipher: VaultCipher) -> Self {
+        Self {
+            session_cipher: Some(cipher),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn from_direct_passphrase(pass: String) -> Self {
+        Self {
+            direct_passphrase: Some(Zeroizing::new(pass)),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn from_direct_recovery_key(key: String) -> Self {
+        Self {
+            direct_recovery_key: Some(Zeroizing::new(key)),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct NewPassphraseInput {
     pub file: Option<PathBuf>,
     pub stdin: bool,
+    pub(crate) direct: Option<Zeroizing<String>>,
+}
+
+impl NewPassphraseInput {
+    pub(crate) fn from_direct(pass: String) -> Self {
+        Self {
+            file: None,
+            stdin: false,
+            direct: Some(Zeroizing::new(pass)),
+        }
+    }
 }
 
 pub enum Credential {
@@ -130,6 +167,21 @@ pub enum CredentialError {
 
 impl AuthInput {
     pub fn resolve(&self) -> Result<Credential, CredentialError> {
+        if self.direct_passphrase.is_some() && self.direct_recovery_key.is_some() {
+            return Err(CredentialError::Conflict);
+        }
+        if let Some(ref p) = self.direct_passphrase {
+            if p.is_empty() {
+                return Err(CredentialError::Empty("empty_passphrase"));
+            }
+            return Ok(Credential::Passphrase(p.clone()));
+        }
+        if let Some(ref r) = self.direct_recovery_key {
+            if r.is_empty() {
+                return Err(CredentialError::Empty("empty_recovery_key"));
+            }
+            return Ok(Credential::RecoveryKey(r.clone()));
+        }
         let pass = read_secret_source(
             self.passphrase_file.as_deref(),
             self.passphrase_stdin,
@@ -153,8 +205,17 @@ impl AuthInput {
     }
 
     pub fn resolve_passphrase_only(&self) -> Result<Option<Zeroizing<String>>, CredentialError> {
-        if self.recovery_key_file.is_some() || self.recovery_key_stdin {
+        if self.recovery_key_file.is_some()
+            || self.recovery_key_stdin
+            || self.direct_recovery_key.is_some()
+        {
             return Err(CredentialError::Conflict);
+        }
+        if let Some(ref p) = self.direct_passphrase {
+            if p.is_empty() {
+                return Err(CredentialError::Empty("empty_passphrase"));
+            }
+            return Ok(Some(p.clone()));
         }
         read_secret_source(
             self.passphrase_file.as_deref(),
@@ -168,6 +229,12 @@ impl AuthInput {
 
 impl NewPassphraseInput {
     pub fn resolve(&self) -> Result<Option<Zeroizing<String>>, CredentialError> {
+        if let Some(ref p) = self.direct {
+            if p.is_empty() {
+                return Err(CredentialError::Empty("empty_new_passphrase"));
+            }
+            return Ok(Some(p.clone()));
+        }
         read_secret_source(
             self.file.as_deref(),
             self.stdin,

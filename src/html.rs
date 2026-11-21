@@ -88,7 +88,12 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
     // A T3 receipt occupies this command id for every kind. Preservation is
     // not a second fact commit.
     super::decide::reject_if_t3_command(&session.conn, &req.command_id, &session.cipher)?;
-    let bytes = read_html(&req.source)?;
+    let max_bytes = if session.vault_format >= 6 {
+        crate::real_extract::MAX_REAL_HTML_BYTES
+    } else {
+        MAX_HTML_BYTES
+    };
+    let bytes = read_html(&req.source, max_bytes)?;
     let text = std::str::from_utf8(&bytes).expect("read_html accepted utf-8");
     let hash = sha256_bytes(&bytes);
     if let Some(source) = store::source_by_hash_with_cipher(
@@ -123,7 +128,7 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
     };
     journal.state = "object_ready".into();
     journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
-    let prepared = extract(text);
+    let (prepared, hints) = extract_for_session(text, session.vault_format);
     let committed = match commit(
         &session,
         &req,
@@ -132,6 +137,7 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
         &hash,
         &key,
         &prepared,
+        &hints,
     ) {
         Ok(body) => body,
         Err(fail) => {
@@ -164,7 +170,7 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
     }
 }
 
-fn read_html(path: &Path) -> Result<Vec<u8>, Fail> {
+fn read_html(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Fail> {
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(err) => {
@@ -182,11 +188,11 @@ fn read_html(path: &Path) -> Result<Vec<u8>, Fail> {
             .extra("preservation", json!(NOT_PRESERVED))
             .extra("new_effect", json!(false)));
     }
-    if meta.len() > MAX_HTML_BYTES {
+    if meta.len() > max_bytes {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "over_input_budget")
             .extra("bytes_read", json!(0))
             .extra("stat_size", json!(meta.len()))
-            .extra("limit", json!(MAX_HTML_BYTES))
+            .extra("limit", json!(max_bytes))
             .extra("preservation", json!(NOT_PRESERVED))
             .extra("new_effect", json!(false)));
     }
@@ -579,6 +585,7 @@ fn replay(
     Ok(body)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit(
     session: &super::Session,
     req: &HtmlRequest,
@@ -587,6 +594,7 @@ fn commit(
     hash: &str,
     key: &str,
     prepared: &Prepared,
+    hints: &crate::real_extract::ExtractedHints,
 ) -> Result<Value, Fail> {
     let tx = session
         .conn
@@ -781,6 +789,16 @@ fn commit(
         &drafts,
         &session.cipher,
     )?;
+    if session.vault_format >= 6 {
+        store::seed_annotation_hints_with_cipher(
+            &tx,
+            &source_id,
+            hints,
+            super::now_ms(),
+            &session.cipher,
+        )
+        .map_err(|err| db_fail(err, "seed_annotation"))?;
+    }
     let mut body = receipt(
         session,
         req,
@@ -907,7 +925,10 @@ fn hit_value(hit: &Hit) -> Map<String, Value> {
     value.insert("element".into(), json!(hit.element));
     if let Some(amount) = &hit.amount_text {
         value.insert("amount_text".into(), json!(amount));
-        value.insert("currency".into(), json!("USD"));
+        value.insert(
+            "currency".into(),
+            json!(hit.currency.as_deref().unwrap_or("USD")),
+        );
     }
     if let Some(start) = &hit.period_start {
         value.insert("period_start".into(), json!(start));
@@ -1000,6 +1021,7 @@ struct Hit {
     display: String,
     usable: bool,
     reason: Option<&'static str>,
+    currency: Option<String>,
     amount_text: Option<String>,
     period_start: Option<String>,
     period_end: Option<String>,
@@ -1024,6 +1046,91 @@ fn prepared(status: &'static str, reason: Option<String>, hits: Vec<Hit>) -> Pre
         reason,
         hits,
     }
+}
+
+fn extract_for_session(
+    source: &str,
+    vault_format: i64,
+) -> (Prepared, crate::real_extract::ExtractedHints) {
+    let strict = extract(source);
+    if vault_format < 6 {
+        return (strict, crate::real_extract::ExtractedHints::default());
+    }
+    let real = crate::real_extract::extract_real_html(source);
+    let hints = real.hints;
+    let strict_has_usable = strict.hits.iter().any(|h| h.usable);
+    if strict_has_usable || strict.status == "conflict" {
+        return (strict, hints);
+    }
+    if real.adopt_amount_idx.is_some()
+        || real.adopt_period_idx.is_some()
+        || real.status == "conflict"
+        || !real.candidates.is_empty()
+    {
+        let mut hits = Vec::new();
+        for (idx, cand) in real.candidates.into_iter().enumerate() {
+            let kind: &'static str = match cand.kind.as_str() {
+                "stated_amount_paid" => "stated_amount_paid",
+                "stated_service_period" => "stated_service_period",
+                "credit_note_total" => "credit_note_total",
+                "unjudged_order_total" => "unjudged_order_total",
+                "unresolved_total" => "unresolved_total",
+                "account_email" => "account_email",
+                "masked_account_email" => "masked_account_email",
+                _ => "other_candidate",
+            };
+            let usable = Some(idx) == real.adopt_amount_idx || Some(idx) == real.adopt_period_idx;
+            let currency = cand
+                .value
+                .get("currency")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let amount_text = cand
+                .value
+                .get("amount_text")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let period_start = cand
+                .value
+                .get("period_start")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let period_end = cand
+                .value
+                .get("period_end")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let reason = if usable {
+                None
+            } else if real.status == "conflict" {
+                Some("conflicting_candidates")
+            } else {
+                Some("not_adopted")
+            };
+            hits.push(Hit {
+                kind,
+                display: cand.excerpt.clone(),
+                usable,
+                reason,
+                currency,
+                amount_text,
+                period_start,
+                period_end,
+                byte_start: 0,
+                byte_end: 0,
+                scalar_start: 0,
+                scalar_end: 0,
+                excerpt: cand.excerpt,
+                element: "real_html".to_string(),
+                display_version: Some(crate::real_extract::REAL_HTML_RULES_VERSION),
+            });
+        }
+        return (
+            prepared(real.status, real.reason.map(str::to_string), hits),
+            hints,
+        );
+    }
+    (strict, hints)
 }
 
 fn extract(source: &str) -> Prepared {
@@ -1222,6 +1329,7 @@ fn record_block(
             display: line,
             usable: true,
             reason: None,
+            currency: None,
             amount_text: amount,
             period_start: start,
             period_end: end,
@@ -1462,6 +1570,7 @@ fn record_stated_lines(name: &str, span: &OwnedSpan, lines: &[String], scan: &mu
             display: line.clone(),
             usable: true,
             reason: None,
+            currency: None,
             amount_text: amount,
             period_start: start,
             period_end: end,
@@ -1593,6 +1702,7 @@ fn push_row(source: &str, label: &RowCell, value: &RowCell, scan: &mut Scan, dra
         display: draft.display,
         usable: true,
         reason: None,
+        currency: None,
         amount_text: draft.amount_text,
         period_start: draft.period_start,
         period_end: draft.period_end,
@@ -1636,6 +1746,7 @@ fn push_ambiguous(
         display: String::new(),
         usable: false,
         reason: Some("ambiguous_association"),
+        currency: None,
         amount_text: None,
         period_start: None,
         period_end: None,

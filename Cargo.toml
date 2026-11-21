@@ -10,10 +10,15 @@ description = "SubVault local-first preservation & static extraction core (Forma
 name = "subvault"
 path = "src/main.rs"
 
+[[bin]]
+name = "subvault-app"
+path = "src/bin/subvault_app.rs"
+
 [dependencies]
 argon2 = "0.5"
 base64 = "0.22"
 chacha20poly1305 = "0.10"
+encoding_rs = "0.8"
 hkdf = "0.12"
 hmac = "0.12"
 html-escape = "=0.2.13"

@@ -162,7 +162,7 @@ fn stated_value(draft: &StatedDraft<'_>) -> Result<Map<String, Value>, Fail> {
                     Fail::new(EXIT_RECOVERY, "RecoveryRequired", "amount_text_unreadable")
                         .extra("new_effect", json!(false))
                 })?;
-            let currency = draft
+            let currency_raw = draft
                 .value
                 .get("currency")
                 .and_then(|item| item.as_str())
@@ -170,13 +170,13 @@ fn stated_value(draft: &StatedDraft<'_>) -> Result<Map<String, Value>, Fail> {
                     Fail::new(EXIT_RECOVERY, "RecoveryRequired", "currency_unreadable")
                         .extra("new_effect", json!(false))
                 })?;
-            if currency != "USD" {
+            let Some(currency) = crate::real_extract::normalize_currency(currency_raw) else {
                 return Err(
                     Fail::new(EXIT_RECOVERY, "RecoveryRequired", "currency_unreadable")
                         .extra("new_effect", json!(false)),
                 );
-            }
-            value.insert("currency".into(), json!("USD"));
+            };
+            value.insert("currency".into(), json!(currency));
             value.insert("amount_text".into(), json!(amount));
         }
         "stated_service_period" => {
@@ -554,9 +554,386 @@ pub struct CorrectRequest {
     pub fact_id: String,
     pub expected_revision: String,
     pub amount_text: String,
+    pub currency: Option<String>,
     pub actor_id: String,
     pub auth: AuthInput,
     pub hooks: super::Hooks,
+}
+
+pub struct ManualFactRequest {
+    pub vault: PathBuf,
+    pub command_id: String,
+    pub source_id: String,
+    pub currency: Option<String>,
+    pub amount_text: Option<String>,
+    pub period_start: Option<String>,
+    pub period_end: Option<String>,
+    pub actor_id: String,
+    pub auth: AuthInput,
+}
+
+pub fn record_manual_fact(req: ManualFactRequest) -> Report {
+    match record_manual_inner(req) {
+        Ok(body) => Report {
+            code: EXIT_OK,
+            body,
+        },
+        Err(fail) => super::note_uncommitted(fail).into_report(),
+    }
+}
+
+fn record_manual_inner(req: ManualFactRequest) -> Result<Value, Fail> {
+    if !is_command_id(&req.command_id) {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_command_id"));
+    }
+    if !is_prefixed_id(&req.source_id, "src_") {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
+    }
+    let actor_id = human_actor(&req.actor_id)?;
+
+    let amount_pair = match (&req.amount_text, &req.currency) {
+        (Some(raw_amt), cur_opt) => {
+            let amt = crate::real_extract::normalize_amount_text(raw_amt)
+                .ok_or_else(|| rejected("amount_text_rejected"))?;
+            let cur_raw = cur_opt.as_deref().unwrap_or("USD");
+            let cur = crate::real_extract::normalize_currency(cur_raw)
+                .ok_or_else(|| Fail::new(EXIT_USAGE, "Usage", "bad_currency"))?;
+            Some((cur.to_string(), amt))
+        }
+        (None, _) => None,
+    };
+    let period_pair = match (&req.period_start, &req.period_end) {
+        (Some(s), Some(e)) => {
+            if !date_text(s) || !date_text(e) || s > e {
+                return Err(rejected("period_rejected"));
+            }
+            Some((s.clone(), e.clone()))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(Fail::new(
+                EXIT_USAGE,
+                "Usage",
+                "period_requires_both_bounds",
+            ))
+        }
+    };
+    if amount_pair.is_none() && period_pair.is_none() {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "manual_fact_empty"));
+    }
+
+    let session = super::open_real_session(&req.vault, &req.auth)?;
+    let source = store::source_by_id_with_cipher(&session.conn, &req.source_id, &session.cipher)
+        .map_err(|err| unseen_db(err, "source_lookup"))?
+        .ok_or_else(|| rejected("unknown_source"))?;
+
+    let tx = session
+        .conn
+        .unchecked_transaction()
+        .map_err(|err| db_fail(err, "begin"))?;
+
+    // Reuse an existing source_version if present, otherwise create a manual one.
+    let existing_sv: Option<String> = tx
+        .query_row(
+            "SELECT source_version_id FROM source_versions WHERE source_id = ?1 ORDER BY source_version_id LIMIT 1",
+            [&source.source_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| db_fail(err, "lookup_source_version"))?;
+
+    let source_version_id = if let Some(sv_id) = existing_sv {
+        sv_id
+    } else {
+        let sv_id = ids::random_id("sv_").map_err(|err| crate::model::io_fail(err, "random"))?;
+        let enc_hash = session
+            .cipher
+            .encrypt_field(
+                "source_versions",
+                &sv_id,
+                "content_sha256",
+                &source.content_sha256,
+            )
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_version"))?;
+        tx.execute(
+            "INSERT INTO source_versions(source_version_id, source_id, object_id, content_sha256, byte_length, media_type, role, eml) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'user_provided_manual', 0)",
+            params![
+                sv_id,
+                source.source_id,
+                source.object_id,
+                enc_hash,
+                source.byte_length,
+                source.media_type
+            ],
+        )
+        .map_err(|err| db_fail(err, "insert_version"))?;
+        sv_id
+    };
+
+    let run_id = ids::random_id("run_").map_err(|err| crate::model::io_fail(err, "random"))?;
+    let attempt_id = ids::random_id("att_").map_err(|err| crate::model::io_fail(err, "random"))?;
+    let logical_key_plain = format!("manual:{}:{}", source.source_id, req.command_id);
+    let stored_logical_key = session
+        .cipher
+        .dedup_key("extraction_runs.logical_key", &logical_key_plain);
+    tx.execute(
+        "INSERT INTO extraction_runs(run_id, logical_key, source_version_id, source_id, extractor, extractor_version, normalization, join_version, rules_version, config_json, status) VALUES (?1, ?2, ?3, ?4, 'subvault-manual', '1', 'manual-entry-1', 'manual-1', 'manual-record-1', '{}', 'succeeded')",
+        params![run_id, stored_logical_key, source_version_id, source.source_id],
+    )
+    .map_err(|err| db_fail(err, "insert_run"))?;
+    let detail_stored = session
+        .cipher
+        .encrypt_field(
+            "extraction_attempts",
+            &attempt_id,
+            "detail_json",
+            "{\"extraction\":\"manual\"}",
+        )
+        .map_err(|err| cipher_tamper_fail(err, "encrypt_attempt"))?;
+    tx.execute(
+        "INSERT INTO extraction_attempts(attempt_id, run_id, attempt_no, command_id, status, published, detail_json) VALUES (?1, ?2, 1, ?3, 'succeeded', 1, ?4)",
+        params![attempt_id, run_id, req.command_id, detail_stored],
+    )
+    .map_err(|err| db_fail(err, "insert_attempt"))?;
+
+    let mut recorded_facts: Vec<Value> = Vec::new();
+    let now = super::now_ms();
+    let mut ordinal = 0i64;
+
+    if let Some((cur, amt)) = amount_pair {
+        // Check whether a stated_amount_paid fact already exists for this source.
+        let existing_amt: Option<String> = tx
+            .query_row(
+                "SELECT fact_id FROM facts WHERE source_id = ?1 AND fact_type = 'stated_amount_paid' LIMIT 1",
+                [&source.source_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| db_fail(err, "lookup_fact"))?;
+        if existing_amt.is_some() {
+            return Err(rejected("amount_fact_already_exists"));
+        }
+        let cand_id =
+            ids::random_id("cand_").map_err(|err| crate::model::io_fail(err, "random"))?;
+        let fact_id =
+            ids::random_id("fact_").map_err(|err| crate::model::io_fail(err, "random"))?;
+        let dec_id = ids::random_id("dec_").map_err(|err| crate::model::io_fail(err, "random"))?;
+        let excerpt = format!("Manual entry: {cur} {amt}");
+        let mut val_map = Map::new();
+        val_map.insert("type".into(), json!("stated_amount_paid"));
+        val_map.insert("statement".into(), json!("user_entered"));
+        val_map.insert("payment_verified".into(), json!(false));
+        val_map.insert("purchase_id".into(), Value::Null);
+        val_map.insert("account_id".into(), Value::Null);
+        val_map.insert("observed_at".into(), Value::Null);
+        val_map.insert("time_status".into(), json!("unknown"));
+        val_map.insert("current_status".into(), json!("unknown"));
+        val_map.insert("currency".into(), json!(cur));
+        val_map.insert("amount_text".into(), json!(amt));
+        let val_json = Value::Object(val_map).to_string();
+        let loc_json = json!({
+            "kind": "manual_entry",
+            "source_version_id": source_version_id,
+            "content_sha256": source.content_sha256,
+            "actor_id": actor_id
+        })
+        .to_string();
+
+        let enc_excerpt = session
+            .cipher
+            .encrypt_field("candidates", &cand_id, "excerpt", &excerpt)
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+        let enc_cand_val = session
+            .cipher
+            .encrypt_field("candidates", &cand_id, "value_json", &val_json)
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+        let enc_loc = session
+            .cipher
+            .encrypt_field("candidates", &cand_id, "locator_json", &loc_json)
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+        tx.execute(
+            "INSERT INTO candidates(candidate_id, run_id, attempt_id, source_version_id, ordinal, kind, usable, excerpt, value_json, locator_json, adopted) VALUES (?1, ?2, ?3, ?4, ?5, 'stated_amount_paid', 1, ?6, ?7, ?8, 0)",
+            params![cand_id, run_id, attempt_id, source_version_id, ordinal, enc_excerpt, enc_cand_val, enc_loc],
+        )
+        .map_err(|err| db_fail(err, "insert_candidate"))?;
+        ordinal += 1;
+
+        let enc_fact_val = session
+            .cipher
+            .encrypt_field("facts", &fact_id, "value_json", &val_json)
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_fact"))?;
+        tx.execute(
+            "INSERT INTO facts(fact_id, source_id, source_version_id, run_id, candidate_id, fact_type, value_json, revision) VALUES (?1, ?2, ?3, ?4, ?5, 'stated_amount_paid', ?6, 1)",
+            params![fact_id, source.source_id, source_version_id, run_id, cand_id, enc_fact_val],
+        )
+        .map_err(|err| db_fail(err, "insert_fact"))?;
+
+        let enc_dec_val = session
+            .cipher
+            .encrypt_field("decisions", &dec_id, "new_value_json", &val_json)
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_decision"))?;
+        tx.execute(
+            "INSERT INTO decisions(decision_id, fact_id, command_id, candidate_id, slot, kind, actor_kind, actor_id, recorded_at, rule_version, prior_value_json, new_value_json, target_decision_id) VALUES (?1, ?2, ?3, ?4, 'stated_amount_paid', 'human_record', 'human', ?5, ?6, NULL, NULL, ?7, NULL)",
+            params![dec_id, fact_id, req.command_id, cand_id, actor_id, now, enc_dec_val],
+        )
+        .map_err(|err| db_fail(err, "insert_decision"))?;
+
+        recorded_facts.push(json!({
+            "fact_id": fact_id,
+            "decision_id": dec_id,
+            "candidate_id": cand_id,
+            "fact_type": "stated_amount_paid",
+            "currency": cur,
+            "amount_text": amt,
+            "revision": 1
+        }));
+    }
+
+    if let Some((start, end)) = period_pair {
+        let existing_period: Option<(String, i64, String, String)> = tx
+            .query_row(
+                "SELECT fact_id, revision, candidate_id, value_json FROM facts WHERE source_id = ?1 AND fact_type = 'stated_service_period' LIMIT 1",
+                [&source.source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|err| db_fail(err, "lookup_fact"))?;
+
+        if let Some((fact_id, rev, cand_id, stored_old)) = existing_period {
+            let old_plain = session
+                .cipher
+                .decrypt_field("facts", &fact_id, "value_json", &stored_old)
+                .map_err(|err| cipher_tamper_fail(err, "decrypt_fact"))?;
+            let mut val_map = serde_json::from_str::<Value>(&old_plain)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            val_map.insert("period_start".into(), json!(start));
+            val_map.insert("period_end".into(), json!(end));
+            val_map.insert("statement".into(), json!("user_entered"));
+            let new_json = Value::Object(val_map).to_string();
+            let dec_id =
+                ids::random_id("dec_").map_err(|err| crate::model::io_fail(err, "random"))?;
+            let enc_prior = session
+                .cipher
+                .encrypt_field("decisions", &dec_id, "prior_value_json", &old_plain)
+                .map_err(|err| cipher_tamper_fail(err, "encrypt_decision"))?;
+            let enc_new = session
+                .cipher
+                .encrypt_field("decisions", &dec_id, "new_value_json", &new_json)
+                .map_err(|err| cipher_tamper_fail(err, "encrypt_decision"))?;
+            tx.execute(
+                "INSERT INTO decisions(decision_id, fact_id, command_id, candidate_id, slot, kind, actor_kind, actor_id, recorded_at, rule_version, prior_value_json, new_value_json, target_decision_id) VALUES (?1, ?2, ?3, ?4, 'stated_service_period', 'human_correct', 'human', ?5, ?6, NULL, ?7, ?8, NULL)",
+                params![dec_id, fact_id, req.command_id, cand_id, actor_id, now, enc_prior, enc_new],
+            )
+            .map_err(|err| db_fail(err, "insert_decision"))?;
+            let enc_fact = session
+                .cipher
+                .encrypt_field("facts", &fact_id, "value_json", &new_json)
+                .map_err(|err| cipher_tamper_fail(err, "encrypt_fact"))?;
+            tx.execute(
+                "UPDATE facts SET value_json = ?2, revision = ?3 WHERE fact_id = ?1",
+                params![fact_id, enc_fact, rev + 1],
+            )
+            .map_err(|err| db_fail(err, "update_fact"))?;
+            recorded_facts.push(json!({
+                "fact_id": fact_id,
+                "decision_id": dec_id,
+                "candidate_id": cand_id,
+                "fact_type": "stated_service_period",
+                "period_start": start,
+                "period_end": end,
+                "revision": rev + 1
+            }));
+        } else {
+            let cand_id =
+                ids::random_id("cand_").map_err(|err| crate::model::io_fail(err, "random"))?;
+            let fact_id =
+                ids::random_id("fact_").map_err(|err| crate::model::io_fail(err, "random"))?;
+            let dec_id =
+                ids::random_id("dec_").map_err(|err| crate::model::io_fail(err, "random"))?;
+            let excerpt = format!("Manual period: {start} through {end}");
+            let mut val_map = Map::new();
+            val_map.insert("type".into(), json!("stated_service_period"));
+            val_map.insert("statement".into(), json!("user_entered"));
+            val_map.insert("payment_verified".into(), json!(false));
+            val_map.insert("purchase_id".into(), Value::Null);
+            val_map.insert("account_id".into(), Value::Null);
+            val_map.insert("observed_at".into(), Value::Null);
+            val_map.insert("time_status".into(), json!("unknown"));
+            val_map.insert("current_status".into(), json!("unknown"));
+            val_map.insert("period_start".into(), json!(start));
+            val_map.insert("period_end".into(), json!(end));
+            let val_json = Value::Object(val_map).to_string();
+            let loc_json = json!({
+                "kind": "manual_entry",
+                "source_version_id": source_version_id,
+                "content_sha256": source.content_sha256,
+                "actor_id": actor_id
+            })
+            .to_string();
+
+            let enc_excerpt = session
+                .cipher
+                .encrypt_field("candidates", &cand_id, "excerpt", &excerpt)
+                .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+            let enc_cand_val = session
+                .cipher
+                .encrypt_field("candidates", &cand_id, "value_json", &val_json)
+                .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+            let enc_loc = session
+                .cipher
+                .encrypt_field("candidates", &cand_id, "locator_json", &loc_json)
+                .map_err(|err| cipher_tamper_fail(err, "encrypt_candidate"))?;
+            tx.execute(
+                "INSERT INTO candidates(candidate_id, run_id, attempt_id, source_version_id, ordinal, kind, usable, excerpt, value_json, locator_json, adopted) VALUES (?1, ?2, ?3, ?4, ?5, 'stated_service_period', 1, ?6, ?7, ?8, 0)",
+                params![cand_id, run_id, attempt_id, source_version_id, ordinal, enc_excerpt, enc_cand_val, enc_loc],
+            )
+            .map_err(|err| db_fail(err, "insert_candidate"))?;
+
+            let enc_fact_val = session
+                .cipher
+                .encrypt_field("facts", &fact_id, "value_json", &val_json)
+                .map_err(|err| cipher_tamper_fail(err, "encrypt_fact"))?;
+            tx.execute(
+                "INSERT INTO facts(fact_id, source_id, source_version_id, run_id, candidate_id, fact_type, value_json, revision) VALUES (?1, ?2, ?3, ?4, ?5, 'stated_service_period', ?6, 1)",
+                params![fact_id, source.source_id, source_version_id, run_id, cand_id, enc_fact_val],
+            )
+            .map_err(|err| db_fail(err, "insert_fact"))?;
+
+            let enc_dec_val = session
+                .cipher
+                .encrypt_field("decisions", &dec_id, "new_value_json", &val_json)
+                .map_err(|err| cipher_tamper_fail(err, "encrypt_decision"))?;
+            tx.execute(
+                "INSERT INTO decisions(decision_id, fact_id, command_id, candidate_id, slot, kind, actor_kind, actor_id, recorded_at, rule_version, prior_value_json, new_value_json, target_decision_id) VALUES (?1, ?2, ?3, ?4, 'stated_service_period', 'human_record', 'human', ?5, ?6, NULL, NULL, ?7, NULL)",
+                params![dec_id, fact_id, req.command_id, cand_id, actor_id, now, enc_dec_val],
+            )
+            .map_err(|err| db_fail(err, "insert_decision"))?;
+
+            recorded_facts.push(json!({
+                "fact_id": fact_id,
+                "decision_id": dec_id,
+                "candidate_id": cand_id,
+                "fact_type": "stated_service_period",
+                "period_start": start,
+                "period_end": end,
+                "revision": 1
+            }));
+        }
+    }
+
+    tx.commit().map_err(|err| db_fail(err, "commit"))?;
+    let _ = store::checkpoint(&session.conn);
+
+    let mut body = honesty("Committed");
+    body.insert("slice".into(), json!("M4-real"));
+    body.insert("command_id".into(), json!(req.command_id));
+    body.insert("source_id".into(), json!(source.source_id));
+    body.insert("facts".into(), Value::Array(recorded_facts));
+    body.insert("new_effect".into(), json!(true));
+    apply_format_honesty(&mut body, session.vault_format, session.protection);
+    Ok(Value::Object(body))
 }
 
 pub struct UndoRequest {
@@ -608,15 +985,38 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
         return Err(rejected("amount_text_rejected"));
     }
     let actor_id = human_actor(&req.actor_id)?;
-    let canonical = correct_canonical(
-        &req.fact_id,
-        &req.expected_revision,
-        &req.amount_text,
-        &actor_id,
-    );
+    let requested_currency = match &req.currency {
+        Some(raw) => Some(
+            crate::real_extract::normalize_currency(raw)
+                .ok_or_else(|| Fail::new(EXIT_USAGE, "Usage", "bad_currency"))?
+                .to_string(),
+        ),
+        None => None,
+    };
     require_decision_vault(&req.vault)?;
     let session = super::open_session_with_auth(&req.vault, &req.auth)?;
     require_fact_tables(&session.conn)?;
+    if let Some(ref cur) = requested_currency {
+        if session.vault_format < 6 && cur != "USD" {
+            return Err(rejected("currency_requires_format_6"));
+        }
+    }
+    let existing_currency = load_fact(&session.conn, &req.fact_id, &session.cipher)?
+        .and_then(|f| {
+            f.value
+                .get("currency")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "USD".to_string());
+    let effective_currency = requested_currency.unwrap_or(existing_currency);
+    let canonical = correct_canonical(
+        &req.fact_id,
+        &req.expected_revision,
+        &effective_currency,
+        &req.amount_text,
+        &actor_id,
+    );
     let mut hooks = super::HookRun::new(req.hooks);
     injected_receipt_read(&hooks)?;
     if let Some(body) = take_committed(&session, &req.command_id, &canonical)? {
@@ -659,6 +1059,7 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
         return Err(rejected("command_race"));
     }
     let mut value = fact.value.clone();
+    value.insert("currency".into(), json!(effective_currency));
     value.insert("amount_text".into(), json!(req.amount_text));
     let new_json = Value::Object(value).to_string();
     let decision_id = ids::random_id("dec_").map_err(|err| crate::model::io_fail(err, "random"))?;
@@ -704,7 +1105,7 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
     );
     body.insert("decision_id".into(), json!(decision_id));
     body.insert("amount_text".into(), json!(req.amount_text));
-    body.insert("currency".into(), json!("USD"));
+    body.insert("currency".into(), json!(effective_currency));
     body.insert("actor_kind".into(), json!("human"));
     body.insert("actor_id".into(), json!(actor_id));
     body.insert("target_decision_id".into(), Value::Null);
@@ -888,9 +1289,15 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
     )
 }
 
-fn correct_canonical(fact_id: &str, revision: &str, amount: &str, actor_id: &str) -> String {
+fn correct_canonical(
+    fact_id: &str,
+    revision: &str,
+    currency: &str,
+    amount: &str,
+    actor_id: &str,
+) -> String {
     format!(
-        "{PAYLOAD_VERSION}\ncorrect\nfact_id={fact_id}\nexpected_revision={revision}\ncurrency=USD\namount_text={amount}\nactor_id={actor_id}\n"
+        "{PAYLOAD_VERSION}\ncorrect\nfact_id={fact_id}\nexpected_revision={revision}\ncurrency={currency}\namount_text={amount}\nactor_id={actor_id}\n"
     )
 }
 
@@ -1357,7 +1764,12 @@ fn unknown_value(fact: &FactHead) -> Value {
     value.insert("time_status".into(), json!("unknown"));
     value.insert("current_status".into(), json!("unknown"));
     if fact.fact_type == "stated_amount_paid" {
-        value.insert("currency".into(), json!("USD"));
+        let cur = fact
+            .value
+            .get("currency")
+            .and_then(Value::as_str)
+            .unwrap_or("USD");
+        value.insert("currency".into(), json!(cur));
         value.insert("amount_text".into(), Value::Null);
     } else {
         value.insert("period_start".into(), Value::Null);

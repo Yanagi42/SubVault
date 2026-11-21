@@ -843,6 +843,28 @@ fn load_snapshot(
     records_map.insert("candidates".into(), array_or_null(candidate_json));
     records_map.insert("facts".into(), array_or_null(fact_json));
     records_map.insert("decisions".into(), array_or_null(decision_json));
+    if vault_format >= 6 {
+        let annotations = store::list_annotations_with_cipher(conn, cipher)
+            .map_err(|err| read_err(err, "list_annotations"))?;
+        let ann_json: Vec<Value> = annotations
+            .into_iter()
+            .map(|a| {
+                json!({
+                    "source_id": a.source_id,
+                    "vendor": a.vendor,
+                    "plan_name": a.plan_name,
+                    "account_label": a.account_label,
+                    "billing_cycle": a.billing_cycle,
+                    "category": a.category,
+                    "bill_date": a.bill_date,
+                    "notes": a.notes,
+                    "user_edited": a.user_edited,
+                    "updated_at": a.updated_at
+                })
+            })
+            .collect();
+        records_map.insert("annotations".into(), Value::Array(ann_json));
+    }
     let records = Value::Object(records_map);
     Ok(Loaded {
         vault_format,
@@ -1259,7 +1281,10 @@ fn check_chains(facts: &[FactRow], decisions: &[DecisionRow]) -> Result<(), Fail
         if chain.is_empty() || chain.len() as i64 != fact.revision {
             return Err(chain_fail(&fact.fact_id));
         }
-        if chain[0].kind != "rule_adopt" || !chain[0].prior.is_null() || chain[0].target.is_some() {
+        if chain[0].kind != "rule_adopt" && chain[0].kind != "human_record" {
+            return Err(chain_fail(&fact.fact_id));
+        }
+        if !chain[0].prior.is_null() || chain[0].target.is_some() {
             return Err(chain_fail(&fact.fact_id));
         }
         if chain.last().unwrap().new_value != fact.value {
@@ -1270,7 +1295,7 @@ fn check_chains(facts: &[FactRow], decisions: &[DecisionRow]) -> Result<(), Fail
                 return Err(chain_fail(&fact.fact_id));
             }
             match decision.kind.as_str() {
-                "rule_adopt" => {
+                "rule_adopt" | "human_record" => {
                     if index != 0 {
                         return Err(chain_fail(&fact.fact_id));
                     }
@@ -1292,7 +1317,8 @@ fn check_chains(facts: &[FactRow], decisions: &[DecisionRow]) -> Result<(), Fail
                         return Err(chain_fail(&fact.fact_id));
                     }
                     let expected = if chain[pos].prior.is_null() {
-                        unknown_value(&fact.fact_type)
+                        let cur = chain[0].new_value.get("currency").and_then(Value::as_str);
+                        unknown_value(&fact.fact_type, cur)
                     } else {
                         chain[pos].prior.clone()
                     };
@@ -1307,7 +1333,7 @@ fn check_chains(facts: &[FactRow], decisions: &[DecisionRow]) -> Result<(), Fail
     Ok(())
 }
 
-fn unknown_value(fact_type: &str) -> Value {
+fn unknown_value(fact_type: &str, currency: Option<&str>) -> Value {
     let mut value = serde_json::Map::new();
     value.insert("type".into(), json!(fact_type));
     value.insert("statement".into(), json!("unknown"));
@@ -1318,7 +1344,7 @@ fn unknown_value(fact_type: &str) -> Value {
     value.insert("time_status".into(), json!("unknown"));
     value.insert("current_status".into(), json!("unknown"));
     if fact_type == "stated_amount_paid" {
-        value.insert("currency".into(), json!("USD"));
+        value.insert("currency".into(), json!(currency.unwrap_or("USD")));
         value.insert("amount_text".into(), Value::Null);
     } else {
         value.insert("period_start".into(), Value::Null);

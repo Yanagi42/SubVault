@@ -204,7 +204,7 @@ pub fn init_real_schema(
 ) -> rusqlite::Result<()> {
     conn.execute_batch(REAL_SCHEMA)?;
     conn.execute_batch(REAL_BODY_DDL)?;
-    conn.execute_batch(FACT_DDL)?;
+    conn.execute_batch(REAL_FACT_DDL)?;
     conn.execute_batch("PRAGMA user_version = 6;")?;
     let meta = [
         ("schema_version", "1"),
@@ -1044,7 +1044,8 @@ CREATE TABLE candidates (
 );
 "#;
 
-/// Format 6 only. Accepts static text-PDF, static HTML, and text fragments in one real-data vault.
+/// Format 6 only. Accepts static text-PDF, static HTML, text fragments, CSV statements,
+/// and manual entries in one real-data vault, plus encrypted user annotations.
 pub const REAL_BODY_DDL: &str = r#"
 CREATE TABLE source_versions (
     source_version_id TEXT PRIMARY KEY,
@@ -1053,7 +1054,7 @@ CREATE TABLE source_versions (
     content_sha256 TEXT NOT NULL,
     byte_length INTEGER NOT NULL,
     media_type TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('user_provided_pdf', 'user_provided_html', 'user_provided_fragment')),
+    role TEXT NOT NULL CHECK (role IN ('user_provided_pdf', 'user_provided_html', 'user_provided_fragment', 'user_provided_csv', 'user_provided_manual')),
     eml INTEGER NOT NULL CHECK (eml = 0)
 );
 CREATE TABLE extraction_runs (
@@ -1093,7 +1094,335 @@ CREATE TABLE candidates (
     adopted INTEGER NOT NULL CHECK (adopted = 0),
     UNIQUE (run_id, ordinal)
 );
+CREATE TABLE source_annotations (
+    source_id TEXT PRIMARY KEY REFERENCES sources(source_id),
+    vendor TEXT,
+    plan_name TEXT,
+    account_label TEXT,
+    billing_cycle TEXT NOT NULL DEFAULT 'unknown',
+    category TEXT,
+    bill_date TEXT,
+    notes TEXT,
+    user_edited INTEGER NOT NULL DEFAULT 0 CHECK (user_edited IN (0, 1)),
+    updated_at INTEGER NOT NULL
+);
 "#;
+
+/// Format 6 only. Extends `FACT_DDL` with `human_record` for user-entered facts on
+/// scanned PDFs, receipt images, and promoted CSV transactions while keeping
+/// Formats 3-5 strictly unchanged.
+pub const REAL_FACT_DDL: &str = r#"
+CREATE TABLE facts (
+    fact_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES sources(source_id),
+    source_version_id TEXT NOT NULL REFERENCES source_versions(source_version_id),
+    run_id TEXT NOT NULL REFERENCES extraction_runs(run_id),
+    candidate_id TEXT NOT NULL REFERENCES candidates(candidate_id),
+    fact_type TEXT NOT NULL CHECK (fact_type IN ('stated_amount_paid', 'stated_service_period')),
+    value_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    UNIQUE (candidate_id, fact_type)
+);
+CREATE TABLE decisions (
+    decision_id TEXT PRIMARY KEY,
+    fact_id TEXT NOT NULL REFERENCES facts(fact_id),
+    command_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL REFERENCES candidates(candidate_id),
+    slot TEXT NOT NULL CHECK (slot IN ('stated_amount_paid', 'stated_service_period')),
+    kind TEXT NOT NULL CHECK (kind IN ('rule_adopt', 'human_record', 'human_correct', 'undo')),
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('rule', 'human')),
+    actor_id TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL,
+    rule_version TEXT,
+    prior_value_json TEXT,
+    new_value_json TEXT NOT NULL,
+    target_decision_id TEXT REFERENCES decisions(decision_id),
+    CHECK (
+        (kind = 'rule_adopt' AND actor_kind = 'rule' AND rule_version IS NOT NULL
+            AND target_decision_id IS NULL AND prior_value_json IS NULL)
+        OR (kind = 'human_record' AND actor_kind = 'human' AND rule_version IS NULL
+            AND target_decision_id IS NULL AND prior_value_json IS NULL)
+        OR (kind = 'human_correct' AND actor_kind = 'human' AND rule_version IS NULL
+            AND target_decision_id IS NULL AND prior_value_json IS NOT NULL)
+        OR (kind = 'undo' AND actor_kind = 'human' AND rule_version IS NULL
+            AND target_decision_id IS NOT NULL AND prior_value_json IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX decisions_command_candidate_slot
+    ON decisions(command_id, candidate_id, slot);
+CREATE INDEX decisions_fact ON decisions(fact_id);
+CREATE TABLE t3_receipts (
+    command_id TEXT PRIMARY KEY,
+    payload_version TEXT NOT NULL CHECK (payload_version = 't3-payload-1'),
+    canonical_payload TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+);
+"#;
+
+#[derive(Clone, Debug, Default)]
+pub struct SourceAnnotation {
+    pub source_id: String,
+    pub vendor: Option<String>,
+    pub plan_name: Option<String>,
+    pub account_label: Option<String>,
+    pub billing_cycle: String,
+    pub category: Option<String>,
+    pub bill_date: Option<String>,
+    pub notes: Option<String>,
+    pub user_edited: bool,
+    pub updated_at: i64,
+}
+
+pub fn upsert_annotation_with_cipher(
+    conn: &Connection,
+    ann: &SourceAnnotation,
+    cipher: &VaultCipher,
+) -> rusqlite::Result<()> {
+    let enc_vendor = cipher
+        .encrypt_opt_field(
+            "source_annotations",
+            &ann.source_id,
+            "vendor",
+            ann.vendor.as_deref(),
+        )
+        .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
+    let enc_plan = cipher
+        .encrypt_opt_field(
+            "source_annotations",
+            &ann.source_id,
+            "plan_name",
+            ann.plan_name.as_deref(),
+        )
+        .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
+    let enc_account = cipher
+        .encrypt_opt_field(
+            "source_annotations",
+            &ann.source_id,
+            "account_label",
+            ann.account_label.as_deref(),
+        )
+        .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
+    let enc_category = cipher
+        .encrypt_opt_field(
+            "source_annotations",
+            &ann.source_id,
+            "category",
+            ann.category.as_deref(),
+        )
+        .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
+    let enc_bill_date = cipher
+        .encrypt_opt_field(
+            "source_annotations",
+            &ann.source_id,
+            "bill_date",
+            ann.bill_date.as_deref(),
+        )
+        .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
+    let enc_notes = cipher
+        .encrypt_opt_field(
+            "source_annotations",
+            &ann.source_id,
+            "notes",
+            ann.notes.as_deref(),
+        )
+        .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
+    let cycle = if ann.billing_cycle.is_empty() {
+        "unknown"
+    } else {
+        ann.billing_cycle.as_str()
+    };
+    conn.execute(
+        "INSERT INTO source_annotations(source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+         ON CONFLICT(source_id) DO UPDATE SET \
+           vendor = excluded.vendor, \
+           plan_name = excluded.plan_name, \
+           account_label = excluded.account_label, \
+           billing_cycle = excluded.billing_cycle, \
+           category = excluded.category, \
+           bill_date = excluded.bill_date, \
+           notes = excluded.notes, \
+           user_edited = excluded.user_edited, \
+           updated_at = excluded.updated_at",
+        params![
+            ann.source_id,
+            enc_vendor,
+            enc_plan,
+            enc_account,
+            cycle,
+            enc_category,
+            enc_bill_date,
+            enc_notes,
+            if ann.user_edited { 1 } else { 0 },
+            ann.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn seed_annotation_hints_with_cipher(
+    conn: &Connection,
+    source_id: &str,
+    hints: &crate::real_extract::ExtractedHints,
+    now_ms: i64,
+    cipher: &VaultCipher,
+) -> rusqlite::Result<()> {
+    if hints.is_empty() || !table_exists(conn, "source_annotations")? {
+        return Ok(());
+    }
+    if let Some(existing) = get_annotation_with_cipher(conn, source_id, cipher)? {
+        if existing.user_edited {
+            return Ok(());
+        }
+    }
+    let ann = SourceAnnotation {
+        source_id: source_id.to_string(),
+        vendor: hints.vendor.clone(),
+        plan_name: hints.plan_name.clone(),
+        account_label: hints.account_label.clone(),
+        billing_cycle: hints
+            .billing_cycle
+            .clone()
+            .unwrap_or_else(|| "unknown".into()),
+        category: hints.category.clone(),
+        bill_date: hints.bill_date.clone(),
+        notes: None,
+        user_edited: false,
+        updated_at: now_ms,
+    };
+    upsert_annotation_with_cipher(conn, &ann, cipher)
+}
+
+pub fn get_annotation_with_cipher(
+    conn: &Connection,
+    source_id: &str,
+    cipher: &VaultCipher,
+) -> rusqlite::Result<Option<SourceAnnotation>> {
+    if !table_exists(conn, "source_annotations")? {
+        return Ok(None);
+    }
+    let row = conn
+        .query_row(
+            "SELECT source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at \
+             FROM source_annotations WHERE source_id = ?1",
+            [source_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some(raw) => Ok(Some(decrypt_annotation_row(raw, cipher)?)),
+    }
+}
+
+pub fn list_annotations_with_cipher(
+    conn: &Connection,
+    cipher: &VaultCipher,
+) -> rusqlite::Result<Vec<SourceAnnotation>> {
+    if !table_exists(conn, "source_annotations")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at \
+         FROM source_annotations ORDER BY source_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(9)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for item in rows {
+        out.push(decrypt_annotation_row(item?, cipher)?);
+    }
+    Ok(out)
+}
+
+#[allow(clippy::type_complexity)]
+fn decrypt_annotation_row(
+    raw: (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+    ),
+    cipher: &VaultCipher,
+) -> rusqlite::Result<SourceAnnotation> {
+    let source_id = raw.0;
+    Ok(SourceAnnotation {
+        vendor: cipher
+            .decrypt_opt_field("source_annotations", &source_id, "vendor", raw.1.as_deref())
+            .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
+        plan_name: cipher
+            .decrypt_opt_field(
+                "source_annotations",
+                &source_id,
+                "plan_name",
+                raw.2.as_deref(),
+            )
+            .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
+        account_label: cipher
+            .decrypt_opt_field(
+                "source_annotations",
+                &source_id,
+                "account_label",
+                raw.3.as_deref(),
+            )
+            .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
+        billing_cycle: raw.4,
+        category: cipher
+            .decrypt_opt_field(
+                "source_annotations",
+                &source_id,
+                "category",
+                raw.5.as_deref(),
+            )
+            .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
+        bill_date: cipher
+            .decrypt_opt_field(
+                "source_annotations",
+                &source_id,
+                "bill_date",
+                raw.6.as_deref(),
+            )
+            .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
+        notes: cipher
+            .decrypt_opt_field("source_annotations", &source_id, "notes", raw.7.as_deref())
+            .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
+        user_edited: raw.8 != 0,
+        updated_at: raw.9,
+        source_id,
+    })
+}
 
 pub fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     conn.query_row(

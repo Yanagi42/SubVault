@@ -13,12 +13,14 @@ mod lockfile;
 mod model;
 mod pdf_parse;
 mod platform;
+mod real_extract;
 mod store;
 mod verify_package;
 #[cfg(windows)]
 mod windows_file_id;
 #[cfg(windows)]
 mod windows_lock;
+pub mod workbench;
 
 pub use model::EXIT_UNCERTAIN;
 

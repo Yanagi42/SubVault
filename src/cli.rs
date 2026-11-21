@@ -41,10 +41,22 @@ struct Flags {
     decision_id: Option<String>,
     expected_revision: Option<String>,
     amount_text: Option<String>,
+    currency: Option<String>,
+    period_start: Option<String>,
+    period_end: Option<String>,
+    vendor: Option<String>,
+    plan_name: Option<String>,
+    account_label: Option<String>,
+    billing_cycle: Option<String>,
+    category: Option<String>,
+    bill_date: Option<String>,
+    notes: Option<String>,
     actor_id: Option<String>,
     allow_partial: Option<bool>,
     package: Option<PathBuf>,
     redact_terms: Vec<String>,
+    port: Option<u16>,
+    no_browser: bool,
 }
 
 impl Flags {
@@ -81,10 +93,22 @@ impl Flags {
             decision_id: None,
             expected_revision: None,
             amount_text: None,
+            currency: None,
+            period_start: None,
+            period_end: None,
+            vendor: None,
+            plan_name: None,
+            account_label: None,
+            billing_cycle: None,
+            category: None,
+            bill_date: None,
+            notes: None,
             actor_id: None,
             allow_partial: None,
             package: None,
             redact_terms: Vec::new(),
+            port: None,
+            no_browser: false,
         }
     }
 
@@ -94,6 +118,9 @@ impl Flags {
             passphrase_stdin: self.passphrase_stdin,
             recovery_key_file: self.recovery_key_file.clone(),
             recovery_key_stdin: self.recovery_key_stdin,
+            session_cipher: None,
+            direct_passphrase: None,
+            direct_recovery_key: None,
         }
     }
 }
@@ -175,11 +202,17 @@ pub fn execute(args: Vec<String>) -> Report {
                 new_passphrase: NewPassphraseInput {
                     file: flags.new_passphrase_file,
                     stdin: flags.new_passphrase_stdin,
+                    direct: None,
                 },
                 rotate_recovery_key: flags.rotate_recovery_key,
                 recovery_key_out: flags.recovery_key_out,
             })
         }
+        "app" => crate::workbench::run_cli_app(crate::workbench::WorkbenchOptions {
+            port: flags.port.unwrap_or(0),
+            open_browser: !flags.no_browser,
+            initial_vault: flags.vault,
+        }),
         "open" | "verify" | "recover" => {
             let Some(vault) = flags.vault else {
                 return usage("vault_required");
@@ -282,6 +315,59 @@ pub fn execute(args: Vec<String>) -> Report {
                 hooks,
             })
         }
+        "csv" => {
+            let (Some(vault), Some(command_id), Some(source)) =
+                (flags.vault, flags.command_id, flags.source)
+            else {
+                return usage("csv_required_flags");
+            };
+            engine::submit_csv(engine::CsvRequest {
+                vault,
+                command_id,
+                source,
+                batch_id: flags.batch_id,
+                auth,
+                hooks,
+            })
+        }
+        "annotate" => {
+            let (Some(vault), Some(source_id)) = (flags.vault, flags.source_id) else {
+                return usage("annotate_required_flags");
+            };
+            engine::annotate_source(engine::AnnotateRequest {
+                vault,
+                source_id,
+                vendor: flags.vendor,
+                plan_name: flags.plan_name,
+                account_label: flags.account_label,
+                billing_cycle: flags.billing_cycle,
+                category: flags.category,
+                bill_date: flags.bill_date,
+                notes: flags.notes,
+                auth,
+            })
+        }
+        "record-fact" => {
+            let (Some(vault), Some(command_id), Some(source_id), Some(actor_id)) = (
+                flags.vault,
+                flags.command_id,
+                flags.source_id,
+                flags.actor_id,
+            ) else {
+                return usage("record_fact_required_flags");
+            };
+            engine::record_manual_fact(engine::ManualFactRequest {
+                vault,
+                command_id,
+                source_id,
+                currency: flags.currency,
+                amount_text: flags.amount_text,
+                period_start: flags.period_start,
+                period_end: flags.period_end,
+                actor_id,
+                auth,
+            })
+        }
         "fragment" => {
             let (Some(vault), Some(command_id), Some(fragment)) =
                 (flags.vault, flags.command_id, flags.fragment)
@@ -372,6 +458,7 @@ pub fn execute(args: Vec<String>) -> Report {
                 fact_id,
                 expected_revision,
                 amount_text,
+                currency: flags.currency,
                 actor_id,
                 auth,
                 hooks,
@@ -449,6 +536,11 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
                 index += 1;
                 continue;
             }
+            "--no-browser" => {
+                flags.no_browser = true;
+                index += 1;
+                continue;
+            }
             "--passphrase" | "--recovery-key" | "--new-passphrase" => {
                 return Err(
                     Fail::new(EXIT_USAGE, "Usage", "passphrase_cli_arg_forbidden")
@@ -497,9 +589,26 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
             "--decision-id" => flags.decision_id = Some(value),
             "--expected-revision" => flags.expected_revision = Some(value),
             "--amount-text" => flags.amount_text = Some(value),
+            "--currency" => flags.currency = Some(value),
+            "--period-start" => flags.period_start = Some(value),
+            "--period-end" => flags.period_end = Some(value),
+            "--vendor" => flags.vendor = Some(value),
+            "--plan" => flags.plan_name = Some(value),
+            "--account" => flags.account_label = Some(value),
+            "--cycle" => flags.billing_cycle = Some(value),
+            "--category" => flags.category = Some(value),
+            "--bill-date" => flags.bill_date = Some(value),
+            "--notes" => flags.notes = Some(value),
             "--actor-id" => flags.actor_id = Some(value),
             "--package" => flags.package = Some(PathBuf::from(value)),
             "--redact-term" => flags.redact_terms.push(value),
+            "--port" => {
+                flags.port = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| Fail::new(EXIT_USAGE, "Usage", "bad_port"))?,
+                );
+            }
             "--passphrase-file" => flags.passphrase_file = Some(PathBuf::from(value)),
             "--recovery-key-file" => flags.recovery_key_file = Some(PathBuf::from(value)),
             "--recovery-key-out" => flags.recovery_key_out = Some(PathBuf::from(value)),

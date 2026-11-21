@@ -35,6 +35,8 @@ use crate::model::{
 };
 use crate::store::{self, CommandRow, ObjectRow, OccurrenceRow, SourceRow};
 
+#[path = "csv_ingest.rs"]
+mod csv_ingest;
 #[path = "decide.rs"]
 mod decide;
 #[path = "export.rs"]
@@ -50,7 +52,11 @@ mod redact;
 #[path = "review.rs"]
 mod review;
 
-pub use decide::{correct_fact, query_facts, undo_decision, CorrectRequest, UndoRequest};
+pub use csv_ingest::{submit_csv, CsvRequest};
+pub use decide::{
+    correct_fact, query_facts, record_manual_fact, undo_decision, CorrectRequest,
+    ManualFactRequest, UndoRequest,
+};
 pub use export::{export_copy, ExportRequest};
 pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
 pub use html::{submit_html, HtmlRequest};
@@ -112,7 +118,7 @@ pub enum InjectAction {
     IoError,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Hooks {
     pub stop_at: Option<String>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -292,13 +298,16 @@ pub fn help_report() -> Report {
             "fragment --vault PATH --command-id ID --fragment PATH [--batch-id ID]",
             "html --vault PATH --command-id ID --source PATH [--batch-id ID]",
             "pdf --vault PATH --command-id ID --source PATH [--batch-id ID]",
+            "csv --vault PATH --command-id ID --source PATH [--batch-id ID]",
+            "annotate --vault PATH --source-id ID [--vendor NAME] [--plan NAME] [--account LABEL] [--cycle monthly|yearly|quarterly|weekly|one_time|unknown] [--category NAME] [--bill-date YYYY-MM-DD] [--notes TEXT]",
+            "record-fact --vault PATH --command-id ID --source-id ID [--currency CODE --amount-text TEXT] [--period-start YYYY-MM-DD --period-end YYYY-MM-DD] --actor-id ID",
             "candidates --vault PATH [--source-id ID]",
             "facts --vault PATH [--source-id ID] [--fact-id ID]",
             "review --vault PATH --out PATH [--package PATH]",
             "export --vault PATH --out PATH [--allow-partial yes] [--acknowledge-plaintext yes]",
             "verify-package --package PATH",
             "redact (--source PATH | --vault PATH --source-id ID) --out PATH [--redact-term STR]...",
-            "correct --vault PATH --command-id ID --fact-id ID --expected-revision N --amount-text TEXT --actor-id ID",
+            "correct --vault PATH --command-id ID --fact-id ID --expected-revision N --amount-text TEXT [--currency CODE] --actor-id ID",
             "undo --vault PATH --command-id ID --decision-id ID --expected-revision N --actor-id ID",
             "cancel --vault PATH --command-id ID --generation N [--kind preservation|fragment|extraction]",
             "recover --vault PATH",
@@ -1418,6 +1427,210 @@ fn reopen_inner(path: &Path, auth: &AuthInput) -> Result<Report, Fail> {
         );
     }
     Ok(inspection)
+}
+
+pub struct AnnotateRequest {
+    pub vault: PathBuf,
+    pub source_id: String,
+    pub vendor: Option<String>,
+    pub plan_name: Option<String>,
+    pub account_label: Option<String>,
+    pub billing_cycle: Option<String>,
+    pub category: Option<String>,
+    pub bill_date: Option<String>,
+    pub notes: Option<String>,
+    pub auth: AuthInput,
+}
+
+pub fn annotate_source(req: AnnotateRequest) -> Report {
+    match annotate_inner(req) {
+        Ok(report) => report,
+        Err(fail) => note_uncommitted(fail).into_report(),
+    }
+}
+
+fn annotate_inner(req: AnnotateRequest) -> Result<Report, Fail> {
+    if !is_prefixed_id(&req.source_id, "src_") {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
+    }
+    if let Some(ref cycle) = req.billing_cycle {
+        if !matches!(
+            cycle.as_str(),
+            "monthly" | "yearly" | "quarterly" | "weekly" | "one_time" | "unknown"
+        ) {
+            return Err(Fail::new(EXIT_USAGE, "Usage", "bad_billing_cycle"));
+        }
+    }
+    if let Some(ref date) = req.bill_date {
+        if !date.is_empty() && crate::real_extract::parse_date_token(date).is_none() {
+            return Err(Fail::new(EXIT_USAGE, "Usage", "bad_bill_date"));
+        }
+    }
+    let session = open_real_session(&req.vault, &req.auth)?;
+    let _source = store::source_by_id_with_cipher(&session.conn, &req.source_id, &session.cipher)
+        .map_err(|err| unseen_db(err, "source_lookup"))?
+        .ok_or_else(|| {
+            Fail::new(EXIT_REJECTED, "Rejected", "unknown_source").extra("new_effect", json!(false))
+        })?;
+    let existing =
+        store::get_annotation_with_cipher(&session.conn, &req.source_id, &session.cipher)
+            .map_err(|err| unseen_db(err, "annotation_lookup"))?
+            .unwrap_or_else(|| store::SourceAnnotation {
+                source_id: req.source_id.clone(),
+                billing_cycle: "unknown".into(),
+                ..Default::default()
+            });
+
+    let clean_opt = |incoming: Option<String>, current: Option<String>| -> Option<String> {
+        match incoming {
+            Some(v) => {
+                let t = v.trim().to_string();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            }
+            None => current,
+        }
+    };
+    let clean_date = match req.bill_date {
+        Some(v) => {
+            let t = v.trim();
+            if t.is_empty() {
+                None
+            } else {
+                crate::real_extract::parse_date_token(t)
+            }
+        }
+        None => existing.bill_date,
+    };
+
+    let updated = store::SourceAnnotation {
+        source_id: req.source_id.clone(),
+        vendor: clean_opt(req.vendor, existing.vendor),
+        plan_name: clean_opt(req.plan_name, existing.plan_name),
+        account_label: clean_opt(req.account_label, existing.account_label),
+        billing_cycle: req.billing_cycle.unwrap_or(existing.billing_cycle),
+        category: clean_opt(req.category, existing.category),
+        bill_date: clean_date,
+        notes: clean_opt(req.notes, existing.notes),
+        user_edited: true,
+        updated_at: now_ms(),
+    };
+    let tx = session
+        .conn
+        .unchecked_transaction()
+        .map_err(|err| db_fail(err, "annotate_begin"))?;
+    store::upsert_annotation_with_cipher(&tx, &updated, &session.cipher)
+        .map_err(|err| db_fail(err, "upsert_annotation"))?;
+    tx.commit().map_err(|err| db_fail(err, "annotate_commit"))?;
+    let _ = store::checkpoint(&session.conn);
+
+    let mut body = honesty("Annotated");
+    body.insert("slice".into(), json!("M4-real"));
+    body.insert("source_id".into(), json!(updated.source_id));
+    body.insert(
+        "annotation".into(),
+        json!({
+            "source_id": updated.source_id,
+            "vendor": updated.vendor,
+            "plan_name": updated.plan_name,
+            "account_label": updated.account_label,
+            "billing_cycle": updated.billing_cycle,
+            "category": updated.category,
+            "bill_date": updated.bill_date,
+            "notes": updated.notes,
+            "user_edited": updated.user_edited,
+            "updated_at": updated.updated_at,
+        }),
+    );
+    body.insert("new_effect".into(), json!(true));
+    apply_format_honesty(&mut body, session.vault_format, session.protection);
+    Ok(Report {
+        code: EXIT_OK,
+        body: Value::Object(body),
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) struct UnlockedVault {
+    pub vault_id: String,
+    pub vault_format: i64,
+    pub protection: Option<ProtectionMode>,
+    pub cipher: VaultCipher,
+}
+
+#[allow(dead_code)]
+pub(crate) fn unlock_vault_session(path: &Path, auth: &AuthInput) -> Result<UnlockedVault, Fail> {
+    let session = open_real_session(path, auth)?;
+    let vault_id = store::meta(&session.conn, "vault_id")
+        .map_err(|err| unseen_db(err, "vault_id"))?
+        .unwrap_or_default();
+    Ok(UnlockedVault {
+        vault_id,
+        vault_format: session.vault_format,
+        protection: session.protection,
+        cipher: session.cipher,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn list_annotations(
+    path: &Path,
+    auth: &AuthInput,
+) -> Result<Vec<store::SourceAnnotation>, Fail> {
+    let session = open_session_with_auth(path, auth)?;
+    store::list_annotations_with_cipher(&session.conn, &session.cipher)
+        .map_err(|err| unseen_db(err, "list_annotations"))
+}
+
+#[allow(dead_code)]
+pub(crate) fn read_source_bytes(
+    path: &Path,
+    source_id: &str,
+    auth: &AuthInput,
+) -> Result<(Vec<u8>, String, String), Fail> {
+    if !is_prefixed_id(source_id, "src_") {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
+    }
+    let session = open_session_with_auth(path, auth)?;
+    let source = store::source_by_id_with_cipher(&session.conn, source_id, &session.cipher)
+        .map_err(|err| unseen_db(err, "source_lookup"))?
+        .ok_or_else(|| Fail::new(EXIT_REJECTED, "Rejected", "unknown_source"))?;
+    let Some(relpath) = canonical_object_relpath(&source.object_id) else {
+        return Err(Fail::new(
+            EXIT_RECOVERY,
+            "RecoveryRequired",
+            "object_id_rejected",
+        ));
+    };
+    let obj_path = session.root.join(&relpath);
+    let bytes = session
+        .cipher
+        .decrypt_object_to_vec(&source.object_id, &obj_path)
+        .map_err(|err| match err {
+            CryptoError::Io(io_err) => io_fail(io_err, "read_object"),
+            other => crate::model::cipher_tamper_fail(other, "decrypt_object"),
+        })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    if hex_encode(&hasher.finalize()) != source.content_sha256 {
+        return Err(Fail::new(
+            EXIT_RECOVERY,
+            "RecoveryRequired",
+            "hash_mismatch",
+        ));
+    }
+    let display_name = store::list_occurrences_with_cipher(&session.conn, &session.cipher)
+        .ok()
+        .and_then(|occs| {
+            occs.into_iter()
+                .find(|o| o.source_id == source.source_id)
+                .map(|o| o.display_name)
+        })
+        .unwrap_or_else(|| format!("{}.bin", source.source_id));
+    Ok((bytes, source.media_type, display_name))
 }
 
 pub fn rotate_passphrase(req: RotatePassphraseRequest) -> Report {
@@ -2753,6 +2966,24 @@ fn open_html_session(path: &Path, auth: &AuthInput) -> Result<Session, Fail> {
     finish_session(path, lock, magic, version, banner, auth)
 }
 
+fn open_real_session(path: &Path, auth: &AuthInput) -> Result<Session, Fail> {
+    let (magic, banner) = vault_shape(path)?;
+    let lock = acquire_writer_lock(path)?;
+    let version = match accept_wal_format_with_banner(&path.join("vault.db"), banner)? {
+        6 => 6,
+        version => {
+            return Err(
+                Fail::new(EXIT_VERSION, "VersionUnsupported", "requires_format_6")
+                    .extra("schema_version_found", json!(version))
+                    .extra("vault_format", json!(version))
+                    .extra("new_effect", json!(false))
+                    .extra("created_new_vault", json!(false)),
+            );
+        }
+    };
+    finish_session(path, lock, magic, version, banner, auth)
+}
+
 fn open_pdf_session(path: &Path, auth: &AuthInput) -> Result<Session, Fail> {
     let (magic, banner) = vault_shape(path)?;
     let lock = acquire_writer_lock(path)?;
@@ -2811,6 +3042,16 @@ fn unlock_cipher(
             Fail::new(EXIT_DAMAGED, "ReadOnlyDamaged", "missing_vault_id")
                 .extra("new_effect", json!(false))
         })?;
+    if let Some(ref cached) = auth.session_cipher {
+        if cached.keys().is_some_and(|k| k.vault_id() == vault_id) {
+            return Ok(cached.clone());
+        }
+        return Err(Fail::new(EXIT_AUTH, "AuthFailed", "session_vault_mismatch")
+            .extra("vault_format", json!(vault_format))
+            .extra("protection", json!(crypto::PROTECTION_PASSPHRASE))
+            .extra("synthetic_only", json!(false))
+            .extra("new_effect", json!(false)));
+    }
     let cred = map_cred_err(auth.resolve())?;
     let dek = match cred {
         Credential::None => {
