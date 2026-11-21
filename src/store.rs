@@ -1104,7 +1104,12 @@ CREATE TABLE source_annotations (
     bill_date TEXT,
     notes TEXT,
     user_edited INTEGER NOT NULL DEFAULT 0 CHECK (user_edited IN (0, 1)),
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    asset_kind TEXT NOT NULL DEFAULT 'general',
+    warranty_end TEXT,
+    license_key TEXT,
+    license_scope TEXT,
+    reimburse_status TEXT NOT NULL DEFAULT 'none'
 );
 "#;
 
@@ -1172,6 +1177,33 @@ pub struct SourceAnnotation {
     pub notes: Option<String>,
     pub user_edited: bool,
     pub updated_at: i64,
+    pub asset_kind: String,
+    pub warranty_end: Option<String>,
+    pub license_key: Option<String>,
+    pub license_scope: Option<String>,
+    pub reimburse_status: String,
+}
+
+fn annotation_has_asset_columns(conn: &Connection) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(source_annotations)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(cols.iter().any(|c| c == "asset_kind"))
+}
+
+pub fn ensure_annotation_asset_columns(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_exists(conn, "source_annotations")? || annotation_has_asset_columns(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "ALTER TABLE source_annotations ADD COLUMN asset_kind TEXT NOT NULL DEFAULT 'general';
+         ALTER TABLE source_annotations ADD COLUMN warranty_end TEXT;
+         ALTER TABLE source_annotations ADD COLUMN license_key TEXT;
+         ALTER TABLE source_annotations ADD COLUMN license_scope TEXT;
+         ALTER TABLE source_annotations ADD COLUMN reimburse_status TEXT NOT NULL DEFAULT 'none';",
+    )?;
+    Ok(())
 }
 
 pub fn upsert_annotation_with_cipher(
@@ -1179,6 +1211,7 @@ pub fn upsert_annotation_with_cipher(
     ann: &SourceAnnotation,
     cipher: &VaultCipher,
 ) -> rusqlite::Result<()> {
+    ensure_annotation_asset_columns(conn)?;
     let enc_vendor = cipher
         .encrypt_opt_field(
             "source_annotations",
@@ -1227,14 +1260,48 @@ pub fn upsert_annotation_with_cipher(
             ann.notes.as_deref(),
         )
         .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
+    let enc_warranty = cipher
+        .encrypt_opt_field(
+            "source_annotations",
+            &ann.source_id,
+            "warranty_end",
+            ann.warranty_end.as_deref(),
+        )
+        .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
+    let enc_license_key = cipher
+        .encrypt_opt_field(
+            "source_annotations",
+            &ann.source_id,
+            "license_key",
+            ann.license_key.as_deref(),
+        )
+        .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
+    let enc_license_scope = cipher
+        .encrypt_opt_field(
+            "source_annotations",
+            &ann.source_id,
+            "license_scope",
+            ann.license_scope.as_deref(),
+        )
+        .map_err(|err| cipher_tamper_sql_err(err.to_string()))?;
     let cycle = if ann.billing_cycle.is_empty() {
         "unknown"
     } else {
         ann.billing_cycle.as_str()
     };
+    let asset_kind = if ann.asset_kind.is_empty() {
+        "general"
+    } else {
+        ann.asset_kind.as_str()
+    };
+    let reimburse_status = if ann.reimburse_status.is_empty() {
+        "none"
+    } else {
+        ann.reimburse_status.as_str()
+    };
     conn.execute(
-        "INSERT INTO source_annotations(source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+        "INSERT INTO source_annotations(source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at, asset_kind, warranty_end, license_key, license_scope, reimburse_status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
          ON CONFLICT(source_id) DO UPDATE SET \
            vendor = excluded.vendor, \
            plan_name = excluded.plan_name, \
@@ -1244,7 +1311,12 @@ pub fn upsert_annotation_with_cipher(
            bill_date = excluded.bill_date, \
            notes = excluded.notes, \
            user_edited = excluded.user_edited, \
-           updated_at = excluded.updated_at",
+           updated_at = excluded.updated_at, \
+           asset_kind = excluded.asset_kind, \
+           warranty_end = excluded.warranty_end, \
+           license_key = excluded.license_key, \
+           license_scope = excluded.license_scope, \
+           reimburse_status = excluded.reimburse_status",
         params![
             ann.source_id,
             enc_vendor,
@@ -1255,7 +1327,12 @@ pub fn upsert_annotation_with_cipher(
             enc_bill_date,
             enc_notes,
             if ann.user_edited { 1 } else { 0 },
-            ann.updated_at
+            ann.updated_at,
+            asset_kind,
+            enc_warranty,
+            enc_license_key,
+            enc_license_scope,
+            reimburse_status
         ],
     )?;
     Ok(())
@@ -1276,22 +1353,52 @@ pub fn seed_annotation_hints_with_cipher(
             return Ok(());
         }
     }
+    let cycle = hints
+        .billing_cycle
+        .clone()
+        .unwrap_or_else(|| "unknown".into());
+    let inferred_kind = match cycle.as_str() {
+        "monthly" | "yearly" | "quarterly" | "weekly" => "subscription",
+        "one_time" => "license",
+        _ => "general",
+    };
     let ann = SourceAnnotation {
         source_id: source_id.to_string(),
         vendor: hints.vendor.clone(),
         plan_name: hints.plan_name.clone(),
         account_label: hints.account_label.clone(),
-        billing_cycle: hints
-            .billing_cycle
-            .clone()
-            .unwrap_or_else(|| "unknown".into()),
+        billing_cycle: cycle,
         category: hints.category.clone(),
         bill_date: hints.bill_date.clone(),
         notes: None,
         user_edited: false,
         updated_at: now_ms,
+        asset_kind: inferred_kind.into(),
+        warranty_end: None,
+        license_key: None,
+        license_scope: None,
+        reimburse_status: "none".into(),
     };
     upsert_annotation_with_cipher(conn, &ann, cipher)
+}
+
+#[allow(clippy::type_complexity)]
+struct RawAnnotationRow {
+    source_id: String,
+    vendor: Option<String>,
+    plan_name: Option<String>,
+    account_label: Option<String>,
+    billing_cycle: String,
+    category: Option<String>,
+    bill_date: Option<String>,
+    notes: Option<String>,
+    user_edited: i64,
+    updated_at: i64,
+    asset_kind: String,
+    warranty_end: Option<String>,
+    license_key: Option<String>,
+    license_scope: Option<String>,
+    reimburse_status: String,
 }
 
 pub fn get_annotation_with_cipher(
@@ -1302,27 +1409,60 @@ pub fn get_annotation_with_cipher(
     if !table_exists(conn, "source_annotations")? {
         return Ok(None);
     }
-    let row = conn
-        .query_row(
+    let has_asset = annotation_has_asset_columns(conn)?;
+    let row = if has_asset {
+        conn.query_row(
+            "SELECT source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at, asset_kind, warranty_end, license_key, license_scope, reimburse_status \
+             FROM source_annotations WHERE source_id = ?1",
+            [source_id],
+            |row| {
+                Ok(RawAnnotationRow {
+                    source_id: row.get(0)?,
+                    vendor: row.get(1)?,
+                    plan_name: row.get(2)?,
+                    account_label: row.get(3)?,
+                    billing_cycle: row.get(4)?,
+                    category: row.get(5)?,
+                    bill_date: row.get(6)?,
+                    notes: row.get(7)?,
+                    user_edited: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    asset_kind: row.get(10)?,
+                    warranty_end: row.get(11)?,
+                    license_key: row.get(12)?,
+                    license_scope: row.get(13)?,
+                    reimburse_status: row.get(14)?,
+                })
+            },
+        )
+        .optional()?
+    } else {
+        conn.query_row(
             "SELECT source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at \
              FROM source_annotations WHERE source_id = ?1",
             [source_id],
             |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                ))
+                Ok(RawAnnotationRow {
+                    source_id: row.get(0)?,
+                    vendor: row.get(1)?,
+                    plan_name: row.get(2)?,
+                    account_label: row.get(3)?,
+                    billing_cycle: row.get(4)?,
+                    category: row.get(5)?,
+                    bill_date: row.get(6)?,
+                    notes: row.get(7)?,
+                    user_edited: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    asset_kind: "general".into(),
+                    warranty_end: None,
+                    license_key: None,
+                    license_scope: None,
+                    reimburse_status: "none".into(),
+                })
             },
         )
-        .optional()?;
+        .optional()?
+    };
     match row {
         None => Ok(None),
         Some(raw) => Ok(Some(decrypt_annotation_row(raw, cipher)?)),
@@ -1336,58 +1476,86 @@ pub fn list_annotations_with_cipher(
     if !table_exists(conn, "source_annotations")? {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
-        "SELECT source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at \
-         FROM source_annotations ORDER BY source_id",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<String>>(7)?,
-            row.get::<_, i64>(8)?,
-            row.get::<_, i64>(9)?,
-        ))
-    })?;
+    let has_asset = annotation_has_asset_columns(conn)?;
     let mut out = Vec::new();
-    for item in rows {
-        out.push(decrypt_annotation_row(item?, cipher)?);
+    if has_asset {
+        let mut stmt = conn.prepare(
+            "SELECT source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at, asset_kind, warranty_end, license_key, license_scope, reimburse_status \
+             FROM source_annotations ORDER BY source_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RawAnnotationRow {
+                source_id: row.get(0)?,
+                vendor: row.get(1)?,
+                plan_name: row.get(2)?,
+                account_label: row.get(3)?,
+                billing_cycle: row.get(4)?,
+                category: row.get(5)?,
+                bill_date: row.get(6)?,
+                notes: row.get(7)?,
+                user_edited: row.get(8)?,
+                updated_at: row.get(9)?,
+                asset_kind: row.get(10)?,
+                warranty_end: row.get(11)?,
+                license_key: row.get(12)?,
+                license_scope: row.get(13)?,
+                reimburse_status: row.get(14)?,
+            })
+        })?;
+        for item in rows {
+            out.push(decrypt_annotation_row(item?, cipher)?);
+        }
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT source_id, vendor, plan_name, account_label, billing_cycle, category, bill_date, notes, user_edited, updated_at \
+             FROM source_annotations ORDER BY source_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RawAnnotationRow {
+                source_id: row.get(0)?,
+                vendor: row.get(1)?,
+                plan_name: row.get(2)?,
+                account_label: row.get(3)?,
+                billing_cycle: row.get(4)?,
+                category: row.get(5)?,
+                bill_date: row.get(6)?,
+                notes: row.get(7)?,
+                user_edited: row.get(8)?,
+                updated_at: row.get(9)?,
+                asset_kind: "general".into(),
+                warranty_end: None,
+                license_key: None,
+                license_scope: None,
+                reimburse_status: "none".into(),
+            })
+        })?;
+        for item in rows {
+            out.push(decrypt_annotation_row(item?, cipher)?);
+        }
     }
     Ok(out)
 }
 
-#[allow(clippy::type_complexity)]
 fn decrypt_annotation_row(
-    raw: (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        i64,
-        i64,
-    ),
+    raw: RawAnnotationRow,
     cipher: &VaultCipher,
 ) -> rusqlite::Result<SourceAnnotation> {
-    let source_id = raw.0;
+    let source_id = raw.source_id;
     Ok(SourceAnnotation {
         vendor: cipher
-            .decrypt_opt_field("source_annotations", &source_id, "vendor", raw.1.as_deref())
+            .decrypt_opt_field(
+                "source_annotations",
+                &source_id,
+                "vendor",
+                raw.vendor.as_deref(),
+            )
             .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
         plan_name: cipher
             .decrypt_opt_field(
                 "source_annotations",
                 &source_id,
                 "plan_name",
-                raw.2.as_deref(),
+                raw.plan_name.as_deref(),
             )
             .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
         account_label: cipher
@@ -1395,16 +1563,16 @@ fn decrypt_annotation_row(
                 "source_annotations",
                 &source_id,
                 "account_label",
-                raw.3.as_deref(),
+                raw.account_label.as_deref(),
             )
             .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
-        billing_cycle: raw.4,
+        billing_cycle: raw.billing_cycle,
         category: cipher
             .decrypt_opt_field(
                 "source_annotations",
                 &source_id,
                 "category",
-                raw.5.as_deref(),
+                raw.category.as_deref(),
             )
             .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
         bill_date: cipher
@@ -1412,14 +1580,45 @@ fn decrypt_annotation_row(
                 "source_annotations",
                 &source_id,
                 "bill_date",
-                raw.6.as_deref(),
+                raw.bill_date.as_deref(),
             )
             .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
         notes: cipher
-            .decrypt_opt_field("source_annotations", &source_id, "notes", raw.7.as_deref())
+            .decrypt_opt_field(
+                "source_annotations",
+                &source_id,
+                "notes",
+                raw.notes.as_deref(),
+            )
             .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
-        user_edited: raw.8 != 0,
-        updated_at: raw.9,
+        user_edited: raw.user_edited != 0,
+        updated_at: raw.updated_at,
+        asset_kind: raw.asset_kind,
+        warranty_end: cipher
+            .decrypt_opt_field(
+                "source_annotations",
+                &source_id,
+                "warranty_end",
+                raw.warranty_end.as_deref(),
+            )
+            .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
+        license_key: cipher
+            .decrypt_opt_field(
+                "source_annotations",
+                &source_id,
+                "license_key",
+                raw.license_key.as_deref(),
+            )
+            .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
+        license_scope: cipher
+            .decrypt_opt_field(
+                "source_annotations",
+                &source_id,
+                "license_scope",
+                raw.license_scope.as_deref(),
+            )
+            .map_err(|err| cipher_tamper_sql_err(err.to_string()))?,
+        reimburse_status: raw.reimburse_status,
         source_id,
     })
 }

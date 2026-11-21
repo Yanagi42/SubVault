@@ -858,6 +858,11 @@ fn load_snapshot(
                     "category": a.category,
                     "bill_date": a.bill_date,
                     "notes": a.notes,
+                    "asset_kind": a.asset_kind,
+                    "warranty_end": a.warranty_end,
+                    "license_key": a.license_key,
+                    "license_scope": a.license_scope,
+                    "reimburse_status": a.reimburse_status,
                     "user_edited": a.user_edited,
                     "updated_at": a.updated_at
                 })

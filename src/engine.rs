@@ -1439,6 +1439,11 @@ pub struct AnnotateRequest {
     pub category: Option<String>,
     pub bill_date: Option<String>,
     pub notes: Option<String>,
+    pub asset_kind: Option<String>,
+    pub warranty_end: Option<String>,
+    pub license_key: Option<String>,
+    pub license_scope: Option<String>,
+    pub reimburse_status: Option<String>,
     pub auth: AuthInput,
 }
 
@@ -1461,9 +1466,30 @@ fn annotate_inner(req: AnnotateRequest) -> Result<Report, Fail> {
             return Err(Fail::new(EXIT_USAGE, "Usage", "bad_billing_cycle"));
         }
     }
+    if let Some(ref kind) = req.asset_kind {
+        if !matches!(
+            kind.as_str(),
+            "subscription" | "license" | "hardware" | "reimbursable" | "general"
+        ) {
+            return Err(Fail::new(EXIT_USAGE, "Usage", "bad_asset_kind"));
+        }
+    }
+    if let Some(ref reimb) = req.reimburse_status {
+        if !matches!(
+            reimb.as_str(),
+            "none" | "pending" | "submitted" | "reimbursed"
+        ) {
+            return Err(Fail::new(EXIT_USAGE, "Usage", "bad_reimburse_status"));
+        }
+    }
     if let Some(ref date) = req.bill_date {
         if !date.is_empty() && crate::real_extract::parse_date_token(date).is_none() {
             return Err(Fail::new(EXIT_USAGE, "Usage", "bad_bill_date"));
+        }
+    }
+    if let Some(ref date) = req.warranty_end {
+        if !date.is_empty() && crate::real_extract::parse_date_token(date).is_none() {
+            return Err(Fail::new(EXIT_USAGE, "Usage", "bad_warranty_end"));
         }
     }
     let session = open_real_session(&req.vault, &req.auth)?;
@@ -1478,6 +1504,8 @@ fn annotate_inner(req: AnnotateRequest) -> Result<Report, Fail> {
             .unwrap_or_else(|| store::SourceAnnotation {
                 source_id: req.source_id.clone(),
                 billing_cycle: "unknown".into(),
+                asset_kind: "general".into(),
+                reimburse_status: "none".into(),
                 ..Default::default()
             });
 
@@ -1494,16 +1522,18 @@ fn annotate_inner(req: AnnotateRequest) -> Result<Report, Fail> {
             None => current,
         }
     };
-    let clean_date = match req.bill_date {
-        Some(v) => {
-            let t = v.trim();
-            if t.is_empty() {
-                None
-            } else {
-                crate::real_extract::parse_date_token(t)
+    let clean_date = |incoming: Option<String>, current: Option<String>| -> Option<String> {
+        match incoming {
+            Some(v) => {
+                let t = v.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    crate::real_extract::parse_date_token(t)
+                }
             }
+            None => current,
         }
-        None => existing.bill_date,
     };
 
     let updated = store::SourceAnnotation {
@@ -1513,10 +1543,15 @@ fn annotate_inner(req: AnnotateRequest) -> Result<Report, Fail> {
         account_label: clean_opt(req.account_label, existing.account_label),
         billing_cycle: req.billing_cycle.unwrap_or(existing.billing_cycle),
         category: clean_opt(req.category, existing.category),
-        bill_date: clean_date,
+        bill_date: clean_date(req.bill_date, existing.bill_date),
         notes: clean_opt(req.notes, existing.notes),
         user_edited: true,
         updated_at: now_ms(),
+        asset_kind: req.asset_kind.unwrap_or(existing.asset_kind),
+        warranty_end: clean_date(req.warranty_end, existing.warranty_end),
+        license_key: clean_opt(req.license_key, existing.license_key),
+        license_scope: clean_opt(req.license_scope, existing.license_scope),
+        reimburse_status: req.reimburse_status.unwrap_or(existing.reimburse_status),
     };
     let tx = session
         .conn
@@ -1541,6 +1576,11 @@ fn annotate_inner(req: AnnotateRequest) -> Result<Report, Fail> {
             "category": updated.category,
             "bill_date": updated.bill_date,
             "notes": updated.notes,
+            "asset_kind": updated.asset_kind,
+            "warranty_end": updated.warranty_end,
+            "license_scope": updated.license_scope,
+            "has_license_key": updated.license_key.is_some(),
+            "reimburse_status": updated.reimburse_status,
             "user_edited": updated.user_edited,
             "updated_at": updated.updated_at,
         }),

@@ -50,6 +50,22 @@
     阿里: { bg: "#ea580c", mark: "阿" },
     京东: { bg: "#dc2626", mark: "京" },
     百度: { bg: "#2563eb", mark: "百" },
+    raycast: { bg: "#e11d48", mark: "RC" },
+    macbook: { bg: "#1d1d1f", mark: "MB" },
+  };
+
+  const ASSET_KIND_META = {
+    subscription: { label: "订阅", full: "周期订阅", badgeClass: "badge-emerald" },
+    license: { label: "买断", full: "买断授权", badgeClass: "badge-blue" },
+    hardware: { label: "硬件", full: "硬件保修", badgeClass: "badge-violet" },
+    reimbursable: { label: "报销", full: "报销凭证", badgeClass: "badge-amber" },
+    general: { label: "账单", full: "普通账单", badgeClass: "badge-slate" },
+  };
+
+  const REIMBURSE_META = {
+    pending: { label: "待报销", next: "submitted", cls: "pending" },
+    submitted: { label: "已提交", next: "reimbursed", cls: "submitted" },
+    reimbursed: { label: "已到账", next: "pending", cls: "reimbursed" },
   };
 
   const CURRENCY_SYMBOLS = {
@@ -99,7 +115,9 @@
     pendingRecoveryKey: null,
     textViewActive: false,
     lastRedactedText: "",
+    manualKind: "subscription",
     manualCycle: "monthly",
+    editKind: "general",
     cmdOpen: false,
     cmdIndex: 0,
     cmdActions: [],
@@ -469,7 +487,9 @@
       cta.classList.add("hidden");
     }
 
+    renderAssetRadar(ws);
     renderSummary(ws);
+    syncAssetFilterCounts(ws);
     syncFilterDropdowns(ws);
     renderLedgerStage(ws);
     if (state.activeTab === "insights") renderInsightsPane(ws);
@@ -477,16 +497,143 @@
     if (state.activeTab === "attention") renderAttentionPane(ws);
   }
 
+  function maskLicenseKey(key) {
+    const s = String(key || "").trim();
+    if (!s) return "";
+    if (s.length <= 4) return "••••";
+    return `••••-••••-${s.slice(-4)}`;
+  }
+
+  function warrantyInfo(buyDate, warrantyEnd) {
+    if (!warrantyEnd || !/^\d{4}-\d{2}-\d{2}$/.test(warrantyEnd)) return null;
+    const end = new Date(`${warrantyEnd}T00:00:00`);
+    if (isNaN(end.getTime())) return null;
+    const now = new Date();
+    const daysLeft = Math.ceil((end - now) / (1000 * 60 * 60 * 24));
+    let pct = daysLeft <= 0 ? 100 : 50;
+    if (buyDate && /^\d{4}-\d{2}-\d{2}$/.test(buyDate)) {
+      const start = new Date(`${buyDate}T00:00:00`);
+      if (!isNaN(start.getTime()) && end > start) {
+        pct = Math.max(0, Math.min(100, Math.round(((now - start) / (end - start)) * 100)));
+      }
+    }
+    const level = daysLeft < 0 ? "expired" : daysLeft <= 60 ? "warn" : "ok";
+    const statusLabel = daysLeft > 0
+      ? `保修还剩 ${daysLeft} 天`
+      : daysLeft === 0
+        ? "保修今日到期"
+        : `已过保 ${Math.abs(daysLeft)} 天`;
+    return { daysLeft, pct, level, statusLabel, warrantyEnd };
+  }
+
+  function costPerDayInfo(buyDate, currency, amountText) {
+    if (!buyDate || !/^\d{4}-\d{2}-\d{2}$/.test(buyDate) || !amountText) return null;
+    const start = new Date(`${buyDate}T00:00:00`);
+    const now = new Date();
+    if (isNaN(start.getTime()) || start > now) return null;
+    const daysUsed = Math.max(1, Math.floor((now - start) / (1000 * 60 * 60 * 24)));
+    const cents = amountToCents(amountText);
+    if (cents <= 0) return null;
+    const perDayCents = Math.max(1, Math.round(cents / daysUsed));
+    return {
+      daysUsed,
+      perDayText: formatMoneyShort(currency, centsToText(perDayCents)),
+    };
+  }
+
+  async function copyLicenseKey(vendor, key) {
+    try {
+      await navigator.clipboard.writeText(key);
+      showToast(`「${vendor || "该授权"}」激活密钥已复制，请注意防窥保管`, "ok");
+    } catch (_) {
+      showToast("浏览器限制了剪贴板访问，请点开详情查看密钥", "error");
+    }
+  }
+
+  async function cycleReimburseStatus(sourceId, currentStatus) {
+    const cur = REIMBURSE_META[currentStatus] ? currentStatus : "pending";
+    const next = REIMBURSE_META[cur].next;
+    try {
+      const snap = await api("POST", "/api/sources/reimburse", {
+        source_id: sourceId,
+        reimburse_status: next,
+      });
+      state.workspace = snap;
+      renderWorkspace();
+      showToast(`报销进度已更新为「${REIMBURSE_META[next].label}」`, "ok");
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  }
+
+  function setLedgerFilter(filterKey) {
+    state.ledgerFilter = filterKey;
+    $("ledger-filters").querySelectorAll(".pill").forEach((x) => {
+      x.classList.toggle("active", x.getAttribute("data-filter") === filterKey);
+    });
+  }
+
+  function renderAssetRadar(ws) {
+    const bar = $("asset-radar");
+    const radar = ws.asset_radar || [];
+    if (radar.length === 0) {
+      bar.classList.add("hidden");
+      bar.innerHTML = "";
+      return;
+    }
+    const chipsHtml = radar
+      .map((r, idx) => {
+        const icon = r.kind === "price_hike"
+          ? "📈"
+          : r.kind === "warranty_expiring"
+            ? "🛡️"
+            : "🧾";
+        const sev = r.severity || "slate";
+        return `
+          <button type="button" class="radar-chip ${esc(sev)}" data-radar-idx="${idx}" title="${esc(r.detail || "")}">
+            <span>${icon}</span>
+            <span class="sensitive">${esc(r.label)}</span>
+          </button>
+        `;
+      })
+      .join("");
+    bar.innerHTML = `<span class="radar-title">资产雷达</span>${chipsHtml}`;
+    bar.classList.remove("hidden");
+    bar.querySelectorAll("[data-radar-idx]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const r = radar[Number(btn.getAttribute("data-radar-idx"))];
+        if (!r) return;
+        if (r.source_id) {
+          const found = (ws.items || []).find((i) => i.source_id === r.source_id);
+          if (found) openDrawer(found);
+        } else if (r.kind === "reimburse_pending" || r.kind === "reimburse_submitted") {
+          switchMainTab("ledger");
+          setLedgerFilter("reimbursable");
+          renderLedgerStage(ws);
+        }
+      });
+    });
+  }
+
+  function syncAssetFilterCounts(ws) {
+    const counts = ws.asset_counts || {};
+    ["subscription", "license", "hardware", "reimbursable"].forEach((k) => {
+      const el = document.querySelector(`.pill-cnt[data-cnt="${k}"]`);
+      if (el) el.textContent = counts[k] > 0 ? ` ${counts[k]}` : "";
+    });
+  }
+
   function renderSummary(ws) {
     const grid = $("summary-section");
     const v = ws.vault;
     const curList = ws.summary_by_currency || [];
+    const ac = ws.asset_counts || {};
     const cards = [];
 
     if (curList.length === 0) {
       cards.push(`
         <div class="kpi-card">
-          <div class="kpi-label"><span>已登记账单总额</span><span class="badge badge-slate">暂无金额</span></div>
+          <div class="kpi-label"><span>已登记资产与账单</span><span class="badge badge-slate">暂无金额</span></div>
           <div class="kpi-value sensitive">0.00</div>
           <div class="kpi-sub">拖入账单或点「+ 手动记一笔」立刻开始</div>
         </div>
@@ -499,7 +646,7 @@
         cards.push(`
           <div class="kpi-card">
             <div class="kpi-label">
-              <span>${esc(c.currency)} 账单汇总</span>
+              <span>${esc(c.currency)} 资产与花费</span>
               <span class="badge badge-emerald">${c.bill_count} 笔</span>
             </div>
             <div class="kpi-value sensitive">${esc(formatMoneyShort(c.currency, c.total_recorded))} <small style="font-size:13px;font-weight:600;color:var(--text-muted)">${esc(c.currency)}</small></div>
@@ -509,6 +656,12 @@
       }
     }
 
+    const assetBits = [];
+    if (ac.license > 0) assetBits.push(`买断 ${ac.license}`);
+    if (ac.hardware > 0) assetBits.push(`硬件 ${ac.hardware}`);
+    if (ac.reimbursable > 0) assetBits.push(`报销 ${ac.reimbursable}`);
+    assetBits.push(`防重 ${v.duplicate_count} 次`);
+
     cards.push(`
       <div class="kpi-card">
         <div class="kpi-label">
@@ -516,7 +669,7 @@
           <span class="badge badge-slate">SHA-256</span>
         </div>
         <div class="kpi-value">${v.source_count} 份原件</div>
-        <div class="kpi-sub">防重拦截 ${v.duplicate_count} 次 · 待整理 ${v.needs_entry_count + v.conflict_count} 项</div>
+        <div class="kpi-sub">${assetBits.join(" · ")}</div>
       </div>
     `);
 
@@ -550,12 +703,17 @@
       const amtVal = item.amount_fact ? item.amount_fact.value : null;
       const flags = item.status_flags || {};
 
-      if (state.ledgerFilter === "recurring") {
-        if (!["monthly", "yearly", "quarterly", "weekly"].includes(ann.billing_cycle)) return false;
+      const kind = ann.asset_kind || "general";
+      if (state.ledgerFilter === "subscription") {
+        if (kind !== "subscription") return false;
+      } else if (state.ledgerFilter === "license") {
+        if (kind !== "license") return false;
+      } else if (state.ledgerFilter === "hardware") {
+        if (kind !== "hardware") return false;
+      } else if (state.ledgerFilter === "reimbursable") {
+        if (kind !== "reimbursable" && (!ann.reimburse_status || ann.reimburse_status === "none")) return false;
       } else if (state.ledgerFilter === "needs") {
         if (!flags.needs_manual_entry && !flags.has_conflict && !flags.is_credit_or_order_warning) return false;
-      } else if (state.ledgerFilter === "duplicates") {
-        if (!flags.has_duplicate) return false;
       } else if (state.ledgerFilter === "csv") {
         if (!flags.is_csv_statement) return false;
       }
@@ -574,6 +732,8 @@
           ann.account_label,
           ann.category,
           ann.notes,
+          ann.license_scope,
+          ann.warranty_end,
           item.display_name,
           item.content_sha256,
           amtVal ? `${amtVal.currency} ${amtVal.amount_text}` : "",
@@ -609,7 +769,7 @@
           ${
             isEmptyVault
               ? `<div style="margin-top:16px;display:flex;justify-content:center;gap:10px;flex-wrap:wrap">
-                   <button type="button" id="btn-load-demo-pack" class="btn btn-primary btn-sm">一键载入 7 份中英文体验账单（日历/图表/沙盘全开）</button>
+                   <button type="button" id="btn-load-demo-pack" class="btn btn-primary btn-sm">一键载入体验资产包（订阅涨价 / 硬件保修 / 买断密钥 / 报销全开）</button>
                  </div>`
               : ""
           }
@@ -619,16 +779,16 @@
       if (demoBtn) {
         demoBtn.addEventListener("click", async () => {
           demoBtn.disabled = true;
-          demoBtn.textContent = "正在载入体验账单包…";
+          demoBtn.textContent = "正在载入体验资产包…";
           try {
             const snap = await api("POST", "/api/import-demo-pack", {});
             state.workspace = snap;
             renderWorkspace();
-            showToast("已载入 7 份中英文示例账单（含重复拦截、扫描件待整理、支付宝流水）！", "ok");
+            showToast("已载入体验资产包（含订阅涨价雷达、硬件保修日均成本、加密授权密钥与待报销凭证）！", "ok");
           } catch (err) {
             showToast(err.message, "error");
             demoBtn.disabled = false;
-            demoBtn.textContent = "一键载入 7 份中英文体验账单（日历/图表/沙盘全开）";
+            demoBtn.textContent = "一键载入体验资产包（订阅涨价 / 硬件保修 / 买断密钥 / 报销全开）";
           }
         });
       }
@@ -661,17 +821,29 @@
         const amtVal = item.amount_fact ? item.amount_fact.value : null;
         const perVal = item.period_fact ? item.period_fact.value : null;
         const flags = item.status_flags || {};
+        const kind = ann.asset_kind || "general";
+        const kindMeta = ASSET_KIND_META[kind] || ASSET_KIND_META.general;
         const title = ann.vendor || item.display_name;
         const sub = ann.plan_name || (ann.vendor ? item.display_name : item.media_type);
         const brand = brandStyleFor(title);
         const cycleText = CYCLE_LABELS[ann.billing_cycle] || "未标注";
-        const prog = periodProgressInfo(perVal);
+        const drift = item.price_drift || null;
+
+        let driftBadge = "";
+        if (drift) {
+          const isUp = drift.direction === "up";
+          const pct = Math.abs(drift.pct_change || 0);
+          driftBadge = `<span class="badge ${isUp ? "badge-danger" : "badge-emerald"}" title="对比上期 ${esc(drift.prev_text)}（${esc(drift.prev_date || "")}）变动 ${esc(drift.diff_text)}">${isUp ? `↑ 涨价 +${pct}%` : `↓ 降价 -${pct}%`}</span>`;
+        }
 
         let priceBlock = "";
         if (amtVal && amtVal.amount_text) {
           priceBlock = `
-            <span class="bill-card-price sensitive">${esc(formatMoneyShort(amtVal.currency, amtVal.amount_text))} <small style="font-size:12px;color:var(--text-muted)">${esc(amtVal.currency)}</small></span>
-            <span class="bill-card-cycle">${esc(cycleText)}</span>
+            <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+              <span class="bill-card-price sensitive">${esc(formatMoneyShort(amtVal.currency, amtVal.amount_text))} <small style="font-size:12px;color:var(--text-muted)">${esc(amtVal.currency)}</small></span>
+              ${driftBadge}
+            </div>
+            <span class="bill-card-cycle">${esc(kind === "hardware" ? "一次性购入" : kind === "license" ? "买断授权" : cycleText)}</span>
           `;
         } else if (flags.is_csv_statement) {
           priceBlock = `<span class="badge badge-slate">CSV 流水 · ${item.csv_row_count} 条可挑拣</span><span class="bill-card-cycle">点击展开</span>`;
@@ -681,20 +853,80 @@
           priceBlock = `<span class="amount-missing">点击补录金额 →</span><span class="bill-card-cycle">待整理</span>`;
         }
 
-        const progHtml = prog
-          ? `<div class="period-bar-wrap">
-               <div class="period-bar-labels"><span>${esc(prog.range)}</span><span>${esc(prog.statusLabel)}</span></div>
-               <div class="period-bar-track"><div class="period-bar-fill" style="width:${prog.pct}%"></div></div>
-             </div>`
-          : ann.bill_date
-            ? `<div style="font-size:11.5px;color:var(--text-muted)">账单日期：${esc(ann.bill_date)}</div>`
-            : "";
+        // Progressive disclosure context block per asset_kind
+        let contextHtml = "";
+        if (kind === "hardware") {
+          const w = warrantyInfo(ann.bill_date, ann.warranty_end);
+          const cpd = amtVal ? costPerDayInfo(ann.bill_date, amtVal.currency, amtVal.amount_text) : null;
+          const parts = [];
+          if (w) {
+            parts.push(`
+              <div class="period-bar-wrap">
+                <div class="period-bar-labels">
+                  <span>🛡️ 保修至 ${esc(w.warrantyEnd)}</span>
+                  <span>${esc(w.statusLabel)}</span>
+                </div>
+                <div class="period-bar-track"><div class="period-bar-fill warranty-fill ${w.level}" style="width:${w.pct}%"></div></div>
+              </div>
+            `);
+          }
+          if (cpd) {
+            parts.push(`
+              <div class="asset-meta-strip">
+                <span>已陪伴 ${cpd.daysUsed} 天</span>
+                <span class="cpd-pill sensitive">日均 ${esc(cpd.perDayText)}/天</span>
+              </div>
+            `);
+          }
+          contextHtml = parts.join("");
+        } else if (kind === "license") {
+          const parts = [];
+          if (ann.license_scope) {
+            parts.push(`<div class="asset-meta-strip"><span>🔑 ${esc(ann.license_scope)}</span></div>`);
+          }
+          if (ann.license_key) {
+            parts.push(`
+              <div class="asset-key-bar">
+                <span class="sensitive">${esc(maskLicenseKey(ann.license_key))}</span>
+                <button type="button" class="asset-key-copy" data-copy-key-sid="${esc(item.source_id)}">复制密钥</button>
+              </div>
+            `);
+          }
+          contextHtml = parts.join("");
+        } else {
+          const prog = periodProgressInfo(perVal);
+          if (prog) {
+            contextHtml = `
+              <div class="period-bar-wrap">
+                <div class="period-bar-labels"><span>${esc(prog.range)}</span><span>${esc(prog.statusLabel)}</span></div>
+                <div class="period-bar-track"><div class="period-bar-fill" style="width:${prog.pct}%"></div></div>
+              </div>
+            `;
+          } else if (ann.bill_date) {
+            contextHtml = `<div style="font-size:11.5px;color:var(--text-muted)">账单日期：${esc(ann.bill_date)}</div>`;
+          }
+        }
 
         const badges = [];
         if (ann.account_label) badges.push(`<span class="badge badge-slate sensitive">${esc(ann.account_label)}</span>`);
         if (ann.category) badges.push(`<span class="badge badge-slate">${esc(ann.category)}</span>`);
         if (flags.has_duplicate) badges.push(`<span class="badge badge-emerald">防重 ×${item.occurrence_count}</span>`);
         if (flags.has_conflict) badges.push(`<span class="badge badge-amber">金额冲突</span>`);
+
+        const reimbStatus = ann.reimburse_status && ann.reimburse_status !== "none"
+          ? ann.reimburse_status
+          : kind === "reimbursable"
+            ? "pending"
+            : null;
+        const reimbBtnHtml = reimbStatus && REIMBURSE_META[reimbStatus]
+          ? `<button type="button" class="reimb-toggle-btn ${REIMBURSE_META[reimbStatus].cls}" data-reimb-sid="${esc(item.source_id)}" data-reimb-cur="${esc(reimbStatus)}" title="点击一键切换报销状态">🧾 ${REIMBURSE_META[reimbStatus].label} ↻</button>`
+          : "";
+
+        const topBadge = kind !== "general" && kind !== "subscription"
+          ? `<span class="badge ${kindMeta.badgeClass}">${esc(kindMeta.label)}</span>`
+          : item.object_intact
+            ? `<span class="badge badge-emerald" title="原件 SHA-256 核验完整">✓ 原件</span>`
+            : "";
 
         return `
           <article class="bill-card" data-source-id="${esc(item.source_id)}">
@@ -706,12 +938,13 @@
                   <div class="bill-card-sub">${esc(sub)}</div>
                 </div>
               </div>
-              ${item.object_intact ? `<span class="badge badge-emerald" title="原件 SHA-256 核验完整">✓ 原件</span>` : ""}
+              ${topBadge}
             </div>
             <div class="bill-card-mid">${priceBlock}</div>
-            ${progHtml}
+            ${contextHtml}
             <div class="bill-card-foot">
               <div class="tags-cell">${badges.join("") || `<span class="badge badge-slate">未分组</span>`}</div>
+              ${reimbBtnHtml}
             </div>
           </article>
         `;
@@ -719,6 +952,22 @@
       .join("");
 
     stage.innerHTML = `<div class="bill-gallery">${html}</div>`;
+    stage.querySelectorAll("[data-copy-key-sid]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const sid = btn.getAttribute("data-copy-key-sid");
+        const found = (state.workspace.items || []).find((i) => i.source_id === sid);
+        if (found?.annotation?.license_key) {
+          copyLicenseKey(found.annotation.vendor || found.display_name, found.annotation.license_key);
+        }
+      });
+    });
+    stage.querySelectorAll("[data-reimb-sid]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        cycleReimburseStatus(btn.getAttribute("data-reimb-sid"), btn.getAttribute("data-reimb-cur"));
+      });
+    });
     stage.querySelectorAll(".bill-card[data-source-id]").forEach((card) => {
       card.addEventListener("click", () => {
         const sid = card.getAttribute("data-source-id");
@@ -735,13 +984,19 @@
         const amtVal = item.amount_fact ? item.amount_fact.value : null;
         const perVal = item.period_fact ? item.period_fact.value : null;
         const flags = item.status_flags || {};
+        const kind = ann.asset_kind || "general";
+        const kindMeta = ASSET_KIND_META[kind] || ASSET_KIND_META.general;
         const title = ann.vendor || item.display_name;
         const brand = brandStyleFor(title);
         const subtitle = [ann.plan_name, ann.vendor && ann.vendor !== item.display_name ? item.display_name : ""].filter(Boolean).join(" · ");
 
         let amountHtml = "";
         if (amtVal && amtVal.amount_text) {
-          amountHtml = `<span class="amount-cell sensitive">${esc(formatMoney(amtVal.currency, amtVal.amount_text))}</span>`;
+          const drift = item.price_drift;
+          const driftTag = drift
+            ? ` <span class="badge ${drift.direction === "up" ? "badge-danger" : "badge-emerald"}">${drift.direction === "up" ? `↑ +${Math.abs(drift.pct_change)}%` : `↓ -${Math.abs(drift.pct_change)}%`}</span>`
+            : "";
+          amountHtml = `<span class="amount-cell sensitive">${esc(formatMoney(amtVal.currency, amtVal.amount_text))}</span>${driftTag}`;
         } else if (flags.is_csv_statement) {
           amountHtml = `<span class="badge badge-slate">CSV 流水（${item.csv_row_count} 条）</span>`;
         } else if (flags.is_credit_or_order_warning) {
@@ -750,12 +1005,25 @@
           amountHtml = `<span class="amount-missing">点击补录 →</span>`;
         }
 
-        const dateText = perVal && perVal.period_start
+        let dateText = perVal && perVal.period_start
           ? `${perVal.period_start} ~ ${perVal.period_end}`
           : ann.bill_date || "—";
+        if (kind === "hardware" && ann.warranty_end) {
+          dateText = `保修至 ${ann.warranty_end}`;
+        }
 
-        const badges = [];
-        if (item.object_intact) badges.push(`<span class="badge badge-emerald">原件完整</span>`);
+        const badges = [`<span class="badge ${kindMeta.badgeClass}">${esc(kindMeta.label)}</span>`];
+        if (kind === "license" && ann.license_key) {
+          badges.push(`<button type="button" class="asset-key-copy" data-copy-key-sid="${esc(item.source_id)}">复制密钥</button>`);
+        }
+        const reimbStatus = ann.reimburse_status && ann.reimburse_status !== "none"
+          ? ann.reimburse_status
+          : kind === "reimbursable"
+            ? "pending"
+            : null;
+        if (reimbStatus && REIMBURSE_META[reimbStatus]) {
+          badges.push(`<button type="button" class="reimb-toggle-btn ${REIMBURSE_META[reimbStatus].cls}" data-reimb-sid="${esc(item.source_id)}" data-reimb-cur="${esc(reimbStatus)}">${REIMBURSE_META[reimbStatus].label} ↻</button>`);
+        }
         if (flags.has_duplicate) badges.push(`<span class="badge badge-slate">去重 ×${item.occurrence_count}</span>`);
         if (flags.has_conflict) badges.push(`<span class="badge badge-amber">金额冲突</span>`);
         if (ann.category) badges.push(`<span class="badge badge-slate">${esc(ann.category)}</span>`);
@@ -786,18 +1054,34 @@
         <table class="ledger-table">
           <thead>
             <tr>
-              <th>商家与账单</th>
+              <th>资产 / 商家</th>
               <th>归属账号</th>
               <th>周期</th>
               <th>金额</th>
-              <th>日期 / 服务周期</th>
-              <th>状态</th>
+              <th>日期 / 保修截止</th>
+              <th>类型与状态</th>
             </tr>
           </thead>
           <tbody>${rowsHtml}</tbody>
         </table>
       </div>
     `;
+    stage.querySelectorAll("[data-copy-key-sid]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const sid = btn.getAttribute("data-copy-key-sid");
+        const found = (state.workspace.items || []).find((i) => i.source_id === sid);
+        if (found?.annotation?.license_key) {
+          copyLicenseKey(found.annotation.vendor || found.display_name, found.annotation.license_key);
+        }
+      });
+    });
+    stage.querySelectorAll("[data-reimb-sid]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        cycleReimburseStatus(btn.getAttribute("data-reimb-sid"), btn.getAttribute("data-reimb-cur"));
+      });
+    });
     stage.querySelectorAll("tbody tr[data-source-id]").forEach((tr) => {
       tr.addEventListener("click", () => {
         const sid = tr.getAttribute("data-source-id");
@@ -828,8 +1112,17 @@
       const ann = item.annotation || {};
       const amtVal = item.amount_fact ? item.amount_fact.value : null;
       const perVal = item.period_fact ? item.period_fact.value : null;
-      if (!amtVal || !amtVal.amount_text) continue;
       const title = ann.vendor || item.display_name;
+
+      // Hardware warranty expiry event
+      if (ann.warranty_end && /^\d{4}-\d{2}-\d{2}$/.test(ann.warranty_end)) {
+        const [wy, wm, wd] = ann.warranty_end.split("-").map(Number);
+        if (wy === year && wm === month + 1) {
+          addEvt(wd, { kind: "warranty", source_id: item.source_id, title: `🛡️ ${title}`, money: "保修截止" });
+        }
+      }
+
+      if (!amtVal || !amtVal.amount_text) continue;
       const money = formatMoneyShort(amtVal.currency, amtVal.amount_text);
 
       const realDateStr = ann.bill_date || (perVal && perVal.period_start);
@@ -876,9 +1169,9 @@
       const pills = evts
         .map(
           (ev) => `
-            <button type="button" class="cal-pill ${ev.kind}" data-cal-sid="${esc(ev.source_id)}" title="${ev.kind === "real" ? "真实历史账单" : "按周期推算的预计续费（仅供参考）"}：${esc(ev.title)} ${esc(ev.money)}">
+            <button type="button" class="cal-pill ${ev.kind}" data-cal-sid="${esc(ev.source_id)}" title="${ev.kind === "warranty" ? "硬件保修截止日" : ev.kind === "real" ? "真实历史账单" : "按周期推算的预计续费（仅供参考）"}：${esc(ev.title)} ${esc(ev.money)}">
               <span class="cal-pill-name">${esc(ev.title)}</span>
-              <span class="sensitive">${esc(ev.money)}</span>
+              <span class="${ev.kind === "warranty" ? "" : "sensitive"}">${esc(ev.money)}</span>
             </button>
           `
         )
@@ -902,7 +1195,8 @@
           </div>
           <div class="cal-legend">
             <span><i class="cal-dot-solid"></i>真实账单日</span>
-            <span><i class="cal-dot-dashed"></i>按周期推算续费（仅供参考）</span>
+            <span><i class="cal-dot-dashed"></i>按周期推算续费</span>
+            <span><i class="cal-dot-violet"></i>硬件保修截止</span>
           </div>
         </div>
         <div class="cal-grid">${cellsHtml}</div>
@@ -1073,6 +1367,52 @@
       .map((c) => `<button type="button" class="pill ${c === cur ? "active" : ""}" data-ins-cur="${esc(c)}">${esc(c)}</button>`)
       .join("");
 
+    // 5. Vendor Asset Portfolio (LTV + sparkline + price drift)
+    const portfolioRows = (ws.vendor_portfolio || []).filter((p) => p.currency === cur);
+    const portfolioTilesHtml = portfolioRows
+      .map((vp) => {
+        const brand = brandStyleFor(vp.vendor);
+        const kindMeta = ASSET_KIND_META[vp.asset_kind] || ASSET_KIND_META.general;
+        const drift = vp.price_drift;
+        const driftTag = drift
+          ? `<span class="badge ${drift.direction === "up" ? "badge-danger" : "badge-emerald"}">${drift.direction === "up" ? `↑ +${Math.abs(drift.pct_change)}%` : `↓ -${Math.abs(drift.pct_change)}%`}</span>`
+          : `<span class="badge ${kindMeta.badgeClass}">${esc(kindMeta.label)}</span>`;
+        const spark = buildMiniSparkline(vp.history || [], drift?.direction === "up" ? "#be123c" : "#0f6b58");
+        const accStr = (vp.accounts || []).length > 0 ? ` · ${vp.accounts.join(" / ")}` : "";
+        return `
+          <div class="vendor-tile" data-jump-vendor="${esc(vp.vendor)}">
+            <div class="vendor-tile-head">
+              <div class="vendor-tile-id">
+                <div class="brand-avatar brand-avatar-sm" style="background:${brand.bg}">${esc(brand.mark)}</div>
+                <div style="min-width:0">
+                  <div class="vendor-tile-name">${esc(vp.vendor)}</div>
+                  <div class="vendor-tile-sub sensitive">${vp.bill_count} 笔账单${esc(accStr)}</div>
+                </div>
+              </div>
+              ${driftTag}
+            </div>
+            <div class="vendor-tile-foot">
+              <div>
+                <div style="font-size:11px;color:var(--text-muted)">历史累计投入</div>
+                <div class="vendor-tile-ltv sensitive">${esc(formatMoneyShort(cur, vp.total_text))}</div>
+              </div>
+              ${spark}
+            </div>
+          </div>
+        `;
+      })
+      .join("");
+
+    const portfolioSection = portfolioRows.length > 0
+      ? `
+        <div class="card portfolio-card">
+          <h3 style="margin:0 0 4px;font-size:15px">🏪 商家资产档案（累计投入与价格轨迹）</h3>
+          <p class="chart-sub" style="margin-bottom:14px">自动归集同一商家的多期账单，一眼看出长期总花费与涨价趋势；点击卡片直接筛选该商家全部凭证</p>
+          <div class="portfolio-grid">${portfolioTilesHtml}</div>
+        </div>
+      `
+      : "";
+
     pane.innerHTML = `
       <div class="insights-wrap">
         <div class="insights-top-bar">
@@ -1106,6 +1446,8 @@
             </div>
           </div>
         </div>
+
+        ${portfolioSection}
 
         <div class="card sim-card">
           <div class="sim-hero">
@@ -1173,6 +1515,17 @@
         renderWorkspace();
       });
     });
+    pane.querySelectorAll("[data-jump-vendor]").forEach((tile) => {
+      tile.addEventListener("click", () => {
+        const v = tile.getAttribute("data-jump-vendor") || "";
+        state.searchQuery = v;
+        $("search-box").value = v;
+        setLedgerFilter("all");
+        switchMainTab("ledger");
+        renderWorkspace();
+        showToast(`已筛选商家：${v}`);
+      });
+    });
 
     // Simulator toggles
     pane.querySelectorAll("[data-sim-sid]").forEach((chk) => {
@@ -1203,6 +1556,32 @@
         }
       });
     }
+  }
+
+  function buildMiniSparkline(history, strokeColor) {
+    if (!history || history.length < 2) {
+      return `<span style="font-size:11px;color:var(--text-muted)">单期记录</span>`;
+    }
+    const vals = history.slice(-8).map((h) => h.cents || 0);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const span = max - min || 1;
+    const w = 68;
+    const h = 24;
+    const pts = vals
+      .map((v, i) => {
+        const x = vals.length === 1 ? w / 2 : (i / (vals.length - 1)) * w;
+        const y = h - 3 - ((v - min) / span) * (h - 6);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+    const lastPt = pts.split(" ").pop().split(",");
+    return `
+      <svg class="sparkline-svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-label="价格变化轨迹">
+        <polyline fill="none" stroke="${strokeColor}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${pts}" />
+        <circle cx="${lastPt[0]}" cy="${lastPt[1]}" r="3" fill="${strokeColor}" />
+      </svg>
+    `;
   }
 
   function buildFunEquivalence(cur, cents) {
@@ -1554,6 +1933,14 @@
     $("ed-period-start").value = (perVal && perVal.period_start) || "";
     $("ed-period-end").value = (perVal && perVal.period_end) || "";
     $("ed-notes").value = ann.notes || "";
+    $("ed-warranty-end").value = ann.warranty_end || "";
+    $("ed-license-key").value = ann.license_key || "";
+    $("ed-license-key").type = "password";
+    $("btn-ed-toggle-key").textContent = "显示";
+    $("ed-license-scope").value = ann.license_scope || "";
+    $("ed-reimburse-status").value = ann.reimburse_status || (ann.asset_kind === "reimbursable" ? "pending" : "none");
+    setEditAssetKind(ann.asset_kind || "general", false);
+    updateEditHardwareMetrics();
 
     $("evidence-meta").innerHTML = `
       <div><strong>文件名：</strong>${esc(item.display_name)}（${formatBytes(item.byte_length)}）</div>
@@ -1755,16 +2142,19 @@
   function renderCmdList(query) {
     const q = query.trim().toLowerCase();
     const baseActions = [
-      { label: "＋ 手动记一笔订阅 / 账单", sub: "无原件也能 5 秒登记", run: () => openManualModal() },
+      { label: "＋ 手动记一笔资产 / 账单", sub: "订阅 / 买断密钥 / 硬件保修 / 报销", run: () => openManualModal() },
       { label: "📥 导入本地账单文件", sub: "PDF / HTML / CSV / 图片", run: () => $("file-picker-input").click() },
+      { label: "🔑 查看买断授权与密钥库", sub: "一键复制加密保存的激活码", run: () => { switchMainTab("ledger"); setLedgerFilter("license"); renderLedgerStage(state.workspace); } },
+      { label: "🛡️ 查看硬件保修与日均成本", sub: "保修倒计时 + 每日持有成本", run: () => { switchMainTab("ledger"); setLedgerFilter("hardware"); renderLedgerStage(state.workspace); } },
+      { label: "🧾 查看报销凭证与待报销进度", sub: "一键切换待报销 / 已提交 / 已到账", run: () => { switchMainTab("ledger"); setLedgerFilter("reimbursable"); renderLedgerStage(state.workspace); } },
       { label: "⚡ 进入极速整理模式", sub: "左右分屏快填待补录项", run: () => switchMainTab("triage") },
-      { label: "📊 打开洞察图表与退订省钱沙盘", sub: "分类环图 + 省钱模拟器", run: () => switchMainTab("insights") },
-      { label: "📅 切换到续费与账单日历", sub: "按月查看账单与预计续费日", run: () => { switchMainTab("ledger"); state.viewMode = "calendar"; renderLedgerStage(state.workspace); } },
-      { label: "🎴 切换到票据卡片画廊", sub: "带品牌徽标与周期进度条", run: () => { switchMainTab("ledger"); state.viewMode = "cards"; renderLedgerStage(state.workspace); } },
-      { label: "📑 切换到台账表格视图", sub: "高密度列表核对", run: () => { switchMainTab("ledger"); state.viewMode = "table"; renderLedgerStage(state.workspace); } },
+      { label: "📊 打开洞察图表、商家档案与省钱沙盘", sub: "分类环图 + 商家涨价轨迹 + 省钱模拟器", run: () => switchMainTab("insights") },
+      { label: "📅 切换到续费与保修日历", sub: "按月查看账单、续费与保修截止日", run: () => { switchMainTab("ledger"); state.viewMode = "calendar"; renderLedgerStage(state.workspace); } },
+      { label: "🎴 切换到票据卡片画廊", sub: "带品牌徽标与上下文资产条", run: () => { switchMainTab("ledger"); state.viewMode = "cards"; renderLedgerStage(state.workspace); } },
+      { label: "📑 切换到资产台账列表", sub: "高密度列表核对", run: () => { switchMainTab("ledger"); state.viewMode = "table"; renderLedgerStage(state.workspace); } },
       { label: "🎨 切换外观主题（纸感 / 深海暗黑 / 极简）", sub: `当前：${state.theme}`, run: () => cycleTheme() },
-      { label: "👁 开关隐私防窥模糊模式", sub: "快捷键 P", run: () => togglePrivacy() },
-      { label: "📊 立即下载 Excel 账单表 (.csv)", sub: "UTF-8 BOM 不乱码", run: () => { window.location.href = tokenUrl("/api/export/csv"); } },
+      { label: "👁 开关隐私防窥模糊模式", sub: "快捷键 P（同时模糊金额、账号与密钥）", run: () => togglePrivacy() },
+      { label: "📊 立即下载 Excel 账单表 (.csv)", sub: "UTF-8 BOM 不乱码（不含敏感密钥）", run: () => { window.location.href = tokenUrl("/api/export/csv"); } },
       { label: "🔒 锁定当前账本", sub: "清空内存密钥", run: () => $("btn-lock-vault").click() },
     ];
 
@@ -1808,6 +2198,79 @@
     });
   }
 
+  // --- Progressive Disclosure for Asset Kinds (Drawer & Manual Modal) ---
+  function setEditAssetKind(kind, userClicked) {
+    state.editKind = kind || "general";
+    document.querySelectorAll("[data-ed-kind]").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-ed-kind") === state.editKind);
+    });
+    const curReimb = $("ed-reimburse-status").value || "none";
+    $("ed-panel-license").classList.toggle("hidden", state.editKind !== "license");
+    $("ed-panel-hardware").classList.toggle("hidden", state.editKind !== "hardware");
+    $("ed-panel-reimb").classList.toggle("hidden", state.editKind !== "reimbursable" && curReimb === "none");
+
+    const hasPeriod = Boolean($("ed-period-start").value || $("ed-period-end").value);
+    $("ed-period-row").classList.toggle(
+      "hidden",
+      (state.editKind === "hardware" || state.editKind === "license") && !hasPeriod
+    );
+
+    if (userClicked) {
+      if (state.editKind === "hardware" || state.editKind === "license") {
+        $("ed-cycle").value = "one_time";
+      } else if (state.editKind === "subscription" && ["unknown", "one_time"].includes($("ed-cycle").value)) {
+        $("ed-cycle").value = "monthly";
+      } else if (state.editKind === "reimbursable" && $("ed-reimburse-status").value === "none") {
+        $("ed-reimburse-status").value = "pending";
+      }
+      updateEditHardwareMetrics();
+    }
+  }
+
+  function updateEditHardwareMetrics() {
+    const box = $("ed-hardware-metrics");
+    if (!box) return;
+    if (state.editKind !== "hardware") {
+      box.classList.add("hidden");
+      return;
+    }
+    const buy = $("ed-bill-date").value;
+    const wend = $("ed-warranty-end").value;
+    const cur = $("ed-currency").value || "CNY";
+    const amt = $("ed-amount").value;
+    const pills = [];
+    const w = warrantyInfo(buy, wend);
+    if (w) pills.push(`<span class="badge ${w.level === "warn" ? "badge-amber" : w.level === "expired" ? "badge-slate" : "badge-violet"}">🛡️ ${esc(w.statusLabel)}</span>`);
+    const cpd = costPerDayInfo(buy, cur, amt);
+    if (cpd) pills.push(`<span class="cpd-pill sensitive">已陪伴 ${cpd.daysUsed} 天 · 日均 ${esc(cpd.perDayText)}/天</span>`);
+    if (pills.length > 0) {
+      box.innerHTML = pills.join("");
+      box.classList.remove("hidden");
+    } else {
+      box.classList.add("hidden");
+    }
+  }
+
+  function setManualAssetKind(kind) {
+    state.manualKind = kind || "subscription";
+    document.querySelectorAll("[data-man-kind]").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-man-kind") === state.manualKind);
+    });
+    $("man-panel-license").classList.toggle("hidden", state.manualKind !== "license");
+    $("man-panel-hardware").classList.toggle("hidden", state.manualKind !== "hardware");
+    $("man-panel-reimb").classList.toggle("hidden", state.manualKind !== "reimbursable");
+    $("man-cycle-row").classList.toggle("hidden", state.manualKind === "hardware" || state.manualKind === "license");
+
+    if (state.manualKind === "hardware" || state.manualKind === "license") {
+      state.manualCycle = "one_time";
+    } else if (state.manualKind === "subscription" && state.manualCycle === "one_time") {
+      state.manualCycle = "monthly";
+    }
+    document.querySelectorAll("[data-man-cycle]").forEach((x) => {
+      x.classList.toggle("active", x.getAttribute("data-man-cycle") === state.manualCycle);
+    });
+  }
+
   // --- Manual Entry Modal ---
   function openManualModal() {
     $("modal-manual").classList.remove("hidden");
@@ -1815,7 +2278,14 @@
     $("man-plan").value = "";
     $("man-amount").value = "";
     $("man-notes").value = "";
+    $("man-license-key").value = "";
+    $("man-license-key").type = "password";
+    $("btn-man-toggle-key").textContent = "显示";
+    $("man-license-scope").value = "";
+    $("man-warranty-end").value = "";
+    $("man-reimburse-status").value = "pending";
     $("man-bill-date").value = new Date().toISOString().slice(0, 10);
+    setManualAssetKind("subscription");
     $("man-vendor").focus();
   }
 
@@ -2097,7 +2567,16 @@
       downloadTextFile("SubVault-离线恢复密钥.txt", `# SubVault 离线恢复密钥（请离线妥善保管）\n${state.pendingRecoveryKey}\n`);
     });
 
-    // Manual entry quick chips & submit
+    // Manual entry asset kind, quick chips & submit
+    document.querySelectorAll("[data-man-kind]").forEach((b) => {
+      b.addEventListener("click", () => setManualAssetKind(b.getAttribute("data-man-kind")));
+    });
+    $("btn-man-toggle-key").addEventListener("click", () => {
+      const inp = $("man-license-key");
+      const show = inp.type === "password";
+      inp.type = show ? "text" : "password";
+      $("btn-man-toggle-key").textContent = show ? "隐藏" : "显示";
+    });
     document.querySelectorAll("[data-man-cycle]").forEach((b) => {
       b.addEventListener("click", () => {
         state.manualCycle = b.getAttribute("data-man-cycle");
@@ -2115,7 +2594,7 @@
       const btn = $("btn-submit-manual");
       btn.disabled = true;
       try {
-        const snap = await api("POST", "/api/manual-entry", {
+        const payload = {
           vendor: $("man-vendor").value,
           plan_name: $("man-plan").value,
           currency: $("man-currency").value,
@@ -2125,11 +2604,21 @@
           category: $("man-category").value,
           bill_date: $("man-bill-date").value,
           notes: $("man-notes").value,
-        });
+          asset_kind: state.manualKind,
+        };
+        if (state.manualKind === "license") {
+          payload.license_key = $("man-license-key").value;
+          payload.license_scope = $("man-license-scope").value;
+        } else if (state.manualKind === "hardware") {
+          payload.warranty_end = $("man-warranty-end").value;
+        } else if (state.manualKind === "reimbursable") {
+          payload.reimburse_status = $("man-reimburse-status").value;
+        }
+        const snap = await api("POST", "/api/manual-entry", payload);
         state.workspace = snap;
         closeManualModal();
         renderWorkspace();
-        showToast("已登记为加密自录凭证！", "ok");
+        showToast("已加密登记进我的资产库！", "ok");
       } catch (err) {
         showToast(err.message, "error");
       } finally {
@@ -2229,6 +2718,26 @@
       if (item) renderCsvRows(item);
     });
 
+    // Drawer asset kind progressive disclosure + live hardware metrics + license key controls
+    document.querySelectorAll("[data-ed-kind]").forEach((b) => {
+      b.addEventListener("click", () => setEditAssetKind(b.getAttribute("data-ed-kind"), true));
+    });
+    ["ed-bill-date", "ed-warranty-end", "ed-amount", "ed-currency"].forEach((id) => {
+      $(id).addEventListener("input", updateEditHardwareMetrics);
+      $(id).addEventListener("change", updateEditHardwareMetrics);
+    });
+    $("btn-ed-toggle-key").addEventListener("click", () => {
+      const inp = $("ed-license-key");
+      const show = inp.type === "password";
+      inp.type = show ? "text" : "password";
+      $("btn-ed-toggle-key").textContent = show ? "隐藏" : "显示";
+    });
+    $("btn-ed-copy-key").addEventListener("click", () => {
+      const val = $("ed-license-key").value.trim();
+      if (!val) { showToast("还没有填写激活密钥", "error"); return; }
+      copyLicenseKey($("ed-vendor").value, val);
+    });
+
     $("form-edit-item").addEventListener("submit", async (e) => {
       e.preventDefault();
       if (!state.selectedSourceId) return;
@@ -2236,7 +2745,7 @@
       btn.disabled = true;
       btn.textContent = "保存中…";
       try {
-        const snap = await api("POST", "/api/sources/save", {
+        const payload = {
           source_id: state.selectedSourceId,
           vendor: $("ed-vendor").value,
           plan_name: $("ed-plan").value,
@@ -2249,7 +2758,15 @@
           period_start: $("ed-period-start").value,
           period_end: $("ed-period-end").value,
           notes: $("ed-notes").value,
-        });
+          asset_kind: state.editKind,
+          warranty_end: $("ed-warranty-end").value,
+          license_scope: $("ed-license-scope").value,
+          reimburse_status: $("ed-reimburse-status").value,
+        };
+        if (state.editKind === "license") {
+          payload.license_key = $("ed-license-key").value;
+        }
+        const snap = await api("POST", "/api/sources/save", payload);
         state.workspace = snap;
         renderWorkspace();
         const refreshed = (snap.items || []).find((i) => i.source_id === state.selectedSourceId);

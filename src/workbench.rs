@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -561,6 +561,7 @@ fn dispatch(req: &HttpRequest, state: &ServerState) -> HttpResponse {
         ("POST", "/api/manual-entry") => api_manual_entry(req, state),
         ("POST", "/api/csv/promote") => api_csv_promote(req, state),
         ("POST", "/api/sources/save") => api_source_save(req, state),
+        ("POST", "/api/sources/reimburse") => api_source_reimburse(req, state),
         ("POST", "/api/facts/undo") => api_fact_undo(req, state),
         ("POST", "/api/sources/redact") => api_source_redact(req, state),
         ("GET", "/api/export/csv") => api_export_csv(state),
@@ -805,7 +806,35 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
             hooks: Hooks::default(),
         });
 
-        // 2. Styled OpenAI HTML receipt ($20.00 monthly) + renamed duplicate copy
+        // 2. Historical OpenAI HTML receipt ($18.00 Sep) + current Oct ($20.00, triggers +11% price drift!) + renamed duplicate copy
+        let openai_sep_html = r#"<!doctype html>
+<html>
+<head><style>body{font-family:sans-serif;color:#111}.box{border:1px solid #e2e8f0;padding:16px}</style></head>
+<body>
+  <div class="box">
+    <h2>OpenAI Receipt (Sample - Prior Month)</h2>
+    <p>From: OpenAI, LLC</p>
+    <p>Account email: work@example.com</p>
+    <p>Date paid: September 5, 2026</p>
+    <table>
+      <tr><th>Plan</th><td>ChatGPT Plus (Monthly)</td></tr>
+      <tr><th>Billing period</th><td>Sep 5, 2026 - Oct 5, 2026</td></tr>
+      <tr><th>Amount paid</th><td>$18.00</td></tr>
+    </table>
+  </div>
+</body>
+</html>"#;
+        let html_sep = tmp_dir.join("sample-openai-sep.html");
+        let _ = fs::write(&html_sep, openai_sep_html.as_bytes());
+        let _ = engine::submit_html(engine::HtmlRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_2a".into()),
+            source: html_sep,
+            batch_id: Some(batch_id.clone()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+
         let openai_html = r#"<!doctype html>
 <html>
 <head><style>body{font-family:sans-serif;color:#111}.box{border:1px solid #e2e8f0;padding:16px}</style></head>
@@ -924,7 +953,134 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
             hooks: Hooks::default(),
         });
 
-        // 6. Scanned-receipt style image (unextracted, lets user try Quick Triage!)
+        // 6. Hardware purchase invoice PDF (Apple MacBook Air ¥8,999 with warranty countdown + cost-per-day)
+        let today_days = today_epoch_days();
+        let hw_buy_date = format_epoch_days(today_days - 320);
+        let hw_warranty_end = format_epoch_days(today_days + 45);
+        let hw_stream = format!(
+            "BT\n{} Tj\nT* {} Tj\nT* {} Tj\nT* {} Tj\nT* {} Tj\nET",
+            utf16be_pdf_hex("增值税电子普通发票（示例）"),
+            utf16be_pdf_hex("销售方名称：苹果电子产品商贸有限公司"),
+            utf16be_pdf_hex("商品名称：MacBook Air M4 16G+512G 午夜色"),
+            utf16be_pdf_hex(&format!("开票日期：{hw_buy_date}")),
+            utf16be_pdf_hex("价税合计（小写）¥8999.00"),
+        );
+        let hw_pdf = tmp_dir.join("示例-MacBook-Air硬件保修发票.pdf");
+        let _ = fs::write(&hw_pdf, build_minimal_demo_pdf(hw_stream.as_bytes()));
+        let hw_rep = engine::submit_pdf(engine::PdfRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_hw".into()),
+            source: hw_pdf,
+            batch_id: Some(batch_id.clone()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+        if let Some(sid) = hw_rep.body["source_id"].as_str() {
+            let _ = engine::annotate_source(engine::AnnotateRequest {
+                vault: active.path.clone(),
+                source_id: sid.to_string(),
+                vendor: Some("Apple MacBook Air".into()),
+                plan_name: Some("M4 16G+512G 午夜色".into()),
+                account_label: Some("个人".into()),
+                billing_cycle: Some("one_time".into()),
+                category: Some("数码硬件".into()),
+                bill_date: Some(hw_buy_date),
+                notes: Some("官方商城一年有限保修，序列号原件已归档".into()),
+                asset_kind: Some("hardware".into()),
+                warranty_end: Some(hw_warranty_end),
+                license_key: None,
+                license_scope: None,
+                reimburse_status: Some("none".into()),
+                auth: auth.clone(),
+            });
+        }
+
+        // 7. Perpetual software license (Raycast Pro $99.00 with AEAD-encrypted license key)
+        let lic_html = r#"<!doctype html>
+<html>
+<head><style>body{font-family:sans-serif;color:#111}.card{border:1px solid #e2e8f0;padding:16px}</style></head>
+<body>
+  <div class="card">
+    <h2>Raycast Store Receipt (Sample)</h2>
+    <p>From: Raycast Technologies Ltd.</p>
+    <p>Date paid: 2026-08-15</p>
+    <table>
+      <tr><th>Product</th><td>Raycast Pro Perpetual License (One-Time)</td></tr>
+      <tr><th>Amount paid</th><td>$99.00</td></tr>
+    </table>
+  </div>
+</body>
+</html>"#;
+        let lic_path = tmp_dir.join("sample-raycast-license.html");
+        let _ = fs::write(&lic_path, lic_html.as_bytes());
+        let lic_rep = engine::submit_html(engine::HtmlRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_lic".into()),
+            source: lic_path,
+            batch_id: Some(batch_id.clone()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+        if let Some(sid) = lic_rep.body["source_id"].as_str() {
+            let _ = engine::annotate_source(engine::AnnotateRequest {
+                vault: active.path.clone(),
+                source_id: sid.to_string(),
+                vendor: Some("Raycast".into()),
+                plan_name: Some("Pro 终身买断版".into()),
+                account_label: Some("个人".into()),
+                billing_cycle: Some("one_time".into()),
+                category: Some("办公效率".into()),
+                bill_date: Some("2026-08-15".into()),
+                notes: Some("激活密钥已单独加密存放在本地密钥库".into()),
+                asset_kind: Some("license".into()),
+                warranty_end: None,
+                license_key: Some("RCST-DEMO-8842-K9X2".into()),
+                license_scope: Some("终身买断 · 最多激活 3 台设备".into()),
+                reimburse_status: Some("none".into()),
+                auth: auth.clone(),
+            });
+        }
+
+        // 8. Company reimbursable invoice PDF (腾讯云 ¥420.00, pending reimbursement)
+        let reimb_stream = format!(
+            "BT\n{} Tj\nT* {} Tj\nT* {} Tj\nT* {} Tj\nT* {} Tj\nET",
+            utf16be_pdf_hex("增值税电子普通发票（示例）"),
+            utf16be_pdf_hex("销售方名称：腾讯云计算（北京）有限责任公司"),
+            utf16be_pdf_hex("商品名称：研发测试环境云服务器资源包"),
+            utf16be_pdf_hex("开票日期：2026-11-15"),
+            utf16be_pdf_hex("价税合计（小写）¥420.00"),
+        );
+        let reimb_pdf = tmp_dir.join("示例-腾讯云企业报销发票.pdf");
+        let _ = fs::write(&reimb_pdf, build_minimal_demo_pdf(reimb_stream.as_bytes()));
+        let reimb_rep = engine::submit_pdf(engine::PdfRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_rb".into()),
+            source: reimb_pdf,
+            batch_id: Some(batch_id.clone()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+        if let Some(sid) = reimb_rep.body["source_id"].as_str() {
+            let _ = engine::annotate_source(engine::AnnotateRequest {
+                vault: active.path.clone(),
+                source_id: sid.to_string(),
+                vendor: Some("腾讯云".into()),
+                plan_name: Some("测试环境云服务器资源包".into()),
+                account_label: Some("公司工作".into()),
+                billing_cycle: Some("one_time".into()),
+                category: Some("云服务".into()),
+                bill_date: Some("2026-11-15".into()),
+                notes: Some("Q4 研发测试垫付费用，待月底统一提交财务报销".into()),
+                asset_kind: Some("reimbursable".into()),
+                warranty_end: None,
+                license_key: None,
+                license_scope: None,
+                reimburse_status: Some("pending".into()),
+                auth: auth.clone(),
+            });
+        }
+
+        // 9. Scanned-receipt style image (unextracted, lets user try Quick Triage!)
         // Minimal valid 1x1 PNG so image preview renders cleanly
         let tiny_png: &[u8] = &[
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
@@ -992,6 +1148,47 @@ fn api_manual_entry(req: &HttpRequest, state: &ServerState) -> HttpResponse {
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let notes = body["notes"].as_str().unwrap_or("").trim();
+    let asset_kind_raw = body["asset_kind"].as_str().unwrap_or("").trim();
+    let asset_kind = if asset_kind_raw.is_empty() {
+        if matches!(billing_cycle, "monthly" | "yearly" | "quarterly" | "weekly") {
+            "subscription".to_string()
+        } else {
+            "general".to_string()
+        }
+    } else {
+        asset_kind_raw.to_string()
+    };
+    let warranty_end = body
+        .get("warranty_end")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let license_key = body
+        .get("license_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let license_scope = body
+        .get("license_scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let reimburse_status = body
+        .get("reimburse_status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if asset_kind == "reimbursable" {
+                Some("pending".to_string())
+            } else {
+                Some("none".to_string())
+            }
+        });
 
     if vendor.is_empty() {
         return HttpResponse::error(400, "vendor_required", "请填写商家或服务名称");
@@ -1091,6 +1288,11 @@ fn api_manual_entry(req: &HttpRequest, state: &ServerState) -> HttpResponse {
             } else {
                 Some(notes.to_string())
             },
+            asset_kind: Some(asset_kind),
+            warranty_end,
+            license_key,
+            license_scope,
+            reimburse_status,
             auth,
         });
         if ann.code != EXIT_OK {
@@ -1455,6 +1657,38 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
     let mut account_set: BTreeSet<String> = BTreeSet::new();
     let mut category_set: BTreeSet<String> = BTreeSet::new();
 
+    #[derive(Default)]
+    struct ReimburseAcc {
+        pending_cents: i64,
+        pending_count: usize,
+        submitted_cents: i64,
+        submitted_count: usize,
+        reimbursed_cents: i64,
+        reimbursed_count: usize,
+    }
+    let mut reimburse_by_currency: BTreeMap<String, ReimburseAcc> = BTreeMap::new();
+
+    struct VendorBillPoint {
+        source_id: String,
+        date: String,
+        recorded_at: i64,
+        cents: i64,
+        amount_text: String,
+        billing_cycle: String,
+        account_label: Option<String>,
+        asset_kind: String,
+        vendor_display: String,
+    }
+    let mut vendor_groups: BTreeMap<(String, String), Vec<VendorBillPoint>> = BTreeMap::new();
+
+    let mut asset_subscription = 0usize;
+    let mut asset_license = 0usize;
+    let mut asset_hardware = 0usize;
+    let mut asset_reimbursable = 0usize;
+    let mut asset_general = 0usize;
+    let today_days = today_epoch_days();
+    let mut radar_warranties: Vec<Value> = Vec::new();
+
     let mut items = Vec::new();
     let mut duplicate_count = 0usize;
     let mut conflict_count = 0usize;
@@ -1535,6 +1769,51 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
             .map(|a| a.billing_cycle.as_str())
             .unwrap_or("unknown")
             .to_string();
+        let raw_asset_kind = ann.map(|a| a.asset_kind.as_str()).unwrap_or("general");
+        let is_recurring_cycle = matches!(
+            cycle.as_str(),
+            "monthly" | "yearly" | "quarterly" | "weekly"
+        );
+        let effective_asset_kind = if raw_asset_kind == "general" && is_recurring_cycle {
+            "subscription"
+        } else {
+            raw_asset_kind
+        };
+        let reimburse_status = ann.map(|a| a.reimburse_status.as_str()).unwrap_or("none");
+
+        match effective_asset_kind {
+            "subscription" => asset_subscription += 1,
+            "license" => asset_license += 1,
+            "hardware" => asset_hardware += 1,
+            "reimbursable" => asset_reimbursable += 1,
+            _ => asset_general += 1,
+        }
+        if effective_asset_kind != "reimbursable" && reimburse_status != "none" {
+            asset_reimbursable += 1;
+        }
+
+        if let Some(we) = ann.and_then(|a| a.warranty_end.as_deref()) {
+            if let Some(we_days) = parse_iso_days(we) {
+                let days_left = we_days - today_days;
+                if (0..=60).contains(&days_left) {
+                    let v_name = ann
+                        .and_then(|a| a.vendor.as_deref())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&display_name);
+                    radar_warranties.push(json!({
+                        "kind": "warranty_expiring",
+                        "severity": if days_left <= 14 { "danger" } else { "amber" },
+                        "vendor": v_name,
+                        "warranty_end": we,
+                        "days_left": days_left,
+                        "source_id": source_id,
+                        "label": format!("{v_name} 保修还剩 {days_left} 天"),
+                        "detail": format!("保修截止 {we}"),
+                    }));
+                }
+            }
+        }
+
         if let Some(acc) = ann.and_then(|a| a.account_label.as_ref()) {
             if !acc.is_empty() {
                 account_set.insert(acc.clone());
@@ -1623,6 +1902,56 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
                         .entry(month_key)
                         .or_insert(0) += cents;
                 }
+
+                // Reimbursement tracking per currency
+                if effective_asset_kind == "reimbursable" || reimburse_status != "none" {
+                    let racc = reimburse_by_currency.entry(cur.clone()).or_default();
+                    match reimburse_status {
+                        "submitted" => {
+                            racc.submitted_cents += cents;
+                            racc.submitted_count += 1;
+                        }
+                        "reimbursed" => {
+                            racc.reimbursed_cents += cents;
+                            racc.reimbursed_count += 1;
+                        }
+                        _ => {
+                            racc.pending_cents += cents;
+                            racc.pending_count += 1;
+                        }
+                    }
+                }
+
+                // Vendor asset portfolio tracking
+                if let Some(v_name) = ann
+                    .and_then(|a| a.vendor.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let date_key = ann
+                        .and_then(|a| a.bill_date.as_deref())
+                        .or_else(|| {
+                            period_fact
+                                .as_ref()
+                                .and_then(|p| p["value"]["period_start"].as_str())
+                        })
+                        .unwrap_or("")
+                        .to_string();
+                    vendor_groups
+                        .entry((v_name.to_lowercase(), cur.clone()))
+                        .or_default()
+                        .push(VendorBillPoint {
+                            source_id: source_id.clone(),
+                            date: date_key,
+                            recorded_at: latest_recorded_at,
+                            cents,
+                            amount_text: amt_text.clone(),
+                            billing_cycle: cycle.clone(),
+                            account_label: ann.and_then(|a| a.account_label.clone()),
+                            asset_kind: effective_asset_kind.to_string(),
+                            vendor_display: v_name.to_string(),
+                        });
+                }
             }
         }
 
@@ -1635,6 +1964,11 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
                 "category": a.category,
                 "bill_date": a.bill_date,
                 "notes": a.notes,
+                "asset_kind": effective_asset_kind,
+                "warranty_end": a.warranty_end,
+                "license_key": a.license_key,
+                "license_scope": a.license_scope,
+                "reimburse_status": a.reimburse_status,
                 "user_edited": a.user_edited,
                 "updated_at": a.updated_at,
             }),
@@ -1646,6 +1980,11 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
                 "category": Value::Null,
                 "bill_date": Value::Null,
                 "notes": Value::Null,
+                "asset_kind": effective_asset_kind,
+                "warranty_end": Value::Null,
+                "license_key": Value::Null,
+                "license_scope": Value::Null,
+                "reimburse_status": "none",
                 "user_edited": false,
                 "updated_at": 0,
             }),
@@ -1677,6 +2016,183 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
             }
         }));
     }
+
+    // Aggregate vendor portfolios + detect recurring price drift across chronological bills
+    let mut drift_by_source: BTreeMap<String, Value> = BTreeMap::new();
+    let mut radar_hikes: Vec<Value> = Vec::new();
+    let mut vendor_portfolio_raw: Vec<(String, i64, Value)> = Vec::new();
+
+    for ((_, cur), mut pts) in vendor_groups {
+        pts.sort_by(|a, b| a.date.cmp(&b.date).then(a.recorded_at.cmp(&b.recorded_at)));
+        let total_cents: i64 = pts.iter().map(|p| p.cents).sum();
+        let bill_count = pts.len();
+        let vendor_name = pts
+            .last()
+            .map(|p| p.vendor_display.clone())
+            .unwrap_or_default();
+        let latest_asset_kind = pts
+            .last()
+            .map(|p| p.asset_kind.clone())
+            .unwrap_or_else(|| "general".into());
+        let latest_amount = pts
+            .last()
+            .map(|p| p.amount_text.clone())
+            .unwrap_or_default();
+        let latest_date = pts.last().map(|p| p.date.clone()).unwrap_or_default();
+        let accounts: Vec<String> = pts
+            .iter()
+            .filter_map(|p| p.account_label.as_deref())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        // Detect price drift across recurring bills with the same billing_cycle
+        let recurring_pts: Vec<&VendorBillPoint> = pts
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.billing_cycle.as_str(),
+                    "monthly" | "yearly" | "quarterly" | "weekly"
+                )
+            })
+            .collect();
+        let mut price_drift = Value::Null;
+        if recurring_pts.len() >= 2 {
+            let curr = recurring_pts[recurring_pts.len() - 1];
+            if let Some(prev) = recurring_pts[..recurring_pts.len() - 1]
+                .iter()
+                .rev()
+                .find(|p| p.billing_cycle == curr.billing_cycle && p.cents > 0)
+            {
+                if curr.cents != prev.cents {
+                    let diff = curr.cents - prev.cents;
+                    let direction = if diff > 0 { "up" } else { "down" };
+                    let pct_abs = ((diff.abs() * 100) + (prev.cents / 2)) / prev.cents;
+                    let pct_signed = if diff > 0 { pct_abs } else { -pct_abs };
+                    let drift_obj = json!({
+                        "direction": direction,
+                        "prev_text": prev.amount_text,
+                        "curr_text": curr.amount_text,
+                        "diff_text": cents_to_text(diff),
+                        "pct_change": pct_signed,
+                        "currency": cur,
+                        "prev_date": prev.date,
+                        "curr_date": curr.date,
+                    });
+                    drift_by_source.insert(curr.source_id.clone(), drift_obj.clone());
+                    if direction == "up" {
+                        radar_hikes.push(json!({
+                            "kind": "price_hike",
+                            "severity": "amber",
+                            "vendor": vendor_name,
+                            "currency": cur,
+                            "pct_change": pct_signed,
+                            "source_id": curr.source_id,
+                            "label": format!("{vendor_name} 涨价 +{pct_abs}%"),
+                            "detail": format!("{} {} → {} {}", cur, prev.amount_text, cur, curr.amount_text),
+                        }));
+                    }
+                    price_drift = drift_obj;
+                }
+            }
+        }
+
+        let history: Vec<Value> = pts
+            .iter()
+            .map(|p| {
+                json!({
+                    "source_id": p.source_id,
+                    "date": p.date,
+                    "amount_text": p.amount_text,
+                    "cents": p.cents,
+                })
+            })
+            .collect();
+
+        vendor_portfolio_raw.push((
+            cur.clone(),
+            total_cents,
+            json!({
+                "vendor": vendor_name,
+                "currency": cur,
+                "asset_kind": latest_asset_kind,
+                "total_cents": total_cents,
+                "total_text": cents_to_text(total_cents),
+                "bill_count": bill_count,
+                "latest_amount_text": latest_amount,
+                "latest_date": latest_date,
+                "accounts": accounts,
+                "price_drift": price_drift,
+                "history": history,
+            }),
+        ));
+    }
+    vendor_portfolio_raw.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let vendor_portfolio: Vec<Value> = vendor_portfolio_raw
+        .into_iter()
+        .map(|(_, _, v)| v)
+        .collect();
+
+    // Attach detected price_drift directly onto the latest bill item for that vendor
+    for item in &mut items {
+        if let Some(sid) = item["source_id"].as_str() {
+            if let Some(drift) = drift_by_source.get(sid) {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("price_drift".into(), drift.clone());
+                }
+            }
+        }
+    }
+
+    let mut radar_reimburse: Vec<Value> = Vec::new();
+    let reimburse_summary: Vec<Value> = reimburse_by_currency
+        .into_iter()
+        .map(|(cur, racc)| {
+            let pending_text = cents_to_text(racc.pending_cents);
+            let submitted_text = cents_to_text(racc.submitted_cents);
+            let reimbursed_text = cents_to_text(racc.reimbursed_cents);
+            if racc.pending_count > 0 {
+                radar_reimburse.push(json!({
+                    "kind": "reimburse_pending",
+                    "severity": "emerald",
+                    "currency": cur,
+                    "pending_text": pending_text,
+                    "pending_count": racc.pending_count,
+                    "label": format!("待报销 {cur} {pending_text}（{} 笔）", racc.pending_count),
+                    "detail": "点击查看待报销凭证并一键流转状态",
+                }));
+            } else if racc.submitted_count > 0 {
+                radar_reimburse.push(json!({
+                    "kind": "reimburse_submitted",
+                    "severity": "slate",
+                    "currency": cur,
+                    "submitted_text": submitted_text,
+                    "submitted_count": racc.submitted_count,
+                    "label": format!("报销审批中 {cur} {submitted_text}（{} 笔）", racc.submitted_count),
+                    "detail": "点击跟踪已提交的报销单",
+                }));
+            }
+            json!({
+                "currency": cur,
+                "pending_cents": racc.pending_cents,
+                "pending_text": pending_text,
+                "pending_count": racc.pending_count,
+                "submitted_cents": racc.submitted_cents,
+                "submitted_text": submitted_text,
+                "submitted_count": racc.submitted_count,
+                "reimbursed_cents": racc.reimbursed_cents,
+                "reimbursed_text": reimbursed_text,
+                "reimbursed_count": racc.reimbursed_count,
+            })
+        })
+        .collect();
+
+    let mut asset_radar: Vec<Value> = Vec::new();
+    asset_radar.extend(radar_hikes);
+    asset_radar.extend(radar_warranties);
+    asset_radar.extend(radar_reimburse);
 
     // Sort newest first so freshly dropped bills appear immediately at the top
     items.sort_by(|a, b| {
@@ -1790,6 +2306,16 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
             "alerts": open_rep.body["alerts"],
         },
         "summary_by_currency": summary_by_currency,
+        "asset_counts": {
+            "subscription": asset_subscription,
+            "license": asset_license,
+            "hardware": asset_hardware,
+            "reimbursable": asset_reimbursable,
+            "general": asset_general,
+        },
+        "reimburse_summary": reimburse_summary,
+        "vendor_portfolio": vendor_portfolio,
+        "asset_radar": asset_radar,
         "analytics": {
             "categories": Value::Object(categories_json),
             "accounts": Value::Object(accounts_json),
@@ -2028,6 +2554,17 @@ fn api_csv_promote(req: &HttpRequest, state: &ServerState) -> HttpResponse {
                 notes: Some(format!(
                     "源自 CSV 流水第 {row_number} 行（{parent_source_id}）"
                 )),
+                asset_kind: Some(
+                    if matches!(billing_cycle, "monthly" | "yearly" | "quarterly" | "weekly") {
+                        "subscription".into()
+                    } else {
+                        "general".into()
+                    },
+                ),
+                warranty_end: None,
+                license_key: None,
+                license_scope: None,
+                reimburse_status: None,
                 auth,
             });
         }
@@ -2086,6 +2623,26 @@ fn api_source_save(req: &HttpRequest, state: &ServerState) -> HttpResponse {
                 .map(str::to_string),
             notes: body
                 .get("notes")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            asset_kind: body
+                .get("asset_kind")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            warranty_end: body
+                .get("warranty_end")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            license_key: body
+                .get("license_key")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            license_scope: body
+                .get("license_scope")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            reimburse_status: body
+                .get("reimburse_status")
                 .and_then(Value::as_str)
                 .map(str::to_string),
             auth: auth.clone(),
@@ -2204,6 +2761,55 @@ fn api_source_save(req: &HttpRequest, state: &ServerState) -> HttpResponse {
             }
         }
 
+        match build_workspace_snapshot(active) {
+            Ok(snap) => HttpResponse::json(200, snap),
+            Err(resp) => resp,
+        }
+    })
+}
+
+fn api_source_reimburse(req: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let body = match parse_json_body(req) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let source_id = body["source_id"].as_str().unwrap_or("").trim().to_string();
+    let status = body["reimburse_status"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if source_id.is_empty() {
+        return HttpResponse::error(400, "source_id_required", "缺少账单编号");
+    }
+    if !matches!(
+        status.as_str(),
+        "none" | "pending" | "submitted" | "reimbursed"
+    ) {
+        return HttpResponse::error(400, "bad_reimburse_status", "无效的报销状态");
+    }
+
+    with_active(state, |active| {
+        let rep = engine::annotate_source(engine::AnnotateRequest {
+            vault: active.path.clone(),
+            source_id,
+            vendor: None,
+            plan_name: None,
+            account_label: None,
+            billing_cycle: None,
+            category: None,
+            bill_date: None,
+            notes: None,
+            asset_kind: None,
+            warranty_end: None,
+            license_key: None,
+            license_scope: None,
+            reimburse_status: Some(status),
+            auth: active.auth(),
+        });
+        if rep.code != EXIT_OK {
+            return map_engine_error(&rep);
+        }
         match build_workspace_snapshot(active) {
             Ok(snap) => HttpResponse::json(200, snap),
             Err(resp) => resp,
@@ -2426,12 +3032,20 @@ fn api_export_csv(state: &ServerState) -> HttpResponse {
 
 fn build_excel_csv_bytes(active: &ActiveVault) -> Result<Vec<u8>, HttpResponse> {
     let snap = build_workspace_snapshot(active)?;
-    let mut out = String::from("\u{FEFF}商家/服务,项目/套餐,归属账号,计费周期,分类,币种,金额,账单日期,服务开始,服务结束,原件文件名,重复导入次数,原件SHA256,备注\n");
+    // Note: Raw license_key is deliberately omitted from plain Excel CSV exports for security.
+    let mut out = String::from("\u{FEFF}资产类型,商家/服务,项目/套餐,归属账号,计费周期,分类,币种,金额,账单日期,服务开始,服务结束,保修截止,报销状态,授权范围,原件文件名,重复导入次数,原件SHA256,备注\n");
     if let Some(items) = snap["items"].as_array() {
         for item in items {
             let ann = &item["annotation"];
             let amt = &item["amount_fact"]["value"];
             let per = &item["period_fact"]["value"];
+            let kind_zh = match ann["asset_kind"].as_str().unwrap_or("general") {
+                "subscription" => "周期订阅",
+                "license" => "买断授权",
+                "hardware" => "硬件保修",
+                "reimbursable" => "报销凭证",
+                _ => "普通账单",
+            };
             let cycle_zh = match ann["billing_cycle"].as_str().unwrap_or("unknown") {
                 "monthly" => "月付",
                 "yearly" => "年付",
@@ -2440,7 +3054,14 @@ fn build_excel_csv_bytes(active: &ActiveVault) -> Result<Vec<u8>, HttpResponse> 
                 "one_time" => "一次性",
                 _ => "未标注",
             };
+            let reimb_zh = match ann["reimburse_status"].as_str().unwrap_or("none") {
+                "pending" => "待报销",
+                "submitted" => "已提交",
+                "reimbursed" => "已到账",
+                _ => "",
+            };
             let cols = [
+                kind_zh,
                 ann["vendor"].as_str().unwrap_or(""),
                 ann["plan_name"].as_str().unwrap_or(""),
                 ann["account_label"].as_str().unwrap_or(""),
@@ -2451,6 +3072,9 @@ fn build_excel_csv_bytes(active: &ActiveVault) -> Result<Vec<u8>, HttpResponse> 
                 ann["bill_date"].as_str().unwrap_or(""),
                 per["period_start"].as_str().unwrap_or(""),
                 per["period_end"].as_str().unwrap_or(""),
+                ann["warranty_end"].as_str().unwrap_or(""),
+                reimb_zh,
+                ann["license_scope"].as_str().unwrap_or(""),
                 item["display_name"].as_str().unwrap_or(""),
                 &item["duplicate_hits"].as_u64().unwrap_or(0).to_string(),
                 item["content_sha256"].as_str().unwrap_or(""),
@@ -2783,4 +3407,50 @@ fn csv_escape(field: &str) -> String {
     } else {
         field.to_string()
     }
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    (y + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn today_epoch_days() -> i64 {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    secs / 86_400
+}
+
+fn parse_iso_days(s: &str) -> Option<i64> {
+    let mut parts = s.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+fn format_epoch_days(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
 }

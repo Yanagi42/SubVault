@@ -226,21 +226,29 @@
   <div id="modal-manual" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-card modal-card-wide">
       <div class="modal-head">
-        <h3>手动记一笔订阅 / 账单</h3>
+        <h3>手动记一笔资产 / 账单</h3>
         <button id="btn-close-manual" class="icon-btn" type="button" aria-label="关闭">×</button>
       </div>
       <p class="modal-desc">
-        找不到原始发票也没关系：系统会为你生成一份带时间戳与校验值的「用户口述自录凭证」安全加密存档，并纳入所有统计与日历中。
+        无论是月度订阅、买断软件授权、硬件保修凭证还是垫付报销，都会生成加密存档并纳入日历、图表与资产雷达。
       </p>
       <form id="form-manual-entry" class="form-stack">
+        <div class="kind-seg-bar" role="radiogroup" aria-label="选择资产类型">
+          <button type="button" class="kind-seg-btn active" data-man-kind="subscription">🔄 周期订阅</button>
+          <button type="button" class="kind-seg-btn" data-man-kind="license">🔑 买断授权</button>
+          <button type="button" class="kind-seg-btn" data-man-kind="hardware">🛡️ 硬件保修</button>
+          <button type="button" class="kind-seg-btn" data-man-kind="reimbursable">🧾 报销凭证</button>
+          <button type="button" class="kind-seg-btn" data-man-kind="general">📄 普通账单</button>
+        </div>
+
         <div class="form-row-2">
           <label class="field">
-            <span>商家 / 服务名 *</span>
-            <input id="man-vendor" type="text" required placeholder="例如 Spotify、百度网盘、Cursor">
+            <span>商家 / 品牌或设备名 *</span>
+            <input id="man-vendor" type="text" required placeholder="例如 Spotify、Raycast、MacBook Air">
           </label>
           <label class="field">
-            <span>套餐 / 项目名</span>
-            <input id="man-plan" type="text" placeholder="例如 个人会员、SVIP 年卡">
+            <span>套餐 / 型号说明</span>
+            <input id="man-plan" type="text" placeholder="例如 个人会员、Pro 买断版、16G+512G">
           </label>
         </div>
 
@@ -251,16 +259,53 @@
           </label>
           <label class="field">
             <span>金额 *</span>
-            <input id="man-amount" type="text" required placeholder="例如 29.00 或 19.99">
+            <input id="man-amount" type="text" required placeholder="例如 29.00 或 8999.00">
           </label>
         </div>
 
-        <div class="quick-chips-row">
+        <div id="man-cycle-row" class="quick-chips-row">
           <span class="quick-chip-label">快捷周期：</span>
           <button type="button" class="qchip active" data-man-cycle="monthly">月付</button>
           <button type="button" class="qchip" data-man-cycle="yearly">年付</button>
           <button type="button" class="qchip" data-man-cycle="quarterly">季付</button>
           <button type="button" class="qchip" data-man-cycle="one_time">一次性</button>
+        </div>
+
+        <!-- 渐进式展开：买断授权 -->
+        <div id="man-panel-license" class="asset-subpanel hidden">
+          <div class="form-row-2">
+            <label class="field">
+              <span>激活密钥 / 序列号（单独加密保存）</span>
+              <div class="input-with-btn">
+                <input id="man-license-key" type="password" autocomplete="off" placeholder="选填，例如 XXXX-XXXX-XXXX">
+                <button type="button" id="btn-man-toggle-key" class="btn btn-outline btn-sm">显示</button>
+              </div>
+            </label>
+            <label class="field">
+              <span>授权范围</span>
+              <input id="man-license-scope" type="text" placeholder="如 终身买断 · 最多 3 台设备">
+            </label>
+          </div>
+        </div>
+
+        <!-- 渐进式展开：硬件保修 -->
+        <div id="man-panel-hardware" class="asset-subpanel hidden">
+          <label class="field">
+            <span>保修截止日期（自动在日历提醒并计算日均持有成本）</span>
+            <input id="man-warranty-end" type="date">
+          </label>
+        </div>
+
+        <!-- 渐进式展开：报销凭证 -->
+        <div id="man-panel-reimb" class="asset-subpanel hidden">
+          <label class="field">
+            <span>当前报销进度</span>
+            <select id="man-reimburse-status">
+              <option value="pending">待报销（尚未提交）</option>
+              <option value="submitted">已提交财务审批</option>
+              <option value="reimbursed">已报销到账</option>
+            </select>
+          </label>
         </div>
 
         <div class="quick-chips-row">
@@ -277,24 +322,24 @@
           </label>
           <label class="field">
             <span>分类</span>
-            <input id="man-category" type="text" list="category-presets" placeholder="如 AI 工具、影音娱乐、云存储">
+            <input id="man-category" type="text" list="category-presets" placeholder="如 AI 工具、数码硬件、办公效率">
           </label>
         </div>
 
         <div class="form-row-2">
           <label class="field">
-            <span>账单日期</span>
+            <span>购买 / 账单日期</span>
             <input id="man-bill-date" type="date">
           </label>
           <label class="field">
             <span>备注（可选）</span>
-            <input id="man-notes" type="text" placeholder="如 微信免密自动续费、下月准备停掉">
+            <input id="man-notes" type="text" placeholder="如 微信免密自动续费、公司垫付可报销">
           </label>
         </div>
 
         <div class="modal-actions-row" style="justify-content:flex-end">
           <button id="btn-cancel-manual" class="btn btn-ghost" type="button">取消</button>
-          <button id="btn-submit-manual" class="btn btn-primary" type="submit">保存这笔记录</button>
+          <button id="btn-submit-manual" class="btn btn-primary" type="submit">保存这笔资产</button>
         </div>
       </form>
     </div>
@@ -328,16 +373,19 @@
       </div>
     </section>
 
+    <!-- 智能资产雷达条（仅在有涨价 / 保修临期 / 待报销时出现，平时零打扰） -->
+    <section id="asset-radar" class="asset-radar hidden" aria-label="资产提醒雷达"></section>
+
     <!-- 多币种真实统计总览卡片 -->
     <section id="summary-section" class="summary-grid" aria-label="花费总览"></section>
     <p class="honesty-caption">
-      所有金额均按原件币种独立统计（不瞎猜汇率、不连银行扣款）；重复文件只计算一次，每条数字都可一键核对原件。
+      所有金额均按原件币种独立统计（不瞎猜汇率、不连银行扣款）；重复文件只计算一次，每条资产都可一键核对原件。
     </p>
 
     <!-- 主导航标签 -->
     <nav class="tab-bar" role="tablist">
       <button class="tab-item active" data-tab="ledger" type="button">
-        我的账单 <span id="count-tab-ledger" class="tab-count">0</span>
+        我的资产 <span id="count-tab-ledger" class="tab-count">0</span>
       </button>
       <button class="tab-item" data-tab="insights" type="button">
         洞察与省钱沙盘
@@ -353,23 +401,25 @@
       </button>
     </nav>
 
-    <!-- 标签页 1：我的账单（卡片画廊 / 表格 / 续费日历 三视图） -->
+    <!-- 标签页 1：我的资产（卡片画廊 / 表格 / 续费与保修日历 三视图） -->
     <section id="pane-ledger" class="pane">
       <div class="toolbar">
         <div class="toolbar-left">
           <!-- 三视图切换器 -->
           <div class="view-switcher" role="group" aria-label="切换浏览视图">
-            <button class="vsw-btn active" data-view-mode="cards" type="button" title="票据卡片画廊">卡片</button>
-            <button class="vsw-btn" data-view-mode="table" type="button" title="高密度台账表格">列表</button>
-            <button class="vsw-btn" data-view-mode="calendar" type="button" title="账单与续费日历">日历</button>
+            <button class="vsw-btn active" data-view-mode="cards" type="button" title="票据资产卡片画廊">卡片</button>
+            <button class="vsw-btn" data-view-mode="table" type="button" title="高密度资产台账">列表</button>
+            <button class="vsw-btn" data-view-mode="calendar" type="button" title="续费与保修日历">日历</button>
           </div>
 
           <div class="filter-group" id="ledger-filters">
             <button class="pill active" data-filter="all" type="button">全部</button>
-            <button class="pill" data-filter="recurring" type="button">周期订阅</button>
-            <button class="pill" data-filter="needs" type="button">待补录/冲突</button>
-            <button class="pill" data-filter="duplicates" type="button">已去重</button>
+            <button class="pill" data-filter="subscription" type="button">周期订阅<span class="pill-cnt" data-cnt="subscription"></span></button>
+            <button class="pill" data-filter="license" type="button">买断授权<span class="pill-cnt" data-cnt="license"></span></button>
+            <button class="pill" data-filter="hardware" type="button">硬件保修<span class="pill-cnt" data-cnt="hardware"></span></button>
+            <button class="pill" data-filter="reimbursable" type="button">报销凭证<span class="pill-cnt" data-cnt="reimbursable"></span></button>
             <button class="pill" data-filter="csv" type="button">CSV 流水</button>
+            <button class="pill" data-filter="needs" type="button">待补录</button>
           </div>
         </div>
 
@@ -508,14 +558,25 @@
         <div id="drawer-warnings" class="warning-stack"></div>
 
         <form id="form-edit-item" class="form-stack">
+          <div class="field">
+            <span>资产类型</span>
+            <div class="kind-seg-bar" id="ed-kind-bar" role="radiogroup">
+              <button type="button" class="kind-seg-btn" data-ed-kind="subscription">🔄 周期订阅</button>
+              <button type="button" class="kind-seg-btn" data-ed-kind="license">🔑 买断授权</button>
+              <button type="button" class="kind-seg-btn" data-ed-kind="hardware">🛡️ 硬件保修</button>
+              <button type="button" class="kind-seg-btn" data-ed-kind="reimbursable">🧾 报销凭证</button>
+              <button type="button" class="kind-seg-btn" data-ed-kind="general">📄 普通账单</button>
+            </div>
+          </div>
+
           <div class="form-row-2">
             <label class="field">
-              <span>商家 / 服务名称</span>
-              <input id="ed-vendor" type="text" placeholder="如 OpenAI、Apple iCloud、WPS">
+              <span>商家 / 品牌或设备名</span>
+              <input id="ed-vendor" type="text" placeholder="如 OpenAI、Apple MacBook Air、Raycast">
             </label>
             <label class="field">
-              <span>项目 / 套餐名</span>
-              <input id="ed-plan" type="text" placeholder="如 ChatGPT Plus、2TB 方案">
+              <span>项目 / 套餐 / 型号</span>
+              <input id="ed-plan" type="text" placeholder="如 ChatGPT Plus、M4 16G+512G">
             </label>
           </div>
 
@@ -537,7 +598,7 @@
                 <option value="yearly">按年续费（年付）</option>
                 <option value="quarterly">按季续费（季付）</option>
                 <option value="weekly">按周续费（周付）</option>
-                <option value="one_time">一次性买断 / 单次消费</option>
+                <option value="one_time">一次性买断 / 单次购买</option>
               </select>
             </label>
           </div>
@@ -549,16 +610,17 @@
             </label>
             <label class="field">
               <span>账单金额</span>
-              <input id="ed-amount" type="text" placeholder="例如 98.00 或 19.99">
+              <input id="ed-amount" type="text" placeholder="例如 98.00 或 8999.00">
             </label>
           </div>
 
           <div class="form-row-2">
             <label class="field">
               <span>分类</span>
-              <input id="ed-category" type="text" list="category-presets" placeholder="如 AI 工具、云存储、开发工具">
+              <input id="ed-category" type="text" list="category-presets" placeholder="如 AI 工具、数码硬件、办公效率">
               <datalist id="category-presets">
                 <option value="AI 工具">
+                <option value="数码硬件">
                 <option value="云存储">
                 <option value="云服务">
                 <option value="开发工具">
@@ -570,12 +632,50 @@
               </datalist>
             </label>
             <label class="field">
-              <span>账单 / 付款日期</span>
+              <span>购买 / 账单日期</span>
               <input id="ed-bill-date" type="date">
             </label>
           </div>
 
-          <div class="form-row-2">
+          <!-- 渐进式展开：买断授权专属 -->
+          <div id="ed-panel-license" class="asset-subpanel hidden">
+            <label class="field">
+              <span>激活密钥 / 序列号（独立加密存放在本机，不随 Excel 表格导出）</span>
+              <div class="input-with-btn">
+                <input id="ed-license-key" type="password" autocomplete="off" class="sensitive" placeholder="粘贴软件激活码或设备序列号">
+                <button type="button" id="btn-ed-toggle-key" class="btn btn-outline btn-sm">显示</button>
+                <button type="button" id="btn-ed-copy-key" class="btn btn-outline btn-sm">复制</button>
+              </div>
+            </label>
+            <label class="field">
+              <span>授权范围</span>
+              <input id="ed-license-scope" type="text" placeholder="如 终身买断 · 最多激活 3 台设备">
+            </label>
+          </div>
+
+          <!-- 渐进式展开：硬件保修专属 -->
+          <div id="ed-panel-hardware" class="asset-subpanel hidden">
+            <label class="field">
+              <span>保修截止日期</span>
+              <input id="ed-warranty-end" type="date">
+            </label>
+            <div id="ed-hardware-metrics" class="hw-metric-box hidden"></div>
+          </div>
+
+          <!-- 渐进式展开：报销进度 -->
+          <div id="ed-panel-reimb" class="asset-subpanel hidden">
+            <label class="field">
+              <span>报销状态</span>
+              <select id="ed-reimburse-status">
+                <option value="none">不参与报销</option>
+                <option value="pending">待报销（尚未提交）</option>
+                <option value="submitted">已提交财务审批</option>
+                <option value="reimbursed">已报销到账</option>
+              </select>
+            </label>
+          </div>
+
+          <div id="ed-period-row" class="form-row-2">
             <label class="field">
               <span>服务周期开始</span>
               <input id="ed-period-start" type="date">
@@ -588,7 +688,7 @@
 
           <label class="field">
             <span>个人备注（在加密账本内全程加密保存）</span>
-            <textarea id="ed-notes" rows="3" placeholder="记录报销单号、取消提醒或账号说明…"></textarea>
+            <textarea id="ed-notes" rows="3" placeholder="记录报销单号、取消提醒或保修凭证说明…"></textarea>
           </label>
 
           <button id="btn-save-item" class="btn btn-primary btn-block" type="submit">

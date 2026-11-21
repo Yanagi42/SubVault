@@ -353,7 +353,7 @@ fn workbench_security_and_complete_end_to_end_user_workflow() {
     assert_eq!(status, 200, "{unlocked_again}");
     assert_eq!(unlocked_again["vault"]["source_count"], 4);
 
-    // 8. Demo pack import endpoint works cleanly on an unlocked vault (7 bilingual items + analytics)
+    // 8. Demo pack import endpoint works cleanly on an unlocked vault (full asset portfolio + analytics)
     let (status, demo_snap) = api_json(
         addr,
         "POST",
@@ -363,29 +363,92 @@ fn workbench_security_and_complete_end_to_end_user_workflow() {
     );
     assert_eq!(status, 200, "{demo_snap}");
     assert!(
-        demo_snap["vault"]["source_count"].as_u64().unwrap() >= 10,
+        demo_snap["vault"]["source_count"].as_u64().unwrap() >= 13,
         "{demo_snap}"
     );
     assert!(demo_snap["analytics"]["categories"].is_object());
     assert!(demo_snap["analytics"]["accounts"].is_object());
     assert!(demo_snap["analytics"]["monthly_trend"].is_object());
 
-    // 9. Self-declared manual entry works without a vendor invoice file and stays encrypted & verifiable
+    // Asset counts cover subscriptions, licenses, hardware warranties, and reimbursable invoices
+    assert!(demo_snap["asset_counts"]["subscription"].as_u64().unwrap() >= 4);
+    assert!(demo_snap["asset_counts"]["license"].as_u64().unwrap() >= 1);
+    assert!(demo_snap["asset_counts"]["hardware"].as_u64().unwrap() >= 1);
+    assert!(demo_snap["asset_counts"]["reimbursable"].as_u64().unwrap() >= 1);
+
+    // Vendor portfolio detects OpenAI price hike ($18.00 -> $20.00, +11%) and aggregates cumulative spend ($38.00)
+    let portfolio = demo_snap["vendor_portfolio"].as_array().unwrap();
+    let openai_vp = portfolio
+        .iter()
+        .find(|p| p["vendor"] == "OpenAI, LLC" && p["currency"] == "USD")
+        .expect("OpenAI vendor portfolio entry");
+    assert_eq!(openai_vp["bill_count"], 2, "{openai_vp}");
+    assert_eq!(openai_vp["total_text"], "38.00", "{openai_vp}");
+    assert_eq!(openai_vp["price_drift"]["direction"], "up", "{openai_vp}");
+    assert_eq!(openai_vp["price_drift"]["pct_change"], 11, "{openai_vp}");
+
+    // Asset radar lights up with price hike, expiring warranty, and pending reimbursement
+    let radar = demo_snap["asset_radar"].as_array().unwrap();
+    assert!(radar.iter().any(|r| r["kind"] == "price_hike"), "{radar:?}");
+    assert!(
+        radar.iter().any(|r| r["kind"] == "warranty_expiring"),
+        "{radar:?}"
+    );
+    assert!(
+        radar.iter().any(|r| r["kind"] == "reimburse_pending"),
+        "{radar:?}"
+    );
+
+    // 1-click reimbursement status workflow transitions pending -> submitted -> reimbursed cleanly
+    let tencent_sid = demo_snap["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["annotation"]["vendor"] == "腾讯云")
+        .expect("reimbursable demo item")["source_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, sub_snap) = api_json(
+        addr,
+        "POST",
+        "/api/sources/reimburse",
+        &token,
+        Some(json!({
+            "source_id": tencent_sid,
+            "reimburse_status": "submitted"
+        })),
+    );
+    assert_eq!(status, 200, "{sub_snap}");
+    let cny_reimb = sub_snap["reimburse_summary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["currency"] == "CNY")
+        .expect("CNY reimburse summary");
+    assert_eq!(cny_reimb["submitted_text"], "420.00", "{cny_reimb}");
+    assert_eq!(cny_reimb["pending_count"], 0, "{cny_reimb}");
+
+    // 9. Self-declared manual entry supports encrypted perpetual license keys without leaking plaintext on disk or CSV
+    let secret_key = "ULTRA-SECRET-KEY-9941-SubVault";
     let (status, man_snap) = api_json(
         addr,
         "POST",
         "/api/manual-entry",
         &token,
         Some(json!({
-            "vendor": "Spotify",
-            "plan_name": "Individual Monthly",
+            "vendor": "CleanShot X",
+            "plan_name": "Pro Perpetual",
             "account_label": "个人",
-            "billing_cycle": "monthly",
-            "category": "影音娱乐",
+            "billing_cycle": "one_time",
+            "category": "办公效率",
             "currency": "USD",
-            "amount_text": "11.99",
+            "amount_text": "29.00",
             "bill_date": "2026-11-20",
-            "notes": "微信自动续费"
+            "asset_kind": "license",
+            "license_key": secret_key,
+            "license_scope": "终身买断 · 单机激活",
+            "notes": "官网直购"
         })),
     );
     assert_eq!(status, 200, "{man_snap}");
@@ -395,10 +458,33 @@ fn workbench_security_and_complete_end_to_end_user_workflow() {
         .starts_with("src_"));
     assert!(
         man_snap["items"].as_array().unwrap().iter().any(|i| {
-            i["annotation"]["vendor"] == "Spotify"
-                && i["amount_fact"]["value"]["amount_text"] == "11.99"
+            i["annotation"]["vendor"] == "CleanShot X"
+                && i["annotation"]["asset_kind"] == "license"
+                && i["annotation"]["license_key"] == secret_key
+                && i["amount_fact"]["value"]["amount_text"] == "29.00"
         }),
         "{man_snap}"
+    );
+
+    // Raw license keys MUST NEVER appear in plain Excel CSV exports OR on disk inside vault.db!
+    let (status, _, excel_bytes_2) =
+        http_call(addr, "GET", "/api/export/csv", Some(&token), None, None);
+    assert_eq!(status, 200);
+    let excel_str_2 = String::from_utf8_lossy(&excel_bytes_2);
+    assert!(excel_str_2.contains("资产类型"));
+    assert!(excel_str_2.contains("买断授权"));
+    assert!(!excel_str_2.contains(secret_key));
+    assert!(!excel_str_2.contains("RCST-DEMO-8842-K9X2"));
+
+    let db_bytes = fs::read(vault_dir.join("vault.db")).unwrap();
+    let db_lossy = String::from_utf8_lossy(&db_bytes);
+    assert!(
+        !db_lossy.contains(secret_key),
+        "raw manual license key leaked into vault.db"
+    );
+    assert!(
+        !db_lossy.contains("RCST-DEMO-8842-K9X2"),
+        "raw demo license key leaked into vault.db"
     );
 
     server.stop();
