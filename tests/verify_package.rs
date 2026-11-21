@@ -4,8 +4,27 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_subvault")
+fn bin() -> PathBuf {
+    if let Ok(path) = std::env::var("SUBVAULT_TEST_BIN") {
+        return PathBuf::from(path);
+    }
+    let compiled = PathBuf::from(env!("CARGO_BIN_EXE_subvault"));
+    if compiled.exists() {
+        return compiled;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let name = if cfg!(windows) {
+            "subvault.exe"
+        } else {
+            "subvault"
+        };
+        if let Some(candidate) = exe.parent().and_then(|p| p.parent()).map(|p| p.join(name)) {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    compiled
 }
 
 struct Tmp {
@@ -178,16 +197,42 @@ fn verify_package_catches_tampered_original_missing_file_extra_file_and_symlink(
     assert_eq!(code, 12, "{body}");
     assert_eq!(body["reason"], "missing_file");
 
-    // 3. Replace original with a symlink -> symlink_in_package
-    let outside = tmp.path().join("outside.bin");
-    fs::write(&outside, &orig_bytes).unwrap();
-    std::os::unix::fs::symlink(&outside, &orig_path).unwrap();
-    let (code, body) = run(&["verify-package", "--package", pack.to_str().unwrap()]);
-    assert_eq!(code, 12, "{body}");
-    assert_eq!(body["reason"], "symlink_in_package");
+    // 3. Replace original with a symlink (Unix) or drop a directory junction (Windows)
+    #[cfg(unix)]
+    {
+        let outside = tmp.path().join("outside.bin");
+        fs::write(&outside, &orig_bytes).unwrap();
+        std::os::unix::fs::symlink(&outside, &orig_path).unwrap();
+        let (code, body) = run(&["verify-package", "--package", pack.to_str().unwrap()]);
+        assert_eq!(code, 12, "{body}");
+        assert_eq!(body["reason"], "symlink_in_package");
+        fs::remove_file(&orig_path).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let outside_dir = tmp.path().join("outside_dir");
+        fs::create_dir(&outside_dir).unwrap();
+        let junction = pack.join("sneaky_junction");
+        let status = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                junction.to_str().unwrap(),
+                outside_dir.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        fs::write(&orig_path, &orig_bytes).unwrap();
+        let (code, body) = run(&["verify-package", "--package", pack.to_str().unwrap()]);
+        assert_eq!(code, 12, "{body}");
+        assert_eq!(body["reason"], "symlink_in_package");
+        fs::remove_dir(&junction).unwrap();
+        fs::remove_file(&orig_path).unwrap();
+    }
 
     // Restore clean original
-    fs::remove_file(&orig_path).unwrap();
     fs::write(&orig_path, &orig_bytes).unwrap();
     let (code, body) = run(&["verify-package", "--package", pack.to_str().unwrap()]);
     assert_eq!(code, 0, "{body}");

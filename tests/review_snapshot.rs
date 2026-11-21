@@ -6,8 +6,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_subvault")
+fn bin() -> PathBuf {
+    if let Ok(path) = std::env::var("SUBVAULT_TEST_BIN") {
+        return PathBuf::from(path);
+    }
+    let compiled = PathBuf::from(env!("CARGO_BIN_EXE_subvault"));
+    if compiled.exists() {
+        return compiled;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let name = if cfg!(windows) {
+            "subvault.exe"
+        } else {
+            "subvault"
+        };
+        if let Some(candidate) = exe.parent().and_then(|p| p.parent()).map(|p| p.join(name)) {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    compiled
 }
 
 const ACTOR: &str = "act_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -632,11 +651,17 @@ fn review_does_not_pair_current_facts_with_an_older_package() {
 }
 
 fn copy_tree(from: &Path, to: &Path) {
-    let status = Command::new("cp")
-        .args(["-R", from.to_str().unwrap(), to.to_str().unwrap()])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&src, &dst);
+        } else {
+            fs::copy(&src, &dst).unwrap();
+        }
+    }
 }
 
 fn assert_receipt_matches_sheet(reviewed: &Value, text: &str) {
@@ -704,10 +729,12 @@ fn assert_fact_history(text: &str) {
     }
 }
 
+#[cfg(unix)]
 struct Flock {
     child: Option<std::process::Child>,
 }
 
+#[cfg(unix)]
 impl Flock {
     fn hold(lock: &Path) -> Self {
         let ready = std::env::temp_dir().join(format!(
@@ -755,6 +782,7 @@ time.sleep(30)
     }
 }
 
+#[cfg(unix)]
 impl Drop for Flock {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
@@ -762,6 +790,116 @@ impl Drop for Flock {
                 .args(["-KILL", &child.id().to_string()])
                 .status();
             let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(windows)]
+struct Flock {
+    handle: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+impl Flock {
+    fn hold(lock: &Path) -> Self {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            h_event: *mut c_void,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share: u32,
+                security: *const c_void,
+                disposition: u32,
+                flags: u32,
+                template: *mut c_void,
+            ) -> *mut c_void;
+            fn LockFileEx(
+                file: *mut c_void,
+                flags: u32,
+                reserved: u32,
+                len_low: u32,
+                len_high: u32,
+                overlapped: *mut Overlapped,
+            ) -> i32;
+        }
+
+        let mut wide: Vec<u16> = lock.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0x8000_0000 | 0x4000_0000,
+                0x0000_0001 | 0x0000_0002,
+                ptr::null(),
+                4,
+                0x80,
+                ptr::null_mut(),
+            )
+        };
+        assert!(!handle.is_null() && handle != (-1isize) as usize as *mut c_void);
+        let mut ov = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            h_event: ptr::null_mut(),
+        };
+        let ok = unsafe { LockFileEx(handle, 0x0000_0002 | 0x0000_0001, 0, 1, 0, &mut ov) };
+        assert_ne!(ok, 0, "LockFileEx helper failed");
+        Self { handle }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Flock {
+    fn drop(&mut self) {
+        use std::ffi::c_void;
+        use std::ptr;
+
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            h_event: *mut c_void,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn UnlockFileEx(
+                file: *mut c_void,
+                reserved: u32,
+                len_low: u32,
+                len_high: u32,
+                overlapped: *mut Overlapped,
+            ) -> i32;
+            fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+
+        let mut ov = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            h_event: ptr::null_mut(),
+        };
+        unsafe {
+            UnlockFileEx(self.handle, 0, 1, 0, &mut ov);
+            CloseHandle(self.handle);
         }
     }
 }

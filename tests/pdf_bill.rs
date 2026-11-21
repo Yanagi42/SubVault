@@ -6,11 +6,33 @@ use serde_json::Value;
 
 const ACTOR: &str = "act_00000000000000000000000000000002";
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_subvault")
+fn bin() -> PathBuf {
+    if let Ok(path) = std::env::var("SUBVAULT_TEST_BIN") {
+        return PathBuf::from(path);
+    }
+    let compiled = PathBuf::from(env!("CARGO_BIN_EXE_subvault"));
+    if compiled.exists() {
+        return compiled;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let name = if cfg!(windows) {
+            "subvault.exe"
+        } else {
+            "subvault"
+        };
+        if let Some(candidate) = exe.parent().and_then(|p| p.parent()).map(|p| p.join(name)) {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    compiled
 }
 
 fn corpus() -> PathBuf {
+    if let Ok(dir) = std::env::var("SUBVAULT_CORPUS_DIR") {
+        return PathBuf::from(dir);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("synthetic/corpus")
 }
 

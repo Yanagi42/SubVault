@@ -1,13 +1,32 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_subvault")
+fn bin() -> PathBuf {
+    if let Ok(path) = std::env::var("SUBVAULT_TEST_BIN") {
+        return PathBuf::from(path);
+    }
+    let compiled = PathBuf::from(env!("CARGO_BIN_EXE_subvault"));
+    if compiled.exists() {
+        return compiled;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let name = if cfg!(windows) {
+            "subvault.exe"
+        } else {
+            "subvault"
+        };
+        if let Some(candidate) = exe.parent().and_then(|p| p.parent()).map(|p| p.join(name)) {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    compiled
 }
 
 const ACTOR: &str = "act_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -69,20 +88,13 @@ fn run(args: &[&str]) -> (i32, Value) {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    let mut child = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(bytes).unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_string()
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }
 
 fn init(tmp: &Tmp, name: &str, format: &str) -> PathBuf {
@@ -1092,24 +1104,27 @@ fn review_names_a_package_original_only_after_the_bytes_match() {
     assert_eq!(reviewed["originals_verified"], 0);
     assert!(!fs::read_to_string(&short).unwrap().contains("originals/"));
 
-    let linked = tmp.path.join("linked");
-    fs::create_dir_all(linked.join("originals")).unwrap();
-    std::os::unix::fs::symlink(&original, linked.join("originals").join(object_id)).unwrap();
-    let link_sheet = tmp.path.join("link.txt");
-    let (code, reviewed) = run(&[
-        "review",
-        "--vault",
-        vault.to_str().unwrap(),
-        "--package",
-        linked.to_str().unwrap(),
-        "--out",
-        link_sheet.to_str().unwrap(),
-    ]);
-    assert_eq!(code, 0, "{reviewed}");
-    assert_eq!(reviewed["originals_verified"], 0);
-    assert!(!fs::read_to_string(&link_sheet)
-        .unwrap()
-        .contains("originals/"));
+    #[cfg(unix)]
+    {
+        let linked = tmp.path.join("linked");
+        fs::create_dir_all(linked.join("originals")).unwrap();
+        std::os::unix::fs::symlink(&original, linked.join("originals").join(object_id)).unwrap();
+        let link_sheet = tmp.path.join("link.txt");
+        let (code, reviewed) = run(&[
+            "review",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--package",
+            linked.to_str().unwrap(),
+            "--out",
+            link_sheet.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{reviewed}");
+        assert_eq!(reviewed["originals_verified"], 0);
+        assert!(!fs::read_to_string(&link_sheet)
+            .unwrap()
+            .contains("originals/"));
+    }
 
     let named = tmp.path.join("named.txt");
     let (code, reviewed) = run(&[
