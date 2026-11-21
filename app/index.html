@@ -1,49 +1,85 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="paper">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SubVault — 本地隐私订阅与账单工作台</title>
+  <title>SubVault — 本地隐私订阅与票据档案馆</title>
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <!-- 顶部全局栏 -->
+  <!-- 全屏磁吸拖拽光晕遮罩 -->
+  <div id="global-drop-overlay" class="drop-overlay hidden" aria-hidden="true">
+    <div class="drop-overlay-inner">
+      <div class="drop-overlay-ring">↓</div>
+      <h2>松手即刻加密入库</h2>
+      <p>支持拖入单个或多个 PDF 发票、邮件 HTML、支付宝/微信 CSV、收据截图，甚至整个文件夹</p>
+      <div class="drop-overlay-pills">
+        <span>自动按原件去重</span>
+        <span>原件字节零改动</span>
+        <span>100% 本机处理</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 庆祝彩纸 Canvas -->
+  <canvas id="confetti-canvas" class="confetti-canvas hidden" aria-hidden="true"></canvas>
+
+  <!-- 顶部导航栏 -->
   <header class="topbar">
     <div class="topbar-inner">
       <div class="brand">
-        <img src="/icon.svg" alt="SubVault" class="brand-icon" width="32" height="32">
+        <img src="/icon.svg" alt="SubVault" class="brand-icon" width="34" height="34">
         <div>
           <div class="brand-row">
             <h1 class="brand-title">SubVault</h1>
             <span id="vault-status-chip" class="chip chip-neutral">纯本地 · 不联网</span>
           </div>
-          <div id="vault-path-sub" class="brand-sub">零银行登录 · 零邮箱授权 · 账单原件防篡改留存</div>
+          <div id="vault-path-sub" class="brand-sub">零银行登录 · 零邮箱授权 · 私人票据防篡改档案馆</div>
         </div>
       </div>
 
-      <div id="topbar-workspace-actions" class="topbar-actions hidden">
-        <label class="btn btn-primary" for="file-picker-input">
-          + 导入账单文件
-        </label>
-        <input id="file-picker-input" type="file" multiple accept=".pdf,.html,.htm,.csv,.txt,.png,.jpg,.jpeg,.webp" class="hidden">
+      <div class="topbar-right-cluster">
+        <!-- 全局快捷小按钮（主题 + 隐私防窥 + 命令面板） -->
+        <div class="utility-bar">
+          <button id="btn-theme-cycle" class="util-btn" type="button" title="切换界面风格（纸感账簿 / 深海金库 / 清爽极简）">
+            <span id="theme-icon">◐</span>
+            <span id="theme-label">纸感账簿</span>
+          </button>
+          <button id="btn-privacy-toggle" class="util-btn hidden" type="button" title="隐私防窥模糊（快捷键 P）">
+            <span id="privacy-icon">👁</span>
+            <span id="privacy-label">防窥</span>
+          </button>
+          <button id="btn-cmd-open" class="util-btn util-kbd hidden" type="button" title="打开快捷命令面板（Ctrl+K）">
+            <span>搜索 / 指令</span>
+            <kbd>Ctrl K</kbd>
+          </button>
+        </div>
 
-        <label class="btn btn-outline" for="folder-picker-input">
-          导入整个文件夹
-        </label>
-        <input id="folder-picker-input" type="file" webkitdirectory multiple class="hidden">
+        <!-- 解锁后的工作区操作 -->
+        <div id="topbar-workspace-actions" class="topbar-actions hidden">
+          <label class="btn btn-primary" for="file-picker-input">+ 导入账单</label>
+          <input id="file-picker-input" type="file" multiple accept=".pdf,.html,.htm,.csv,.txt,.png,.jpg,.jpeg,.webp" class="hidden">
 
-        <button id="btn-lock-vault" class="btn btn-ghost" type="button" title="立即清空内存密钥并锁回解锁界面">
-          锁定账本
-        </button>
-        <button id="btn-shutdown-app" class="btn btn-ghost-danger" type="button" title="清空内存密钥并关闭本地服务">
-          安全退出
-        </button>
+          <label class="btn btn-outline" for="folder-picker-input">导入文件夹</label>
+          <input id="folder-picker-input" type="file" webkitdirectory multiple class="hidden">
+
+          <button id="btn-open-manual" class="btn btn-outline" type="button" title="没有原件发票也能快速手动登记一笔订阅">
+            + 手动记一笔
+          </button>
+
+          <button id="btn-lock-vault" class="btn btn-ghost" type="button" title="立即清空内存密钥并锁定账本">
+            锁定
+          </button>
+          <button id="btn-shutdown-app" class="btn btn-ghost-danger" type="button" title="清空密钥并关闭本地服务">
+            退出
+          </button>
+        </div>
       </div>
     </div>
   </header>
 
-  <!-- 顶部轻提示 -->
+  <!-- 轻提示 Toast -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite">
     <span id="toast-msg"></span>
     <button id="toast-close" class="toast-close" type="button" aria-label="关闭提示">×</button>
@@ -52,11 +88,10 @@
   <!-- 视图 0：欢迎与解锁大厅 -->
   <main id="screen-lobby" class="lobby-wrap">
     <section class="lobby-hero">
-      <span class="hero-eyebrow">100% 本机运行 · 无云端上传 · 无账号绑定</span>
-      <h2>把散落在邮箱和网盘里的账单，整理成一本只属于你的加密账本</h2>
+      <div class="hero-stamp">ARCHIVE · LOCAL ONLY · ZERO CLOUD</div>
+      <h2>把散落各处的账单原件，收进一座只属于你的加密票据馆</h2>
       <p>
-        支持直接拖入国内外 PDF 发票、带样式的邮件 HTML、支付宝/微信 CSV 流水与收据截图。
-        自动按原件内容去重，不瞎估状态，所有数字都能一键对照原始凭证，随时一键打包带走。
+        拖入国内外 PDF 发票、邮件 HTML、支付宝/微信 CSV 与收据截图；自动按原件防重，用日历、分类环图和退订省钱沙盘把钱花在哪里看得清清楚楚。
       </p>
     </section>
 
@@ -80,9 +115,9 @@
           </label>
 
           <div class="seg-toggle" role="tablist">
-            <button type="button" class="seg-btn active" data-unlock-mode="passphrase">使用主密码解锁</button>
-            <button type="button" class="seg-btn" data-unlock-mode="recovery">使用恢复密钥解锁</button>
-            <button type="button" class="seg-btn" data-unlock-mode="os-disk">无密码（系统盘模式）</button>
+            <button type="button" class="seg-btn active" data-unlock-mode="passphrase">主密码解锁</button>
+            <button type="button" class="seg-btn" data-unlock-mode="recovery">恢复密钥解锁</button>
+            <button type="button" class="seg-btn" data-unlock-mode="os-disk">系统盘免密</button>
           </div>
 
           <label id="unlock-passphrase-wrap" class="field">
@@ -98,7 +133,7 @@
           <div id="unlock-error" class="form-error hidden"></div>
 
           <button id="btn-unlock-submit" class="btn btn-primary btn-block" type="submit">
-            解锁并进入账本
+            解锁并打开票据馆
           </button>
         </form>
       </section>
@@ -107,7 +142,7 @@
       <section class="card lobby-card">
         <div class="card-head">
           <h3>新建一本本地账本</h3>
-          <span class="badge badge-emerald">首次使用</span>
+          <span class="badge badge-emerald">开箱即用</span>
         </div>
 
         <form id="form-create-vault" class="form-stack">
@@ -126,14 +161,14 @@
                 <input type="radio" name="create-protection" value="passphrase" checked>
                 <div>
                   <strong>推荐：主密码加密保护</strong>
-                  <small>账本内所有原件、商家备注与账单金额在硬盘上全部加密，并生成一份离线恢复密钥备用。</small>
+                  <small>账本内所有原件、商家备注与账单金额在硬盘上全部加密，并生成离线恢复密钥备用。</small>
                 </div>
               </label>
               <label class="radio-card" id="opt-os-disk">
                 <input type="radio" name="create-protection" value="os-disk">
                 <div>
                   <strong>系统磁盘加密模式（免输密码）</strong>
-                  <small>适合电脑已开启 BitLocker / FileVault / LUKS 全盘加密的用户，打开即用。</small>
+                  <small>适合已开启 BitLocker / FileVault / LUKS 全盘加密的电脑，双击即入。</small>
                 </div>
               </label>
             </div>
@@ -153,14 +188,14 @@
           <div id="create-error" class="form-error hidden"></div>
 
           <button id="btn-create-submit" class="btn btn-emerald btn-block" type="submit">
-            创建并立即使用
+            创建并开始使用
           </button>
         </form>
       </section>
     </div>
   </main>
 
-  <!-- 恢复密钥保存弹窗（新建加密账本或轮换恢复密钥后强制提示） -->
+  <!-- 恢复密钥保存弹窗 -->
   <div id="modal-recovery" class="modal-backdrop hidden" role="dialog" aria-modal="true">
     <div class="modal-card">
       <div class="modal-head">
@@ -168,7 +203,7 @@
         <span class="badge badge-amber">仅显示这一次</span>
       </div>
       <p class="modal-desc">
-        因为 SubVault 完全不联网、不存您的密码，如果您日后忘记主密码，这串恢复密钥是<strong>唯一</strong>找回账本的方式。建议下载保存或手抄存放在安全处。
+        SubVault 完全不联网、不存密码。若日后忘记主密码，这串恢复密钥是<strong>唯一</strong>能找回账本的钥匙。建议立即下载 `.txt` 离线保管。
       </p>
       <div class="recovery-box">
         <code id="modal-recovery-key"></code>
@@ -187,91 +222,206 @@
     </div>
   </div>
 
+  <!-- 手动记一笔弹窗（无原件快速直录） -->
+  <div id="modal-manual" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card modal-card-wide">
+      <div class="modal-head">
+        <h3>手动记一笔订阅 / 账单</h3>
+        <button id="btn-close-manual" class="icon-btn" type="button" aria-label="关闭">×</button>
+      </div>
+      <p class="modal-desc">
+        找不到原始发票也没关系：系统会为你生成一份带时间戳与校验值的「用户口述自录凭证」安全加密存档，并纳入所有统计与日历中。
+      </p>
+      <form id="form-manual-entry" class="form-stack">
+        <div class="form-row-2">
+          <label class="field">
+            <span>商家 / 服务名 *</span>
+            <input id="man-vendor" type="text" required placeholder="例如 Spotify、百度网盘、Cursor">
+          </label>
+          <label class="field">
+            <span>套餐 / 项目名</span>
+            <input id="man-plan" type="text" placeholder="例如 个人会员、SVIP 年卡">
+          </label>
+        </div>
+
+        <div class="form-row-2">
+          <label class="field">
+            <span>币种</span>
+            <select id="man-currency"></select>
+          </label>
+          <label class="field">
+            <span>金额 *</span>
+            <input id="man-amount" type="text" required placeholder="例如 29.00 或 19.99">
+          </label>
+        </div>
+
+        <div class="quick-chips-row">
+          <span class="quick-chip-label">快捷周期：</span>
+          <button type="button" class="qchip active" data-man-cycle="monthly">月付</button>
+          <button type="button" class="qchip" data-man-cycle="yearly">年付</button>
+          <button type="button" class="qchip" data-man-cycle="quarterly">季付</button>
+          <button type="button" class="qchip" data-man-cycle="one_time">一次性</button>
+        </div>
+
+        <div class="quick-chips-row">
+          <span class="quick-chip-label">快捷账号：</span>
+          <button type="button" class="qchip active" data-man-acc="个人">个人</button>
+          <button type="button" class="qchip" data-man-acc="公司工作">公司工作</button>
+          <button type="button" class="qchip" data-man-acc="家庭共享">家庭共享</button>
+        </div>
+
+        <div class="form-row-2">
+          <label class="field">
+            <span>归属账号</span>
+            <input id="man-account" type="text" value="个人" placeholder="个人 / 公司工作 / 邮箱">
+          </label>
+          <label class="field">
+            <span>分类</span>
+            <input id="man-category" type="text" list="category-presets" placeholder="如 AI 工具、影音娱乐、云存储">
+          </label>
+        </div>
+
+        <div class="form-row-2">
+          <label class="field">
+            <span>账单日期</span>
+            <input id="man-bill-date" type="date">
+          </label>
+          <label class="field">
+            <span>备注（可选）</span>
+            <input id="man-notes" type="text" placeholder="如 微信免密自动续费、下月准备停掉">
+          </label>
+        </div>
+
+        <div class="modal-actions-row" style="justify-content:flex-end">
+          <button id="btn-cancel-manual" class="btn btn-ghost" type="button">取消</button>
+          <button id="btn-submit-manual" class="btn btn-primary" type="submit">保存这笔记录</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 全局命令面板 (Ctrl+K) -->
+  <div id="modal-cmd" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="cmd-card">
+      <div class="cmd-input-wrap">
+        <span class="cmd-icon">⌘</span>
+        <input id="cmd-input" type="text" placeholder="搜索任意账单、商家，或输入指令（如：日历、沙盘、暗黑、防窥、导出）…">
+        <kbd>Esc</kbd>
+      </div>
+      <div id="cmd-list" class="cmd-list"></div>
+    </div>
+  </div>
+
   <!-- 视图 1：主工作区（解锁后显示） -->
   <main id="screen-workspace" class="workspace-wrap hidden">
-    <!-- 拖拽导入区 + 批量进度条 -->
-    <section id="drop-zone" class="drop-banner">
-      <div class="drop-banner-left">
-        <div class="drop-icon">↓</div>
-        <div>
-          <strong>把账单文件或整个文件夹直接拖到这里即可入库</strong>
-          <div class="drop-hint">
-            支持 PDF 发票（中英文）、邮件 HTML、支付宝/微信/银行 CSV、文本与收据截图（PNG/JPG/WebP）；重复文件自动识别不重算。
-          </div>
-        </div>
+    <!-- 顶部导入进度与轻量提示条 -->
+    <section id="drop-strip" class="drop-strip">
+      <div class="drop-strip-left">
+        <span class="drop-dot"></span>
+        <span>随时把 <strong>PDF / HTML / 支付宝微信 CSV / 截图</strong> 或<strong>整个文件夹</strong>拖到窗口任意处入库</span>
       </div>
-      <div id="import-progress" class="import-progress hidden"></div>
+      <div class="drop-strip-right">
+        <div id="import-progress" class="import-progress hidden"></div>
+        <button id="btn-quick-triage-cta" class="btn btn-amber-soft btn-sm hidden" type="button">
+          ⚡ 有 <span id="cta-triage-count">0</span> 条待整理，立即极速过一遍 →
+        </button>
+      </div>
     </section>
 
-    <!-- 多币种真实花费统计区 -->
+    <!-- 多币种真实统计总览卡片 -->
     <section id="summary-section" class="summary-grid" aria-label="花费总览"></section>
     <p class="honesty-caption">
-      说明：以上统计严格基于本账本已入库账单按币种独立汇总（不虚构汇率换算、不连接银行核验扣款）；重复导入的相同原件只计算一次。
+      所有金额均按原件币种独立统计（不瞎猜汇率、不连银行扣款）；重复文件只计算一次，每条数字都可一键核对原件。
     </p>
 
     <!-- 主导航标签 -->
     <nav class="tab-bar" role="tablist">
       <button class="tab-item active" data-tab="ledger" type="button">
-        全部订阅与账单 <span id="count-tab-ledger" class="tab-count">0</span>
+        我的账单 <span id="count-tab-ledger" class="tab-count">0</span>
+      </button>
+      <button class="tab-item" data-tab="insights" type="button">
+        洞察与省钱沙盘
+      </button>
+      <button class="tab-item" data-tab="triage" type="button">
+        ⚡ 极速整理 <span id="count-tab-triage" class="tab-count tab-count-amber">0</span>
       </button>
       <button class="tab-item" data-tab="attention" type="button">
-        去重与待核对 <span id="count-tab-attention" class="tab-count tab-count-amber">0</span>
+        去重与待核对 <span id="count-tab-attention" class="tab-count">0</span>
       </button>
       <button class="tab-item" data-tab="export" type="button">
-        导出备份与安全设置
+        导出备份与安全
       </button>
     </nav>
 
-    <!-- 标签页 1：订阅与账单主台账 -->
+    <!-- 标签页 1：我的账单（卡片画廊 / 表格 / 续费日历 三视图） -->
     <section id="pane-ledger" class="pane">
       <div class="toolbar">
-        <div class="filter-group" id="ledger-filters">
-          <button class="pill active" data-filter="all" type="button">全部</button>
-          <button class="pill" data-filter="recurring" type="button">周期订阅</button>
-          <button class="pill" data-filter="needs" type="button">待补录 / 冲突</button>
-          <button class="pill" data-filter="duplicates" type="button">已自动去重</button>
-          <button class="pill" data-filter="csv" type="button">CSV 流水</button>
+        <div class="toolbar-left">
+          <!-- 三视图切换器 -->
+          <div class="view-switcher" role="group" aria-label="切换浏览视图">
+            <button class="vsw-btn active" data-view-mode="cards" type="button" title="票据卡片画廊">卡片</button>
+            <button class="vsw-btn" data-view-mode="table" type="button" title="高密度台账表格">列表</button>
+            <button class="vsw-btn" data-view-mode="calendar" type="button" title="账单与续费日历">日历</button>
+          </div>
+
+          <div class="filter-group" id="ledger-filters">
+            <button class="pill active" data-filter="all" type="button">全部</button>
+            <button class="pill" data-filter="recurring" type="button">周期订阅</button>
+            <button class="pill" data-filter="needs" type="button">待补录/冲突</button>
+            <button class="pill" data-filter="duplicates" type="button">已去重</button>
+            <button class="pill" data-filter="csv" type="button">CSV 流水</button>
+          </div>
         </div>
 
         <div class="toolbar-right">
+          <span id="active-cat-chip" class="active-filter-chip hidden">
+            <span id="active-cat-label"></span>
+            <button id="btn-clear-cat" type="button" aria-label="清除分类筛选">×</button>
+          </span>
           <select id="filter-account" class="select-sm" title="按归属账号筛选">
             <option value="">所有账号</option>
           </select>
           <select id="filter-currency" class="select-sm" title="按币种筛选">
             <option value="">所有币种</option>
           </select>
-          <input id="search-box" class="search-box" type="search" placeholder="搜索商家、项目、账号、备注、文件名…">
+          <input id="search-box" class="search-box" type="search" placeholder="搜索商家、账号、备注… (按 / 聚焦)">
         </div>
       </div>
 
-      <div id="ledger-list-wrap" class="card table-card"></div>
+      <div id="ledger-stage"></div>
     </section>
 
-    <!-- 标签页 2：去重与待核对 -->
+    <!-- 标签页 2：洞察图表 + 退订省钱沙盘 -->
+    <section id="pane-insights" class="pane hidden"></section>
+
+    <!-- 标签页 3：⚡ 极速整理模式 -->
+    <section id="pane-triage" class="pane hidden"></section>
+
+    <!-- 标签页 4：去重与待核对 -->
     <section id="pane-attention" class="pane hidden"></section>
 
-    <!-- 标签页 3：导出备份与安全设置 -->
+    <!-- 标签页 5：导出备份与安全中心 -->
     <section id="pane-export" class="pane hidden">
       <div class="export-grid">
         <div class="card export-card">
           <h3>一键导出 Excel 账单表（.csv）</h3>
-          <p>导出带 UTF-8 BOM 编码的表格文件，Windows Excel 双击直接打开中文不乱码，包含商家、套餐、账号、周期、金额、日期与原件校验值。</p>
+          <p>带 UTF-8 BOM 编码，Windows Excel 双击打开中文绝不乱码，含商家、套餐、账号、周期、金额、日期与原件 SHA-256。</p>
           <button id="btn-dl-excel" class="btn btn-primary" type="button">下载 Excel 账单表 (.csv)</button>
         </div>
 
         <div class="card export-card">
           <h3>一键下载完整离线备份包（.zip）</h3>
-          <p>包含全部原始账单原件、<code>facts.csv</code>、<code>ledger-excel.csv</code>、可读核对单与 <code>manifest.json</code> 完整哈希校验清单，永不锁定。</p>
+          <p>包含全部原始账单原件、<code>facts.csv</code>、<code>ledger-excel.csv</code>、可读核对单与 <code>manifest.json</code> 校验清单，零锁定。</p>
           <label id="zip-ack-row" class="checkbox-row hidden">
             <input id="chk-zip-ack" type="checkbox">
-            <span>我已知晓：导出的备份包内含明文原件与账单记录，会妥善保管</span>
+            <span>我已知晓：导出的备份包内含明文原件与记录，会妥善保管</span>
           </label>
           <button id="btn-dl-zip" class="btn btn-emerald" type="button">下载完整离线备份包 (.zip)</button>
         </div>
 
         <div class="card export-card">
           <h3>导出到本地文件夹并自动完整性校验</h3>
-          <p>直接在硬盘生成标准离线退出目录，并立即用独立校验引擎逐文件核验 SHA-256。</p>
+          <p>在硬盘生成标准离线退出目录，并立即用独立校验引擎逐文件核验 SHA-256。</p>
           <label class="field">
             <span>导出文件夹路径（不能在当前账本内部）</span>
             <div class="input-with-btn">
@@ -289,7 +439,7 @@
 
         <div class="card export-card">
           <h3>独立校验任意离线备份包</h3>
-          <p>选择之前导出的任意备份文件夹，核对其中每个原件和表格是否完整无篡改。</p>
+          <p>选择之前导出的任意备份文件夹，逐个核对原件和表格是否完整无篡改。</p>
           <label class="field">
             <span>备份包目录路径</span>
             <div class="input-with-btn">
@@ -303,7 +453,7 @@
 
         <div id="card-security-rotate" class="card export-card hidden">
           <h3>安全设置：修改账本主密码</h3>
-          <p>无需重新导入文件，事务性轮换加密密钥槽；也可同时作废旧恢复密钥并生成新密钥。</p>
+          <p>无需重新导入文件，安全轮换主密码；也可同步生成新的离线恢复密钥并作废旧密钥。</p>
           <form id="form-rotate-pass" class="form-stack">
             <label class="field">
               <span>新主密码（至少 6 位）</span>
@@ -315,7 +465,7 @@
             </label>
             <label class="checkbox-row">
               <input id="chk-rotate-recovery" type="checkbox">
-              <span>同时重新生成一份新的离线恢复密钥（旧恢复密钥将立即失效）</span>
+              <span>同时重新生成一份新的离线恢复密钥（旧密钥立即失效）</span>
             </label>
             <button class="btn btn-outline" type="submit">更新主密码</button>
           </form>
@@ -324,15 +474,24 @@
     </section>
   </main>
 
-  <!-- 右侧抽屉：单条账单的原件证据、人工编辑、CSV 流水挑拣、历史与脱敏 -->
+  <!-- 右侧抽屉：票据档案详情与编辑 -->
   <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
   <aside id="detail-drawer" class="drawer hidden" aria-label="账单详情与原件核对">
-    <div class="drawer-header">
-      <div>
-        <h3 id="drawer-title">账单详情</h3>
-        <div id="drawer-subtitle" class="drawer-sub"></div>
+    <div class="drawer-receipt-top">
+      <div class="drawer-head-row">
+        <div class="drawer-brand-group">
+          <div id="drawer-avatar" class="brand-avatar">SV</div>
+          <div>
+            <h3 id="drawer-title">账单详情</h3>
+            <div id="drawer-subtitle" class="drawer-sub"></div>
+          </div>
+        </div>
+        <div class="drawer-head-right">
+          <span id="drawer-stamp" class="verify-stamp">SHA-256 VERIFIED</span>
+          <button id="btn-close-drawer" class="icon-btn" type="button" aria-label="关闭抽屉">×</button>
+        </div>
       </div>
-      <button id="btn-close-drawer" class="icon-btn" type="button" aria-label="关闭抽屉">×</button>
+      <div class="perforation-line"></div>
     </div>
 
     <div class="drawer-tabs" id="drawer-tabs">
@@ -344,7 +503,7 @@
     </div>
 
     <div class="drawer-body">
-      <!-- 抽屉页 1：编辑与兜底手录 -->
+      <!-- 抽屉页 1：编辑与手录 -->
       <div id="dpane-edit" class="dpane">
         <div id="drawer-warnings" class="warning-stack"></div>
 
@@ -363,7 +522,7 @@
           <div class="form-row-2">
             <label class="field">
               <span>归属账号（区分个人 / 工作）</span>
-              <input id="ed-account" type="text" list="account-presets" placeholder="个人 / 公司 / 邮箱">
+              <input id="ed-account" type="text" list="account-presets" placeholder="个人 / 公司工作 / 邮箱">
               <datalist id="account-presets">
                 <option value="个人">
                 <option value="公司工作">
@@ -464,13 +623,13 @@
 
       <!-- 抽屉页 4：不可篡改修改历史与撤销 -->
       <div id="dpane-history" class="dpane hidden">
-        <p class="muted-note">每一次自动提取、手动登记、金额修改和撤销都会按时间顺序追加记录，原始账单字节永远不会被改写。</p>
+        <p class="muted-note">每一次自动提取、手动登记、金额修正和撤销都按时间顺序追加记录，原始账单字节永不被改写。</p>
         <div id="history-timeline" class="timeline"></div>
       </div>
 
       <!-- 抽屉页 5：单条隐私脱敏导出 -->
       <div id="dpane-redact" class="dpane hidden">
-        <p class="muted-note">自动抹去本账单中的姓名、邮箱、电话、卡号、订单号、日期与具体金额数字（保留币种与排版），方便安全分享或排查格式问题。</p>
+        <p class="muted-note">自动抹去本账单中的姓名、邮箱、电话、卡号、订单号、日期与具体金额数字（保留币种与排版），方便安全分享或反馈账单版式。</p>
         <label class="field">
           <span>额外要抹去的敏感词（可选，用逗号隔开）</span>
           <input id="redact-custom-terms" type="text" placeholder="例如 张三, 某某科技有限公司">

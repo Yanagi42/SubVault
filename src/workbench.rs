@@ -558,6 +558,7 @@ fn dispatch(req: &HttpRequest, state: &ServerState) -> HttpResponse {
         ("GET", "/api/workspace") => api_workspace(state),
         ("POST", "/api/import") => api_import_file(req, state),
         ("POST", "/api/import-demo-pack") => api_import_demo_pack(state),
+        ("POST", "/api/manual-entry") => api_manual_entry(req, state),
         ("POST", "/api/csv/promote") => api_csv_promote(req, state),
         ("POST", "/api/sources/save") => api_source_save(req, state),
         ("POST", "/api/facts/undo") => api_fact_undo(req, state),
@@ -843,7 +844,109 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
             hooks: Hooks::default(),
         });
 
-        // 3. Alipay GBK CSV sample statement
+        // 3. GitHub Copilot (Work account, $10.00 monthly)
+        let github_html = r#"<!doctype html>
+<html>
+<head><style>body{font-family:sans-serif}</style></head>
+<body>
+  <h2>GitHub Payment Receipt</h2>
+  <p>From: GitHub, Inc.</p>
+  <p>Account email: dev-work@company.example</p>
+  <p>Date paid: 2026-11-08</p>
+  <table>
+    <tr><th>Plan</th><td>GitHub Copilot Individual (Monthly)</td></tr>
+    <tr><th>Billing period</th><td>2026-11-08 through 2026-12-08</td></tr>
+    <tr><th>Amount paid</th><td>$10.00</td></tr>
+  </table>
+</body>
+</html>"#;
+        let gh_path = tmp_dir.join("sample-github-copilot.html");
+        let _ = fs::write(&gh_path, github_html.as_bytes());
+        let _ = engine::submit_html(engine::HtmlRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_gh".into()),
+            source: gh_path,
+            batch_id: Some(batch_id.clone()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+
+        // 4. Apple iCloud+ 2TB (Personal account, ¥68.00 monthly)
+        let apple_html = r#"<!doctype html>
+<html>
+<head><style>body{font-family:sans-serif}</style></head>
+<body>
+  <h2>Apple 电子收据（示例）</h2>
+  <p>收款方：Apple iCloud</p>
+  <p>账号：个人</p>
+  <p>账单日期：2026-11-12</p>
+  <table>
+    <tr><th>套餐</th><td>iCloud+ 2TB 云存储（连续包月）</td></tr>
+    <tr><th>服务周期</th><td>2026年11月12日 至 2026年12月12日</td></tr>
+    <tr><th>实付金额</th><td>¥68.00</td></tr>
+  </table>
+</body>
+</html>"#;
+        let apple_path = tmp_dir.join("示例-Apple-iCloud月账单.html");
+        let _ = fs::write(&apple_path, apple_html.as_bytes());
+        let _ = engine::submit_html(engine::HtmlRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_ap".into()),
+            source: apple_path,
+            batch_id: Some(batch_id.clone()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+
+        // 5. Netflix Standard ($15.49 monthly)
+        let nf_html = r#"<!doctype html>
+<html>
+<head><style>body{font-family:sans-serif}</style></head>
+<body>
+  <h2>Netflix Payment Confirmation</h2>
+  <p>From: Netflix</p>
+  <p>Date paid: 2026-11-18</p>
+  <table>
+    <tr><th>Subscription</th><td>Standard Monthly Plan</td></tr>
+    <tr><th>Billing period</th><td>Nov 18, 2026 - Dec 18, 2026</td></tr>
+    <tr><th>Amount paid</th><td>$15.49</td></tr>
+  </table>
+</body>
+</html>"#;
+        let nf_path = tmp_dir.join("sample-netflix-nov.html");
+        let _ = fs::write(&nf_path, nf_html.as_bytes());
+        let _ = engine::submit_html(engine::HtmlRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_nf".into()),
+            source: nf_path,
+            batch_id: Some(batch_id.clone()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+
+        // 6. Scanned-receipt style image (unextracted, lets user try Quick Triage!)
+        // Minimal valid 1x1 PNG so image preview renders cleanly
+        let tiny_png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let shot_path = tmp_dir.join("示例-待补录收据截图.png");
+        let _ = fs::write(&shot_path, tiny_png);
+        let _ = engine::import_file(engine::ImportRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("dm_").unwrap_or_else(|_| "dm_img".into()),
+            batch_id: Some(batch_id.clone()),
+            media_type: "image/png".into(),
+            source: shot_path,
+            display_name: Some("示例-待补录收据截图.png".into()),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+
+        // 7. Alipay GBK CSV sample statement
         let alipay_str = "支付宝交易记录明细查询（示例）\n账号:[personal@example.com]\n------------------------------------\n交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态\n2026-10-01 09:00:00,云服务,Apple,iCloud+ 2TB 连续包月,支出,68.00,招商银行,交易成功\n2026-10-06 14:20:00,影音娱乐,哔哩哔哩,大会员连续包月,支出,15.00,余额宝,交易成功\n2026-10-12 20:00:00,开发工具,JetBrains,All Products Pack 年付,支出,1980.00,信用卡,交易成功\n";
         let (gbk_bytes, _, _) = encoding_rs::GB18030.encode(alipay_str);
         let csv_path = tmp_dir.join("示例-支付宝账单明细.csv");
@@ -860,6 +963,147 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
         let _ = fs::remove_dir_all(&tmp_dir);
         match build_workspace_snapshot(active) {
             Ok(snap) => HttpResponse::json(200, snap),
+            Err(resp) => resp,
+        }
+    })
+}
+
+fn api_manual_entry(req: &HttpRequest, state: &ServerState) -> HttpResponse {
+    let body = match parse_json_body(req) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let vendor = body["vendor"].as_str().unwrap_or("").trim();
+    let plan_name = body["plan_name"].as_str().unwrap_or("").trim();
+    let account_label = body["account_label"].as_str().unwrap_or("").trim();
+    let billing_cycle = body["billing_cycle"].as_str().unwrap_or("monthly").trim();
+    let category = body["category"].as_str().unwrap_or("").trim();
+    let currency_raw = body["currency"].as_str().unwrap_or("CNY").trim();
+    let amount_raw = body["amount_text"].as_str().unwrap_or("").trim();
+    let bill_date = body["bill_date"].as_str().unwrap_or("").trim();
+    let period_start = body["period_start"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let period_end = body["period_end"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let notes = body["notes"].as_str().unwrap_or("").trim();
+
+    if vendor.is_empty() {
+        return HttpResponse::error(400, "vendor_required", "请填写商家或服务名称");
+    }
+    let Some(norm_amt) = crate::real_extract::normalize_amount_text(amount_raw) else {
+        return HttpResponse::error(400, "bad_amount", "请填写有效金额，例如 29.99 或 68");
+    };
+    let Some(norm_cur) = crate::real_extract::normalize_currency(currency_raw) else {
+        return HttpResponse::error(400, "bad_currency", "不支持该币种");
+    };
+
+    with_active(state, |active| {
+        let auth = active.auth();
+        let entry_id = ids::random_id("man_").unwrap_or_else(|_| "man_1".into());
+        let note_text = format!(
+            "SubVault Self-Declared Entry (No Original Vendor File)\nEntry ID: {entry_id}\nVendor: {vendor}\nPlan: {plan_name}\nAccount: {account_label}\nBilling cycle: {billing_cycle}\nCategory: {category}\nCurrency: {norm_cur}\nAmount: {norm_amt}\nBill date: {bill_date}\nNotes: {notes}\nHonesty notice: Recorded directly by user without an attached vendor invoice.\n"
+        );
+        let display_name = sanitize_filename(&format!(
+            "自录-{}-{}.txt",
+            vendor,
+            if bill_date.is_empty() {
+                "记录"
+            } else {
+                bill_date
+            }
+        ));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "subvault-man-{}",
+            ids::random_id("mn_").unwrap_or_else(|_| "tmp".into())
+        ));
+        if let Err(err) = fs::create_dir_all(&tmp_dir) {
+            return HttpResponse::error(500, "temp_failed", &err.to_string());
+        }
+        let temp_file = tmp_dir.join(&display_name);
+        if let Err(err) = fs::write(&temp_file, note_text.as_bytes()) {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return HttpResponse::error(500, "temp_write_failed", &err.to_string());
+        }
+        let imp = engine::import_file(engine::ImportRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("me_").unwrap_or_else(|_| "me_1".into()),
+            batch_id: None,
+            media_type: "text/plain;charset=utf-8".into(),
+            source: temp_file,
+            display_name: Some(display_name),
+            auth: auth.clone(),
+            hooks: Hooks::default(),
+        });
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if imp.code != EXIT_OK {
+            return map_engine_error(&imp);
+        }
+        let source_id = imp.body["source_id"].as_str().unwrap_or("").to_string();
+
+        let rec = engine::record_manual_fact(engine::ManualFactRequest {
+            vault: active.path.clone(),
+            command_id: ids::random_id("mf_").unwrap_or_else(|_| "mf_1".into()),
+            source_id: source_id.clone(),
+            currency: Some(norm_cur.to_string()),
+            amount_text: Some(norm_amt),
+            period_start,
+            period_end,
+            actor_id: WORKBENCH_ACTOR_ID.into(),
+            auth: auth.clone(),
+        });
+        if rec.code != EXIT_OK {
+            return map_engine_error(&rec);
+        }
+
+        let ann = engine::annotate_source(engine::AnnotateRequest {
+            vault: active.path.clone(),
+            source_id: source_id.clone(),
+            vendor: Some(vendor.to_string()),
+            plan_name: if plan_name.is_empty() {
+                None
+            } else {
+                Some(plan_name.to_string())
+            },
+            account_label: if account_label.is_empty() {
+                None
+            } else {
+                Some(account_label.to_string())
+            },
+            billing_cycle: Some(billing_cycle.to_string()),
+            category: if category.is_empty() {
+                None
+            } else {
+                Some(category.to_string())
+            },
+            bill_date: if bill_date.is_empty() {
+                None
+            } else {
+                Some(bill_date.to_string())
+            },
+            notes: if notes.is_empty() {
+                Some("用户手动直录（暂无商家原件）".into())
+            } else {
+                Some(notes.to_string())
+            },
+            auth,
+        });
+        if ann.code != EXIT_OK {
+            return map_engine_error(&ann);
+        }
+
+        match build_workspace_snapshot(active) {
+            Ok(mut snap) => {
+                if let Some(obj) = snap.as_object_mut() {
+                    obj.insert("created_source_id".into(), json!(source_id));
+                }
+                HttpResponse::json(200, snap)
+            }
             Err(resp) => resp,
         }
     })
@@ -1205,6 +1449,9 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
         bill_count: usize,
     }
     let mut by_currency: BTreeMap<String, CurrencyAcc> = BTreeMap::new();
+    let mut cat_by_currency: BTreeMap<String, BTreeMap<String, (i64, usize)>> = BTreeMap::new();
+    let mut acc_by_currency: BTreeMap<String, BTreeMap<String, (i64, usize)>> = BTreeMap::new();
+    let mut month_by_currency: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
     let mut account_set: BTreeSet<String> = BTreeSet::new();
     let mut category_set: BTreeSet<String> = BTreeSet::new();
 
@@ -1330,6 +1577,52 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
                     }
                     _ => {}
                 }
+
+                // Category breakdown (exact integer cents)
+                let cat_label = ann
+                    .and_then(|a| a.category.as_deref())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("未分类")
+                    .to_string();
+                let cat_entry = cat_by_currency
+                    .entry(cur.clone())
+                    .or_default()
+                    .entry(cat_label)
+                    .or_insert((0, 0));
+                cat_entry.0 += cents;
+                cat_entry.1 += 1;
+
+                // Account breakdown (exact integer cents)
+                let acc_label = ann
+                    .and_then(|a| a.account_label.as_deref())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("未分组")
+                    .to_string();
+                let acc_entry = acc_by_currency
+                    .entry(cur.clone())
+                    .or_default()
+                    .entry(acc_label)
+                    .or_insert((0, 0));
+                acc_entry.0 += cents;
+                acc_entry.1 += 1;
+
+                // Monthly spend rhythm (YYYY-MM from bill_date or period_start)
+                let ym = ann
+                    .and_then(|a| a.bill_date.as_deref())
+                    .or_else(|| {
+                        period_fact
+                            .as_ref()
+                            .and_then(|p| p["value"]["period_start"].as_str())
+                    })
+                    .and_then(|d| d.get(0..7))
+                    .map(str::to_string);
+                if let Some(month_key) = ym {
+                    *month_by_currency
+                        .entry(cur.clone())
+                        .or_default()
+                        .entry(month_key)
+                        .or_insert(0) += cents;
+                }
             }
         }
 
@@ -1408,6 +1701,78 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
         })
         .collect();
 
+    let categories_json: serde_json::Map<String, Value> = cat_by_currency
+        .into_iter()
+        .map(|(cur, map)| {
+            let mut rows: Vec<(String, i64, usize)> = map
+                .into_iter()
+                .map(|(k, (cents, cnt))| (k, cents, cnt))
+                .collect();
+            rows.sort_by_key(|a| std::cmp::Reverse(a.1));
+            (
+                cur,
+                Value::Array(
+                    rows.into_iter()
+                        .map(|(name, cents, count)| {
+                            json!({
+                                "name": name,
+                                "cents": cents,
+                                "amount_text": cents_to_text(cents),
+                                "count": count
+                            })
+                        })
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+
+    let accounts_json: serde_json::Map<String, Value> = acc_by_currency
+        .into_iter()
+        .map(|(cur, map)| {
+            let mut rows: Vec<(String, i64, usize)> = map
+                .into_iter()
+                .map(|(k, (cents, cnt))| (k, cents, cnt))
+                .collect();
+            rows.sort_by_key(|a| std::cmp::Reverse(a.1));
+            (
+                cur,
+                Value::Array(
+                    rows.into_iter()
+                        .map(|(name, cents, count)| {
+                            json!({
+                                "name": name,
+                                "cents": cents,
+                                "amount_text": cents_to_text(cents),
+                                "count": count
+                            })
+                        })
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+
+    let monthly_json: serde_json::Map<String, Value> = month_by_currency
+        .into_iter()
+        .map(|(cur, map)| {
+            (
+                cur,
+                Value::Array(
+                    map.into_iter()
+                        .map(|(month, cents)| {
+                            json!({
+                                "month": month,
+                                "cents": cents,
+                                "amount_text": cents_to_text(cents)
+                            })
+                        })
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+
     Ok(json!({
         "ok": true,
         "vault": {
@@ -1425,6 +1790,11 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
             "alerts": open_rep.body["alerts"],
         },
         "summary_by_currency": summary_by_currency,
+        "analytics": {
+            "categories": Value::Object(categories_json),
+            "accounts": Value::Object(accounts_json),
+            "monthly_trend": Value::Object(monthly_json),
+        },
         "accounts": account_set.into_iter().collect::<Vec<_>>(),
         "categories": category_set.into_iter().collect::<Vec<_>>(),
         "items": items,

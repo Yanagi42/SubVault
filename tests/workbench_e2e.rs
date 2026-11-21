@@ -353,7 +353,7 @@ fn workbench_security_and_complete_end_to_end_user_workflow() {
     assert_eq!(status, 200, "{unlocked_again}");
     assert_eq!(unlocked_again["vault"]["source_count"], 4);
 
-    // 8. Demo pack import endpoint works cleanly on an unlocked vault
+    // 8. Demo pack import endpoint works cleanly on an unlocked vault (7 bilingual items + analytics)
     let (status, demo_snap) = api_json(
         addr,
         "POST",
@@ -362,7 +362,44 @@ fn workbench_security_and_complete_end_to_end_user_workflow() {
         Some(json!({})),
     );
     assert_eq!(status, 200, "{demo_snap}");
-    assert!(demo_snap["vault"]["source_count"].as_u64().unwrap() >= 7);
+    assert!(
+        demo_snap["vault"]["source_count"].as_u64().unwrap() >= 10,
+        "{demo_snap}"
+    );
+    assert!(demo_snap["analytics"]["categories"].is_object());
+    assert!(demo_snap["analytics"]["accounts"].is_object());
+    assert!(demo_snap["analytics"]["monthly_trend"].is_object());
+
+    // 9. Self-declared manual entry works without a vendor invoice file and stays encrypted & verifiable
+    let (status, man_snap) = api_json(
+        addr,
+        "POST",
+        "/api/manual-entry",
+        &token,
+        Some(json!({
+            "vendor": "Spotify",
+            "plan_name": "Individual Monthly",
+            "account_label": "个人",
+            "billing_cycle": "monthly",
+            "category": "影音娱乐",
+            "currency": "USD",
+            "amount_text": "11.99",
+            "bill_date": "2026-11-20",
+            "notes": "微信自动续费"
+        })),
+    );
+    assert_eq!(status, 200, "{man_snap}");
+    assert!(man_snap["created_source_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("src_"));
+    assert!(
+        man_snap["items"].as_array().unwrap().iter().any(|i| {
+            i["annotation"]["vendor"] == "Spotify"
+                && i["amount_fact"]["value"]["amount_text"] == "11.99"
+        }),
+        "{man_snap}"
+    );
 
     server.stop();
 }
