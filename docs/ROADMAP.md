@@ -24,13 +24,15 @@ SubVault will **not** cut premature version bumps during pre-release development
 - [x] Implemented Windows atomic no-replace directory publishing (`SetFileInformationByHandle(FileRenameInfo)` with `ReplaceIfExists = FALSE` and `GetFinalPathNameByHandleW` moved-parent tracking), `CREATE_NEW | FILE_FLAG_OPEN_REPARSE_POINT`, `BCryptGenRandom`, `GetDriveTypeW`/UNC network-filesystem refusal, and SQLite `file:///C:/...` URI normalization.
 - [x] Verified natively on Windows 11 NTFS (`x86_64-pc-windows-msvc`) across 48 tests (`lib` unit tests, `windows_native`, `verify_package`, `pdf_bill`, `review_sheet`, and concurrent `review_snapshot`), plus added `windows-latest` jobs to `.github/workflows/ci.yml` and `.github/workflows/release.yml` and portable Windows packaging (`scripts/package-release-windows.ps1`).
 
+### Milestone 4: At-Rest Protection Mode, Real-Data Format 6 & Redacted Template Export
+- [x] Dedicated non-synthetic Format 6 (`subvault init --format 6 --protection passphrase|os-disk`) isolated from disposable Formats 1–5 (`SUBVAULT_VAULT` banner, `synthetic_only = false`, `real_data_import = "available"`, accepting PDF, HTML, and fragments in one vault).
+- [x] Pure-Rust application-layer envelope encryption (`src/crypto.rs`: `Argon2id` + `HKDF-SHA256` + `XChaCha20-Poly1305`) across `objects/obj_*` (`SVENC001`), `staging/*.partial`, `journal/*.json` (`SVJRN001`), and sensitive SQLite columns (`enc:v1:...` bound to `vault_id || table || row_id || column`), plus keyed `HMAC-SHA256` dedup keys, checksummed `SVRK-...` offline recovery keys, `subvault rotate-passphrase`, dedicated `EXIT_AUTH = 22`, CLI secret-arg refusal, and mandatory `--acknowledge-plaintext yes` on encrypted `export`.
+- [x] Deterministic local-only `subvault redact` (`src/redact.rs`) supporting external files and stored vault sources (`--source` or `--vault --source-id`), repeatable `--redact-term`, PDF static text extraction without binary/XMP leaks, HTML script/style/comment stripping with preserved table structure, and PII-free JSON receipts.
+- [x] Verified on both Windows 11 NTFS (`x86_64-pc-windows-msvc`) and Linux (`x86_64-unknown-linux-gnu`) with zero-plaintext disk scans and AEAD tamper/swap proofs (`tests/format6_crypto.rs`, `tests/redact.rs`).
+
 ---
 
 ## Remaining Milestones Before Cutting `v0.1.0`
-
-### Milestone 4: At-Rest Protection Mode & Real-Data Vault Format
-- Finalize local at-rest encryption and offline recovery-key design (`protection_preference`), plus a redacted-template export helper for sharing broken real-world vendor invoice layouts safely.
-- Introduce a dedicated non-synthetic production vault format isolated from disposable synthetic Formats 1–5 (lifting the `SYNTHETIC_ONLY` guard).
 
 ### Milestone 5: Thin Native Desktop Shell → Ship `v0.1.0`
 - Thin native desktop shell wrapping the verified Rust/SQLite core (drag-and-drop / watch-folder local intake for PDF, HTML, and CSV — zero Plaid and zero inbox OAuth).

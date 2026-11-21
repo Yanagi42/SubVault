@@ -91,7 +91,7 @@ jobs:
         env:
           SUBVAULT_GIT_SHA: ${{ github.sha }}
         run: |
-          cargo test --locked --lib --test windows_native --test pdf_bill --test verify_package --test review_sheet --test review_snapshot -- --test-threads=1
+          cargo test --locked --lib --test windows_native --test format6_crypto --test redact --test pdf_bill --test verify_package --test review_sheet --test review_snapshot -- --test-threads=1
 
       - name: Build portable Windows release bundle & verify SHA256SUMS
         shell: pwsh

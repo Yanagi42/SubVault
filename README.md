@@ -122,39 +122,53 @@ node scripts/test-web.mjs
 bash scripts/package-release.sh
 ```
 
-### 4. Native CLI Walkthrough (Format 5 PDF + HTML + Verifiable Exit)
+### 4. Native CLI Walkthrough (Format 6 Real-Data Encrypted Vault + Redacted Template + Verifiable Exit)
 
 ```bash
-# Initialize an isolated Format 5 vault (accepts static text-PDFs & static HTML bills)
-./target/release/subvault init --vault /tmp/my-vault --format 5
+# 1. Initialize an isolated Format 6 real-data vault with application-layer AEAD encryption
+#    (never pass raw secrets as CLI flags — use --passphrase-file, --passphrase-stdin, or SUBVAULT_PASSPHRASE_FILE)
+./target/release/subvault init \
+  --vault /tmp/my-real-vault \
+  --format 6 \
+  --protection passphrase \
+  --passphrase-file ./passphrase.txt \
+  --recovery-key-out /tmp/recovery-key.txt
 
-# Preserve & extract a text-PDF receipt (uncompressed or FlateDecode)
+# 2. Preserve & extract a static text-PDF receipt (or static HTML / text fragment)
 ./target/release/subvault pdf \
-  --vault /tmp/my-vault \
+  --vault /tmp/my-real-vault \
   --command-id cmd-pdf-1 \
-  --source ./synthetic/corpus/originals/v-2026-09-receipt.pdf
+  --source ./synthetic/corpus/originals/v-2026-09-receipt.pdf \
+  --passphrase-file ./passphrase.txt
 
-# Preserve & extract a static HTML bill in the same vault
-./target/release/subvault html \
-  --vault /tmp/my-vault \
-  --command-id cmd-bill-1 \
-  --source ./bill.html
-
-# Export a SHA-256 verifiable offline exit package outside the vault
+# 3. Export a SHA-256 verifiable offline exit package (requires explicit plaintext ack on encrypted vaults)
 ./target/release/subvault export \
-  --vault /tmp/my-vault \
-  --out /tmp/my-export-pack
+  --vault /tmp/my-real-vault \
+  --out /tmp/my-export-pack \
+  --acknowledge-plaintext yes \
+  --passphrase-file ./passphrase.txt
 
-# Independently verify the exported package without needing the live vault
+# 4. Independently verify the exported package without needing the live vault
 ./target/release/subvault verify-package \
   --package /tmp/my-export-pack
 
-# Generate a lock-consistent plain-text review sheet linked to verified originals
+# 5. Generate a lock-consistent plain-text review sheet linked to verified originals
 ./target/release/subvault review \
-  --vault /tmp/my-vault \
+  --vault /tmp/my-real-vault \
   --out /tmp/review.txt \
-  --package /tmp/my-export-pack
+  --package /tmp/my-export-pack \
+  --passphrase-file ./passphrase.txt
+
+# 6. Export a redacted human-inspectable template (for safely reporting broken bill layouts)
+./target/release/subvault redact \
+  --vault /tmp/my-real-vault \
+  --source-id <src_id> \
+  --out /tmp/redacted-template.txt \
+  --redact-term "MyName" \
+  --passphrase-file ./passphrase.txt
 ```
+
+*(Prefer OS full-disk encryption instead of application-layer AEAD? Initialize with `--format 6 --protection os-disk`. Synthetic test vaults Formats 1–5 remain strictly isolated with `SYNTHETIC_ONLY`.)*
 
 ---
 
@@ -162,12 +176,12 @@ bash scripts/package-release.sh
 
 | Path | Purpose |
 | --- | --- |
-| `src/` | Rust preservation engine, SQLite WAL store, static text, HTML & PDF (`FlateDecode`) extractors, append-only decision chain, offline exporter, standalone verifier, and review sheet renderer |
-| `tests/` | 22 integration & backward-compatibility test suites (including `windows_native.rs`, `pdf_bill.rs`, `verify_package.rs`, crash/fault hooks, WAL/header consistency, Linux `renameat2(RENAME_NOREPLACE)`, and Windows `LockFileEx`/`FileIdInfo`/junctions) |
+| `src/` | Rust preservation engine, SQLite WAL store, pure-Rust Format 6 envelope crypto (`Argon2id` + `HKDF-SHA256` + `XChaCha20-Poly1305`), static text/HTML/PDF extractors, append-only decision chain, offline exporter, standalone verifier, review sheet renderer, and deterministic `redact` template exporter |
+| `tests/` | 24 integration & backward-compatibility test suites (including `format6_crypto.rs`, `redact.rs`, `windows_native.rs`, `pdf_bill.rs`, `verify_package.rs`, crash/fault hooks, WAL/header consistency, Linux `renameat2(RENAME_NOREPLACE)`, and Windows `LockFileEx`/`FileIdInfo`/junctions) |
 | `web/` | Zero-dependency, subpath-safe pure-static interactive Web Demo (`index.html`, `app.js`, `engine.js`, `demo-data.js`, `pdf.js`, `zip.js`, `styles.css`) |
 | `synthetic/` | Deterministic T0 corpus generator and independent byte/logical expectations |
 | `scripts/` | Release packaging (`package-release.sh`, `package-release-windows.ps1`), Web Demo & CLI-interop checks (`test-web.mjs`), screenshot capture (`capture-screenshots.py`), and T1 evidence script |
-| `.github/workflows/` | Automated Linux + Windows CI (`ci.yml`), GitHub Pages deployment (`pages.yml`), and multi-platform release publishing (`release.yml`) |
+| `.github/workflows/` | Automated Linux + Windows CI (`ci.yml`), manual GitHub Pages deployment (`pages.yml`), and multi-platform release publishing (`release.yml`) |
 | `docs/` | Real UI screenshots (`docs/screenshots/`), next-iteration roadmap (`docs/ROADMAP.md`), and the complete Chinese technical specification (`docs/SPEC-zh.md`) |
 
 ---
@@ -177,9 +191,10 @@ bash scripts/package-release.sh
 SubVault intentionally separates **verified guarantees** from **unbuilt milestones**:
 
 - **Verified today (pre-`v0.1.0`):**
-  - **Linux (`x86_64-unknown-linux-gnu`):** Single-writer preservation (`flock`, SQLite 3.46 WAL `synchronous=FULL`, `renameat2(RENAME_NOREPLACE)` + parent fd `fsync`), Format 1–5 isolation, deterministic UTF-8 fragment, constrained static HTML (`tl` 0.7.8), and static text-PDF (`FlateDecode` via `miniz_oxide`, 1-based `pdf_page` locators) extraction, append-only human `correct`/`undo`, verifiable `offline-exit-1` export & standalone `verify-package`, and read-only `review` sheets.
-  - **Windows (`x86_64-pc-windows-msvc`):** Native Win32 `CreateFileW` + `LockFileEx` two-process single-writer locking, 128-bit `GetFileInformationByHandleEx(FileIdInfo)` directory identity (blocking case-insensitive vault aliases and NTFS junctions), atomic no-replace directory publish (`SetFileInformationByHandle(FileRenameInfo)`), `BCryptGenRandom`, `GetDriveTypeW`/UNC network refusal, and verified Format 5 PDF+HTML+export+verify-package+review+concurrent stress tests on Windows 11 NTFS.
+  - **Real-Data Format 6 & At-Rest Encryption (`src/crypto.rs`, `src/redact.rs`):** Dedicated non-synthetic Format 6 (`SUBVAULT_VAULT` banner, `synthetic_only=false`, `real_data_import=available`) isolated from disposable Formats 1–5, supporting explicit `--protection passphrase` (pure-Rust `Argon2id` + `HKDF-SHA256` + `XChaCha20-Poly1305` envelope encryption for `objects/`, `staging/`, `journal/`, and sensitive SQLite cells, keyed `HMAC-SHA256` dedup, offline `SVRK-...` recovery keys, `rotate-passphrase`, dedicated `EXIT_AUTH = 22`, and mandatory `--acknowledge-plaintext yes` on `export`) or `--protection os-disk`, plus local-only `subvault redact` template sanitization.
+  - **Linux (`x86_64-unknown-linux-gnu`):** Single-writer preservation (`flock`, SQLite 3.46 WAL `synchronous=FULL`, `renameat2(RENAME_NOREPLACE)` + parent fd `fsync`), Format 1–6 isolation, deterministic UTF-8 fragment, constrained static HTML (`tl` 0.7.8), and static text-PDF (`FlateDecode` via `miniz_oxide`, 1-based `pdf_page` locators) extraction, append-only human `correct`/`undo`, verifiable `offline-exit-1` export & standalone `verify-package`, and read-only `review` sheets.
+  - **Windows (`x86_64-pc-windows-msvc`):** Native Win32 `CreateFileW` + `LockFileEx` two-process single-writer locking, 128-bit `GetFileInformationByHandleEx(FileIdInfo)` directory identity (blocking case-insensitive vault aliases and NTFS junctions), atomic no-replace directory publish (`SetFileInformationByHandle(FileRenameInfo)`), `BCryptGenRandom`, `GetDriveTypeW`/UNC network refusal, and verified Format 5 & Format 6 encrypted/redacted suites natively on Windows 11 NTFS.
   - **Pure-Static Web Demo (`web/`):** Preloaded 12-file synthetic corpus, real binary `.pdf` hashing/extraction, `.zip` offline exit, and bidirectional Format 5 CLI↔Web verification.
-- **Remaining before cutting `v0.1.0` (see [`docs/ROADMAP.md`](./docs/ROADMAP.md)):** At-rest encryption & removing the `SYNTHETIC_ONLY` guard for real personal data, plus a thin native desktop UI shell.
+- **Remaining before cutting `v0.1.0` (see [`docs/ROADMAP.md`](./docs/ROADMAP.md)):** Thin native desktop UI shell wrapping the verified Rust/SQLite core (`user_ready` stays `false` until Milestone 5 ships).
 
-For the exhaustive contract of exit codes (0–21), crash/recovery semantics, and Format 1–4 invariants, see [`docs/SPEC-zh.md`](./docs/SPEC-zh.md).
+For the exhaustive contract of exit codes (`0`–`22`), crash/recovery semantics, and Format 1–6 invariants, see [`docs/SPEC-zh.md`](./docs/SPEC-zh.md).

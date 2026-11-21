@@ -64,6 +64,52 @@ pub fn has_valid_pdf_envelope(bytes: &[u8]) -> bool {
     bytes.starts_with(b"%PDF-") && find_subslice(bytes, b"%%EOF").is_some()
 }
 
+pub fn extract_pages_for_redaction(
+    bytes: &[u8],
+) -> Result<Vec<(usize, Vec<String>)>, &'static str> {
+    if !has_valid_pdf_envelope(bytes) {
+        return Err("invalid_pdf_header");
+    }
+    let objects = parse_objects(bytes);
+    if has_encrypt_marker(bytes, &objects) {
+        return Err("encrypted_pdf");
+    }
+    let pages = collect_page_streams(&objects);
+    if pages.len() > MAX_PAGES {
+        return Err("too_many_pages");
+    }
+    let mut total_decompressed = 0usize;
+    let mut out = Vec::with_capacity(pages.len());
+    for (page_idx, stream_nums) in pages.iter().enumerate() {
+        let mut page_lines = Vec::new();
+        for &stream_num in stream_nums {
+            let Some(obj) = objects.get(&stream_num) else {
+                continue;
+            };
+            let Some(raw_stream) = obj.stream else {
+                continue;
+            };
+            let decoded = decode_stream(obj.dict, raw_stream)?;
+            total_decompressed = total_decompressed.saturating_add(decoded.len());
+            if total_decompressed > MAX_TOTAL_DECOMPRESSED {
+                return Err("decompressed_budget_exceeded");
+            }
+            for raw_line in extract_text_lines(&decoded) {
+                let trimmed = raw_line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.len() > MAX_LINE_BYTES {
+                    return Err("line_over_budget");
+                }
+                page_lines.push(trimmed.to_string());
+            }
+        }
+        out.push((page_idx + 1, page_lines));
+    }
+    Ok(out)
+}
+
 pub fn extract(bytes: &[u8]) -> PdfExtraction {
     if !has_valid_pdf_envelope(bytes) {
         return unsupported("invalid_pdf_header", 0);

@@ -1,6 +1,6 @@
 # SubVault v0.1.0 Release Notes (Draft — Pre-Release)
 
-> **Status:** Draft notes for the upcoming first usable **`v0.1.0`** release. SubVault stays on `0.1.0` (unreleased) while remaining real-data milestones in [`docs/ROADMAP.md`](./docs/ROADMAP.md) (at-rest encryption and desktop shell) are completed.
+> **Status:** Draft notes for the upcoming first usable **`v0.1.0`** release. SubVault stays on `0.1.0` (unreleased) while the final real-data milestone in [`docs/ROADMAP.md`](./docs/ROADMAP.md) (thin native desktop shell) is completed.
 
 **Target tag:** `v0.1.0`  
 **Live Demo:** <https://yanagi42.github.io/SubVault/>
@@ -9,8 +9,10 @@
 
 ## Highlights Included So Far
 
-1. **Verified Rust + SQLite Preservation & Extraction Core (`subvault` CLI, Formats 1–5)**
-   - **Immutable Byte Custody (T1):** Content-addressed `objects/obj_<id>` storage with SHA-256 integrity verification, zero byte normalization, idempotent `CommandId` journaling, exclusive non-blocking `flock`, SQLite 3.46 WAL (`synchronous=FULL`), atomic directory publication via `renameat2(RENAME_NOREPLACE)` + parent fd `fsync`, and 17 distinct honest exit codes.
+1. **Verified Rust + SQLite Preservation, Encryption & Extraction Core (`subvault` CLI, Formats 1–6)**
+   - **Real-Data Format 6 & At-Rest Protection (M4):** Dedicated non-synthetic Format 6 (`subvault init --format 6 --protection passphrase|os-disk`, `SUBVAULT_VAULT` banner) isolated from disposable Formats 1–5. `passphrase` mode provides pure-Rust `Argon2id` + `HKDF-SHA256` + `XChaCha20-Poly1305` envelope encryption across objects, staging, journals, and sensitive SQLite columns, offline `SVRK-...` recovery keys, `subvault rotate-passphrase`, dedicated `EXIT_AUTH = 22`, mandatory `--acknowledge-plaintext yes` on `export`, and zero raw-secret CLI arguments.
+   - **Redacted Template Export (`subvault redact`):** Local-only deterministic sanitizer for external files or stored vault sources (`--source` or `--vault --source-id`) with repeatable `--redact-term`, PDF text extraction without binary/XMP metadata, HTML script/style/comment stripping with preserved table structure, and PII-free JSON receipts.
+   - **Immutable Byte Custody (T1):** Content-addressed `objects/obj_<id>` storage with SHA-256 integrity verification, zero byte normalization, idempotent `CommandId` journaling, exclusive non-blocking locks (`flock` on Linux, Win32 `LockFileEx` on Windows), SQLite 3.46 WAL (`synchronous=FULL`), atomic no-replace directory publication, and honest exit codes (`0`–`22`).
    - **Native Text-PDF & Static HTML Extraction (Formats 2–5):**
      - Format 5 (`subvault init --format 5`) accepts **both** `subvault pdf` (uncompressed and `/FlateDecode` via `miniz_oxide =0.8.8`, bounded memory, 1-based `pdf_page` locators) and `subvault html` (`tl` 0.7.8, refusing `<style>`/stylesheets instead of guessing CSS visibility).
      - Preserves raw bytes verbatim on encrypted PDFs (`encrypted_pdf`), image-only PDFs (`no_extractable_text`, `ocr=not_available`), and CSS-styled HTML; rejects fake renamed `.pdf` text files before preservation (`invalid_pdf_header`).
@@ -54,5 +56,4 @@ cd subvault-v0.1.0-linux-x86_64
 
 ## Remaining Scope Before Publishing `v0.1.0`
 
-- **At-Rest Protection & Removing `SYNTHETIC_ONLY`:** Finalize encryption and key recovery for real personal billing data.
 - **Thin Desktop Shell:** Wrap the verified Rust/SQLite core for everyday local use.

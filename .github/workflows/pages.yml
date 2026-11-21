@@ -1,12 +1,6 @@
 name: Deploy Demo to GitHub Pages
 
 on:
-  push:
-    branches: ["main"]
-    paths:
-      - "web/**"
-      - "scripts/test-web.mjs"
-      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
