@@ -32,7 +32,41 @@
     refresh: `<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>`,
     arrowRight: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>`,
     trash: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg>`,
+    eyeOpen: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>`,
+    eyeOff: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c6.5 0 10 8 10 8a17.6 17.6 0 0 1-2.16 3.19"/><path d="M6.6 6.6C3.9 8.4 2 12 2 12s3.5 8 10 8a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="m2 2 20 20"/></svg>`,
+    party: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5.8 11.3 2 22l10.7-3.79"/><path d="M4 3h.01M22 8h.01M15 2h.01M22 20h.01"/><path d="m22 2-2.24.75a2.9 2.9 0 0 0-1.96 3.12c.1.86-.57 1.63-1.45 1.63h-.38c-.86 0-1.6.6-1.76 1.44L14 10"/><path d="M11 13c1.93 1.93 2.83 4.17 2 5-.83.83-3.07-.07-5-2-1.93-1.93-2.83-4.17-2-5 .83-.83 3.07.07 5 2Z"/></svg>`,
   };
+
+  // 空账本插画：会慢慢转动转盘的小金库，上面飘着两张票据
+  const VAULT_ART = `
+    <svg class="vault-art" viewBox="0 0 112 96" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <g class="va-paper p1" style="--r:-9deg">
+        <rect x="26" y="4" width="26" height="32" rx="3" style="fill: var(--surface)" stroke-width="1.6"/>
+        <path d="M31 12h10M31 17h15M31 22h12" stroke-width="1.6" stroke-opacity="0.45"/>
+      </g>
+      <g class="va-paper p2" style="--r:8deg">
+        <rect x="58" y="2" width="26" height="32" rx="3" style="fill: var(--surface)" stroke-width="1.6"/>
+        <path d="M63 10h8" stroke-width="2.2" style="stroke: var(--blue)"/>
+        <path d="M63 16h15M63 21h11" stroke-width="1.6" stroke-opacity="0.45"/>
+      </g>
+      <rect x="14" y="24" width="84" height="62" rx="12" style="fill: var(--surface)" stroke-width="2"/>
+      <rect x="20" y="30" width="72" height="50" rx="8" stroke-width="1.2" stroke-opacity="0.35"/>
+      <path d="M14 40h-3M14 70h-3" stroke-width="4"/>
+      <path d="M26 86v5M86 86v5" stroke-width="4"/>
+      <circle cx="56" cy="55" r="18" stroke-width="2"/>
+      <circle cx="56" cy="55" r="13" stroke-width="1" stroke-opacity="0.4" stroke-dasharray="1.5 3"/>
+      <g class="va-wheel">
+        <path d="M56 45v20M47.3 50l17.4 10M47.3 60l17.4-10" stroke-width="2.4"/>
+        <circle cx="56" cy="55" r="3.5" fill="currentColor" stroke="none"/>
+      </g>
+    </svg>`;
+
+  const LOCK_ART = `
+    <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path class="fl-shackle" d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      <rect width="18" height="11" x="3" y="11" rx="2.5"/>
+      <circle cx="12" cy="16.5" r="1.4" fill="currentColor" stroke="none"/>
+    </svg>`;
 
   const THEMES = [
     { id: "gallery", label: "浅色" },
@@ -243,6 +277,8 @@
     $("toast-msg").textContent = msg;
     el.className = `toast ${kind === "error" ? "toast-error" : kind === "ok" ? "toast-ok" : ""}`;
     el.classList.remove("hidden");
+    void el.offsetWidth;
+    el.classList.add("toast-anim");
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => el.classList.add("hidden"), 4200);
   }
@@ -313,52 +349,564 @@
     try { localStorage.setItem("subvault_ui_theme_v3", found.id); } catch (_) {}
   }
 
-  function cycleTheme() {
+  // 外观切换：从被点击的按钮处以圆形扩散揭开新主题（浏览器支持 View Transitions 时）
+  function cycleTheme(ev) {
     const idx = THEMES.findIndex((t) => t.id === state.theme);
     const next = THEMES[(idx + 1) % THEMES.length];
-    applyTheme(next.id);
-    if (state.workspace) renderWorkspace();
+    const swap = () => {
+      applyTheme(next.id);
+      if (state.workspace) renderWorkspace();
+    };
+    const origin = (ev && ev.currentTarget && ev.currentTarget.getBoundingClientRect)
+      ? ev.currentTarget
+      : ($("screen-workspace").classList.contains("hidden") ? $("lobby-theme-btn") : $("btn-theme-cycle"));
+    if (typeof document.startViewTransition === "function" && motionOK() && origin) {
+      const r = origin.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
+      const endR = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y));
+      const vt = document.startViewTransition(swap);
+      vt.ready.then(() => {
+        document.documentElement.animate(
+          { clipPath: [`circle(0px at ${x}px ${y}px)`, `circle(${endR}px at ${x}px ${y}px)`] },
+          { duration: 620, easing: "cubic-bezier(0.22, 1, 0.36, 1)", pseudoElement: "::view-transition-new(root)" },
+        );
+      }).catch(() => {});
+    } else {
+      swap();
+    }
     showToast(`已切换为${next.label}外观`);
   }
 
   function togglePrivacy(forceVal) {
-    state.privacyBlur = forceVal !== undefined ? forceVal : !state.privacyBlur;
+    const nextVal = forceVal !== undefined ? forceVal : !state.privacyBlur;
+    if (nextVal !== state.privacyBlur && forceVal === undefined) runPrivacySweep();
+    state.privacyBlur = nextVal;
     document.body.classList.toggle("privacy-blur", state.privacyBlur);
-    $("btn-privacy-toggle").classList.toggle("active", state.privacyBlur);
-    if (state.privacyBlur) showToast("已隐藏金额、账号和密钥，鼠标放上去可临时查看");
-    else if (forceVal === undefined) showToast("已恢复显示金额");
+    const btn = $("btn-privacy-toggle");
+    btn.classList.toggle("active", state.privacyBlur);
+    btn.innerHTML = state.privacyBlur ? ICO.eyeOff : ICO.eyeOpen;
+    if (state.privacyBlur) showToast("已拉上磨砂玻璃：金额、账号和密钥已隐藏，鼠标放上去可临时查看");
+    else if (forceVal === undefined) showToast("磨砂玻璃已收起，金额恢复显示");
   }
 
-  function launchConfetti() {
+  // 一块磨砂玻璃从左往右扫过屏幕，金额按横向位置依次模糊 / 清晰，与玻璃同步
+  function runPrivacySweep() {
+    if (!motionOK()) return;
+    const w = window.innerWidth;
+    const vh = window.innerHeight;
+    const touched = [];
+    document.querySelectorAll(".sensitive").forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (!r.width || r.bottom < 0 || r.top > vh) return;
+      el.style.transitionDelay = `${Math.round(Math.max(0, Math.min(1, r.left / w)) * 320)}ms`;
+      touched.push(el);
+    });
+    const sweep = document.createElement("div");
+    sweep.className = "privacy-sweep";
+    document.body.appendChild(sweep);
+    setTimeout(() => {
+      sweep.remove();
+      touched.forEach((el) => { el.style.transitionDelay = ""; });
+    }, 820);
+  }
+
+  // --- Delight Layer: motion helpers, particles, vault door, living numbers ---
+  const motionQuery = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+  function motionOK() { return !(motionQuery && motionQuery.matches); }
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function pulseClass(el, cls, ms) {
+    if (!el) return;
+    el.classList.remove(cls);
+    void el.offsetWidth;
+    el.classList.add(cls);
+    setTimeout(() => el.classList.remove(cls), ms);
+  }
+
+  function coinSymbol(cur) {
+    const s = String(CURRENCY_SYMBOLS[cur] || "¥").trim();
+    const m = s.match(/[¥$€£₩]/);
+    return m ? m[0] : s.slice(0, 1);
+  }
+
+  // 粒子系统：彩带、圆点、小票据与会翻转的金币，共用同一个 canvas 与动画循环
+  const fx = { particles: [], running: false, dpr: 1 };
+
+  function fxCanvas() {
     const canvas = $("confetti-canvas");
+    if (!canvas) return null;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      canvas.style.width = `${w}px`;
+      canvas.style.height = `${h}px`;
+    }
+    fx.dpr = dpr;
+    return canvas;
+  }
+
+  function drawParticle(ctx, p) {
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, p.life / 22);
+    ctx.translate(p.x, p.y);
+    if (p.shape === "coin") {
+      const flip = Math.cos((p.rot * Math.PI) / 180);
+      ctx.scale(Math.max(0.14, Math.abs(flip)), 1);
+      const r = p.size;
+      const g = ctx.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.1, 0, 0, r);
+      g.addColorStop(0, "#fff4b8");
+      g.addColorStop(0.55, "#f4c542");
+      g.addColorStop(1, "#c88a0e");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(140, 90, 6, 0.55)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      if (Math.abs(flip) > 0.4) {
+        ctx.fillStyle = "rgba(118, 70, 0, 0.78)";
+        ctx.font = `800 ${Math.round(r * 1.1)}px system-ui, sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(p.symbol || "¥", 0, r * 0.08);
+      }
+    } else if (p.shape === "receipt") {
+      ctx.rotate((p.rot * Math.PI) / 180);
+      const w = p.size * 1.6;
+      const h = p.size * 2.2;
+      ctx.fillStyle = "#ffffff";
+      ctx.strokeStyle = "rgba(17, 19, 24, 0.16)";
+      ctx.lineWidth = 1;
+      ctx.fillRect(-w / 2, -h / 2, w, h);
+      ctx.strokeRect(-w / 2, -h / 2, w, h);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-w / 2 + 2, -h / 2 + 2.5, w - 4, 2);
+      ctx.fillStyle = "rgba(17, 19, 24, 0.24)";
+      ctx.fillRect(-w / 2 + 2, -h / 2 + 6.5, w * 0.62, 1.2);
+      ctx.fillRect(-w / 2 + 2, -h / 2 + 9.5, w * 0.44, 1.2);
+    } else if (p.shape === "dot") {
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(0, 0, p.size * 0.6, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.rotate((p.rot * Math.PI) / 180);
+      ctx.scale(1, Math.cos(p.rot * 0.06));
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.size, -p.size * 0.42, p.size * 2, p.size * 0.84);
+    }
+    ctx.restore();
+  }
+
+  function fxSpawn(list) {
+    if (!motionOK() || !list.length) return;
+    const canvas = fxCanvas();
     if (!canvas) return;
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    fx.particles.push(...list);
+    if (fx.running) return;
+    fx.running = true;
     canvas.classList.remove("hidden");
     const ctx = canvas.getContext("2d");
-    const pieces = Array.from({ length: 68 }, () => ({
-      x: Math.random() * canvas.width,
-      y: -20 - Math.random() * 120,
-      r: 4 + Math.random() * 4,
-      dx: (Math.random() - 0.5) * 4,
-      dy: 2.6 + Math.random() * 4,
-      rot: Math.random() * 360,
-      drot: (Math.random() - 0.5) * 10,
-      color: getChartPalette()[Math.floor(Math.random() * 8)],
-    }));
-    let frame = 0;
-    function tick() {
+    const tick = () => {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      pieces.forEach((p) => {
-        p.x += p.dx; p.y += p.dy; p.dy += 0.08; p.rot += p.drot;
-        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate((p.rot * Math.PI) / 180);
-        ctx.fillStyle = p.color; ctx.fillRect(-p.r, -p.r * 0.5, p.r * 2, p.r); ctx.restore();
+      ctx.setTransform(fx.dpr, 0, 0, fx.dpr, 0, 0);
+      const h = window.innerHeight;
+      fx.particles = fx.particles.filter((p) => {
+        p.vx *= p.drag;
+        p.vy = p.vy * p.drag + p.g;
+        p.x += p.vx;
+        p.y += p.vy;
+        p.rot += p.vr;
+        p.life -= 1;
+        if (p.life <= 0 || p.y > h + 40) return false;
+        drawParticle(ctx, p);
+        return true;
       });
-      frame += 1;
-      if (frame < 100) requestAnimationFrame(tick);
-      else { ctx.clearRect(0, 0, canvas.width, canvas.height); canvas.classList.add("hidden"); }
-    }
+      if (fx.particles.length) requestAnimationFrame(tick);
+      else {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        canvas.classList.add("hidden");
+        fx.running = false;
+      }
+    };
     requestAnimationFrame(tick);
+  }
+
+  // 满屏庆祝：彩带 + 小票据 + 金币；coins:true 时变成金币雨
+  function launchConfetti(opts = {}) {
+    const w = window.innerWidth;
+    const palette = getChartPalette();
+    const symbol = opts.symbol || coinSymbol(state.heroCurrency || "CNY");
+    const list = Array.from({ length: opts.count || 110 }, (_, i) => {
+      const roll = Math.random();
+      const shape = opts.coins ? "coin" : roll < 0.14 ? "coin" : roll < 0.26 ? "receipt" : roll < 0.42 ? "dot" : "ribbon";
+      return {
+        x: Math.random() * w,
+        y: -20 - Math.random() * 180,
+        vx: (Math.random() - 0.5) * 3,
+        vy: 2 + Math.random() * 3.5,
+        g: 0.05 + Math.random() * 0.05,
+        drag: 0.996,
+        rot: Math.random() * 360,
+        vr: (Math.random() - 0.5) * 12,
+        size: shape === "coin" ? 7 + Math.random() * 4 : 4 + Math.random() * 3.5,
+        color: palette[i % palette.length],
+        shape,
+        symbol,
+        life: 280,
+      };
+    });
+    fxSpawn(list);
+  }
+
+  // 局部迸发：从某个点向上喷出一小把金币 / 彩点
+  function burstAt(x, y, opts = {}) {
+    const palette = getChartPalette();
+    const list = Array.from({ length: opts.count || 16 }, (_, i) => {
+      const a = -Math.PI / 2 + (Math.random() - 0.5) * (opts.spread || 2.3);
+      const sp = 3.5 + Math.random() * 4.5;
+      const shape = opts.shape || (i % 3 === 0 ? "coin" : i % 3 === 1 ? "dot" : "ribbon");
+      return {
+        x, y,
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp,
+        g: 0.22,
+        drag: 0.97,
+        rot: Math.random() * 360,
+        vr: (Math.random() - 0.5) * 18,
+        size: shape === "coin" ? 6 + Math.random() * 3 : 3 + Math.random() * 2.5,
+        color: palette[i % palette.length],
+        shape,
+        symbol: opts.symbol || "¥",
+        life: 62 + Math.random() * 22,
+      };
+    });
+    fxSpawn(list);
+  }
+
+  function burstFrom(el, opts) {
+    if (!el || !el.getBoundingClientRect) return;
+    const r = el.getBoundingClientRect();
+    if (!r.width) return;
+    burstAt(r.left + r.width / 2, r.top + r.height / 2, opts);
+  }
+
+  // 字符“解码”效果：随机字符逐位落定为最终文本（不泄露任何真实字符）
+  function scrambleText(el, finalText, dur = 650) {
+    if (!el) return;
+    if (!motionOK()) { el.textContent = finalText; return; }
+    const pool = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const chars = Array.from(finalText);
+    const t0 = performance.now();
+    const step = (now) => {
+      if (!el.isConnected) return;
+      const p = Math.min(1, (now - t0) / dur);
+      const settled = Math.floor(p * chars.length);
+      el.textContent = chars.map((c, i) => (i < settled || /[\s·\-]/.test(c) ? c : pool[Math.floor(Math.random() * pool.length)])).join("");
+      if (p < 1) requestAnimationFrame(step);
+      else el.textContent = finalText;
+    };
+    requestAnimationFrame(step);
+  }
+
+  // 数字滚动：同一个 key 只在数值变化时从旧值滚到新值，搜索时的重复渲染不会重播
+  const countMemory = new Map();
+  function runCountUps(root) {
+    if (!root) return;
+    root.querySelectorAll("[data-countup]").forEach((el) => {
+      const key = el.getAttribute("data-countup");
+      const to = Number(el.getAttribute("data-cents")) || 0;
+      const from = countMemory.has(key) ? countMemory.get(key) : 0;
+      countMemory.set(key, to);
+      if (from === to || !motionOK()) return;
+      const cur = el.getAttribute("data-cur") || "";
+      const mode = el.getAttribute("data-count-mode") || "editorial";
+      const withCode = el.getAttribute("data-code") === "1";
+      const paint = (c) => (mode === "short"
+        ? esc(formatMoneyShort(cur, centsToText(c)))
+        : renderEditorialMoney(cur, centsToText(c), withCode));
+      const finalHtml = el.innerHTML;
+      const dur = Math.min(1150, 480 + Math.log10(Math.abs(to - from) + 10) * 110);
+      const t0 = performance.now();
+      el.classList.add("is-counting");
+      const step = (now) => {
+        if (!el.isConnected) return;
+        const p = Math.min(1, (now - t0) / dur);
+        const eased = 1 - Math.pow(1 - p, 4);
+        if (p < 1) {
+          el.innerHTML = paint(Math.round(from + (to - from) * eased));
+          requestAnimationFrame(step);
+        } else {
+          el.innerHTML = finalHtml;
+          el.classList.remove("is-counting");
+        }
+      };
+      requestAnimationFrame(step);
+    });
+  }
+
+  // 场景切换：只有切换视图 / 分类 / 月份时才播放入场错落动画，日常重渲染保持安静
+  let sceneKey = "";
+  let sceneTimer = null;
+  function markScene(key) {
+    if (key === sceneKey) return;
+    sceneKey = key;
+    if (!motionOK()) return;
+    document.body.classList.remove("scene-enter");
+    void document.body.offsetWidth;
+    document.body.classList.add("scene-enter");
+    clearTimeout(sceneTimer);
+    sceneTimer = setTimeout(() => document.body.classList.remove("scene-enter"), 1500);
+  }
+
+  const STAGGER_SELECTORS = [
+    ".object-gallery > .obj-card", ".filing-strip", ".clean-table tbody tr", ".signal-tile", ".agenda-row",
+    ".vendor-tile", ".sim-row", ".bar-col", ".legend-row", ".attn-row", ".csv-ws-card",
+  ];
+  function assignStagger(root) {
+    if (!root) return;
+    STAGGER_SELECTORS.forEach((sel) => {
+      root.querySelectorAll(sel).forEach((el, i) => el.style.setProperty("--i", String(Math.min(i, 16))));
+    });
+  }
+
+  // 卡片 3D 倾斜 + 跟随鼠标的高光；买断密钥卡片额外带一层镭射膜
+  function bindTiltEffects() {
+    let active = null;
+    const reset = (el) => {
+      if (!el) return;
+      el.classList.remove("is-tilting");
+      el.style.removeProperty("--rx");
+      el.style.removeProperty("--ry");
+    };
+    document.addEventListener("pointermove", (e) => {
+      if (e.pointerType && e.pointerType !== "mouse") return;
+      const card = motionOK() && e.target.closest ? e.target.closest(".obj-card, .mini-artifact") : null;
+      if (active && active !== card) reset(active);
+      active = card;
+      if (!card) return;
+      const r = card.getBoundingClientRect();
+      const px = (e.clientX - r.left) / r.width;
+      const py = (e.clientY - r.top) / r.height;
+      const strength = card.classList.contains("mini-artifact") ? 10 : 6;
+      card.style.setProperty("--rx", `${((0.5 - py) * strength).toFixed(2)}deg`);
+      card.style.setProperty("--ry", `${((px - 0.5) * strength * 1.3).toFixed(2)}deg`);
+      card.style.setProperty("--gx", `${(px * 100).toFixed(1)}%`);
+      card.style.setProperty("--gy", `${(py * 100).toFixed(1)}%`);
+      card.classList.add("is-tilting");
+    }, { passive: true });
+    document.addEventListener("pointerleave", () => { reset(active); active = null; });
+    window.addEventListener("blur", () => { reset(active); active = null; });
+  }
+
+  // 顶部导航的滑块：在各个入口之间弹性滑动
+  function moveDockGlider(instant) {
+    const dock = document.querySelector(".floating-dock");
+    const glider = dock && dock.querySelector(".dock-glider");
+    const activeBtn = dock && dock.querySelector(".dock-item.active");
+    if (!glider || !activeBtn || !activeBtn.offsetWidth) return;
+    const jump = instant || !dock.classList.contains("has-glider") || !motionOK();
+    if (jump) glider.style.transition = "none";
+    glider.style.width = `${activeBtn.offsetWidth}px`;
+    glider.style.transform = `translateX(${activeBtn.offsetLeft}px)`;
+    if (jump) {
+      void glider.offsetWidth;
+      glider.style.transition = "";
+    }
+    dock.classList.add("has-glider");
+  }
+
+  // 金库大门：合拢 → 转盘转动 → 在门后切换界面 → 打开
+  let doorBusy = false;
+  async function playVaultDoor(swap, locking = false) {
+    const door = $("vault-door");
+    if (!door || !motionOK() || doorBusy) { swap(); return; }
+    doorBusy = true;
+    try {
+      door.dataset.mode = locking ? "lock" : "unlock";
+      door.classList.remove("hidden", "closing", "spin", "open");
+      void door.offsetWidth;
+      door.classList.add("closing");
+      await wait(400);
+      door.classList.add("spin");
+      await wait(480);
+      swap();
+      door.classList.add("open");
+      await wait(680);
+    } finally {
+      door.classList.add("hidden");
+      door.classList.remove("closing", "spin", "open");
+      doorBusy = false;
+    }
+  }
+
+  // 导入时的小纸片：从落点沿弧线飞进左上角的账本胶囊
+  function paperTint(name) {
+    const ext = (String(name || "").split(".").pop() || "").toLowerCase();
+    if (ext === "pdf") return "#e11d48";
+    if (ext === "csv" || ext === "txt") return "#059669";
+    if (ext.startsWith("htm")) return "#2563eb";
+    if (["png", "jpg", "jpeg", "webp"].includes(ext)) return "#7c3aed";
+    return "#8a94a6";
+  }
+
+  function flyPapersInto(fromX, fromY, files) {
+    if (!motionOK()) return;
+    const target = $("vault-pill-btn");
+    if (!target || !target.offsetParent) return;
+    const tr = target.getBoundingClientRect();
+    const tx = tr.left + 20;
+    const ty = tr.top + tr.height / 2;
+    Array.from(files).slice(0, 8).forEach((f, i) => {
+      const el = document.createElement("div");
+      el.className = "fly-paper";
+      el.style.setProperty("--tint", paperTint(f && f.name));
+      el.style.left = `${fromX - 13}px`;
+      el.style.top = `${fromY - 17}px`;
+      document.body.appendChild(el);
+      const jitter = (Math.random() - 0.5) * 80;
+      const dx = tx - fromX;
+      const dy = ty - fromY;
+      const r0 = (Math.random() - 0.5) * 36;
+      const anim = el.animate([
+        { transform: `translate(${jitter * 0.3}px, 8px) rotate(${r0}deg) scale(0.5)`, opacity: 0 },
+        { transform: `translate(${jitter}px, -30px) rotate(${r0 * 1.3}deg) scale(1)`, opacity: 1, offset: 0.2 },
+        { transform: `translate(${dx * 0.55 + jitter}px, ${dy * 0.55 - 90}px) rotate(${-r0}deg) scale(0.85)`, opacity: 1, offset: 0.62 },
+        { transform: `translate(${dx}px, ${dy}px) rotate(${-r0 * 2}deg) scale(0.16)`, opacity: 0.25 },
+      ], { duration: 860, delay: i * 90, easing: "cubic-bezier(0.45, 0, 0.55, 1)", fill: "both" });
+      anim.onfinish = () => { el.remove(); pulseClass(target, "gulp", 440); };
+    });
+  }
+
+  function importOriginFor(el) {
+    if (!el || !el.offsetParent) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+
+  // 新加入账本的卡片：短暂发光并在必要时滚动到视野内
+  function itemIdSet() {
+    return new Set((state.workspace?.items || []).map((i) => i.source_id));
+  }
+
+  function highlightNewItems(prevIds) {
+    if (!prevIds) return;
+    const fresh = (state.workspace?.items || []).filter((i) => !prevIds.has(i.source_id));
+    if (!fresh.length) return;
+    requestAnimationFrame(() => {
+      let first = null;
+      fresh.forEach((it) => {
+        const el = $("ledger-stage").querySelector(`[data-source-id="${CSS.escape(it.source_id)}"]`);
+        if (el) {
+          pulseClass(el, "just-added", 2300);
+          if (!first) first = el;
+        }
+      });
+      if (first && state.activeNav === "assets") {
+        const r = first.getBoundingClientRect();
+        if (r.top > window.innerHeight - 40 || r.bottom < 80) {
+          first.scrollIntoView({ behavior: motionOK() ? "smooth" : "auto", block: "center" });
+        }
+      }
+    });
+  }
+
+  function flashButtonSuccess(btn, okText, restoreText) {
+    btn.disabled = false;
+    btn.classList.add("btn-success");
+    btn.innerHTML = `${ICO.check} ${esc(okText)}`;
+    setTimeout(() => {
+      btn.classList.remove("btn-success");
+      btn.textContent = restoreText;
+    }, 1400);
+  }
+
+  // 订阅花费的“生活换算”：点一下换一种说法
+  const FUN_EQUIV = {
+    CNY: [{ unit: "杯奶茶", cents: 1800 }, { unit: "张电影票", cents: 4500 }, { unit: "份煎饼果子", cents: 800 }, { unit: "顿火锅", cents: 12000 }],
+    USD: [{ unit: "杯拿铁", cents: 550 }, { unit: "张电影票", cents: 1500 }, { unit: "块披萨", cents: 350 }, { unit: "本平装书", cents: 1800 }],
+    EUR: [{ unit: "杯咖啡", cents: 350 }, { unit: "张电影票", cents: 1200 }, { unit: "个可颂", cents: 150 }],
+    GBP: [{ unit: "杯咖啡", cents: 340 }, { unit: "张电影票", cents: 1100 }, { unit: "品脱啤酒", cents: 500 }],
+    JPY: [{ unit: "碗拉面", cents: 100000 }, { unit: "张电影票", cents: 190000 }, { unit: "个饭团", cents: 16000 }],
+    HKD: [{ unit: "杯奶茶", cents: 2200 }, { unit: "张电影票", cents: 9000 }, { unit: "个菠萝油", cents: 1400 }],
+  };
+
+  function funFactsFor(cur, monthlyCents) {
+    if (!monthlyCents || monthlyCents <= 0) return ["还没有周期订阅，钱包表示很安心"];
+    const daily = Math.max(1, Math.round((monthlyCents * 12) / 365));
+    const yearly = monthlyCents * 12;
+    const facts = [`订阅每天悄悄花掉 ${formatMoneyShort(cur, centsToText(daily))}`];
+    (FUN_EQUIV[cur] || []).forEach((eq, i) => {
+      const monthlyView = i % 2 === 0;
+      const n = (monthlyView ? monthlyCents : yearly) / eq.cents;
+      const nTxt = n >= 10 ? String(Math.round(n)) : n.toFixed(1).replace(/\.0$/, "");
+      facts.push(`${monthlyView ? "每月订阅" : "一年订阅"} ≈ ${nTxt} ${eq.unit}`);
+    });
+    facts.push(`一年订阅合计 ${formatMoneyShort(cur, centsToText(yearly))}`);
+    return facts;
+  }
+
+  // 主密码“锁芯”：密码越强，顶起的弹子越多
+  function passStrengthLevel(p) {
+    if (!p) return 0;
+    if (p.length < 6) return 1;
+    let s = 2;
+    if (p.length >= 10) s += 1;
+    if (/[a-z]/i.test(p) && /\d/.test(p)) s += 1;
+    if (/[^A-Za-z0-9]/.test(p) || (/[a-z]/.test(p) && /[A-Z]/.test(p))) s += 1;
+    if (p.length >= 14) s += 1;
+    return Math.min(5, s);
+  }
+
+  const TUMBLER_LABELS = ["还没设置", "太短了，至少 6 位", "能用，再长一点更好", "还不错", "很牢靠", "固若金汤"];
+  function updateTumblers() {
+    const meter = $("pass-tumblers");
+    if (!meter) return;
+    const p = $("create-passphrase").value;
+    const c = $("create-passphrase-confirm").value;
+    const lvl = passStrengthLevel(p);
+    meter.className = `tumbler-meter lvl-${lvl}`;
+    meter.querySelectorAll(".tm-pin").forEach((pin, i) => pin.classList.toggle("set", i < lvl));
+    $("tm-label").textContent = `锁芯 ${lvl}/5 · ${TUMBLER_LABELS[lvl]}`;
+    const match = $("tm-match");
+    match.className = "tm-match";
+    if (!c) {
+      match.textContent = lvl >= 5 ? "这把锁连自己都撬不开，记得保存恢复密钥" : "密码越长，锁芯里顶起的弹子越多";
+    } else if (c === p) {
+      match.textContent = "两次输入一致 ✓";
+      match.classList.add("ok");
+    } else if (p.startsWith(c)) {
+      match.textContent = "继续输入确认密码…";
+    } else {
+      match.textContent = "两次输入不一致";
+      match.classList.add("bad");
+    }
+  }
+
+  function celebrateReimburse(sourceId, status) {
+    if (!motionOK()) return;
+    const sel = CSS.escape(sourceId);
+    const btn = document.querySelector(`#ledger-stage .stamp-btn[data-reimb-sid="${sel}"]`);
+    if (btn) pulseClass(btn, "just-changed", 520);
+    if (status !== "reimbursed") return;
+    const card = document.querySelector(`#ledger-stage .obj-card[data-source-id="${sel}"]`);
+    if (card) {
+      const stamp = document.createElement("div");
+      stamp.className = "stamp-slam";
+      stamp.innerHTML = "已到账<small>REIMBURSED</small>";
+      card.appendChild(stamp);
+      setTimeout(() => pulseClass(card, "stamp-thud", 360), 240);
+      setTimeout(() => stamp.remove(), 1950);
+    }
+    const item = (state.workspace?.items || []).find((i) => i.source_id === sourceId);
+    burstFrom(btn || card, { count: 14, shape: "coin", symbol: coinSymbol(item?.amount_fact?.value?.currency || "CNY") });
   }
 
   // --- Metric Helpers ---
@@ -432,7 +980,7 @@
       <div class="ring-gauge">
         <svg width="44" height="44" viewBox="0 0 44 44">
           <circle cx="22" cy="22" r="${r}" fill="none" stroke="var(--recessed)" stroke-width="4" />
-          <circle cx="22" cy="22" r="${r}" fill="none" stroke="${color}" stroke-width="4" stroke-linecap="round" stroke-dasharray="${dash.toFixed(1)} ${circ.toFixed(1)}" />
+          <circle class="rg-progress" cx="22" cy="22" r="${r}" fill="none" stroke="${color}" stroke-width="4" stroke-linecap="round" stroke-dasharray="${dash.toFixed(1)} ${circ.toFixed(1)}" />
         </svg>
         <div class="ring-gauge-lbl" style="color:${color}">${esc(label)}</div>
       </div>
@@ -445,7 +993,7 @@
     const cls = expired ? "filled muted" : "filled blue";
     let html = `<div class="tick-meter">`;
     for (let i = 0; i < total; i++) {
-      html += `<span class="tick-bar ${i < filled ? cls : ""}"></span>`;
+      html += `<span class="tick-bar ${i < filled ? cls : ""}" style="--t:${i}"></span>`;
     }
     html += `</div>`;
     return html;
@@ -455,6 +1003,8 @@
     try {
       await navigator.clipboard.writeText(key);
       if (btnEl) {
+        const plateText = btnEl.closest(".serial-plate")?.querySelector("span");
+        if (plateText) scrambleText(plateText, plateText.textContent, 620);
         const orig = btnEl.innerHTML;
         btnEl.classList.add("copied");
         btnEl.innerHTML = `${ICO.check} 已复制`;
@@ -473,7 +1023,8 @@
       const snap = await api("POST", "/api/sources/reimburse", { source_id: sourceId, reimburse_status: next });
       state.workspace = snap;
       renderWorkspace();
-      showToast(`报销状态已改为「${REIMBURSE_META[next].label}」`, "ok");
+      celebrateReimburse(sourceId, next);
+      showToast(next === "reimbursed" ? "啪！盖章到账，这笔钱回来了" : `报销状态已改为「${REIMBURSE_META[next].label}」`, "ok");
     } catch (err) {
       showToast(err.message, "error");
     }
@@ -572,15 +1123,18 @@
   }
 
   function showLobbyScreen() {
+    sceneKey = "";
     $("screen-lobby").classList.remove("hidden");
     $("screen-workspace").classList.add("hidden");
     closeDrawer();
   }
 
   function showWorkspaceScreen() {
+    sceneKey = "";
     $("screen-lobby").classList.add("hidden");
     $("screen-workspace").classList.remove("hidden");
     renderWorkspace();
+    requestAnimationFrame(() => moveDockGlider(true));
   }
 
   async function refreshWorkspace() {
@@ -595,15 +1149,19 @@
   }
 
   function navigateTo(navKey, collectionKey) {
+    const navChanged = state.activeNav !== navKey;
     state.activeNav = navKey;
     if (navKey === "assets" && collectionKey !== undefined) state.collection = collectionKey;
 
     document.querySelectorAll("[data-nav]").forEach((b) => {
       b.classList.toggle("active", b.getAttribute("data-nav") === navKey);
     });
+    moveDockGlider();
     ["assets", "calendar", "insights", "triage", "security"].forEach((name) => {
       $(`pane-${name}`).classList.toggle("hidden", name !== navKey);
     });
+    if (navChanged && motionOK()) pulseClass($(`pane-${navKey}`), "pane-enter", 420);
+    if (navKey === "security") markScene("security");
 
     if (state.workspace) {
       if (navKey === "assets") renderAssetsPane(state.workspace);
@@ -653,6 +1211,7 @@
     if (state.activeNav === "insights") renderInsightsPane(ws);
     if (state.activeNav === "triage") renderTriagePane(ws);
     if (state.activeNav === "security") renderSecurityAttention(ws);
+    moveDockGlider();
   }
 
   function syncAccountDropdown(ws) {
@@ -709,6 +1268,7 @@
 
   // --- View A: Editorial Hero + Tactile Object Gallery ---
   function renderAssetsPane(ws) {
+    if (state.activeNav === "assets") markScene(`assets|${state.collection}|${state.viewMode}`);
     const demoCount = ws.vault?.demo_count || 0;
     const demoBar = $("demo-notice-bar");
     if (demoCount > 0) {
@@ -752,9 +1312,9 @@
       if (!hasItems) {
         stage.innerHTML = `
           <div class="empty-gallery">
-            <div class="empty-emblem">${ICO.inbox}</div>
-            <h3>账本里还没有记录</h3>
-            <p>把 PDF 发票、邮件 HTML、支付宝 / 微信 CSV 或收据截图拖进窗口，也可以直接手动记一笔。</p>
+            ${VAULT_ART}
+            <h3>小金库还空着</h3>
+            <p>把 PDF 发票、邮件 HTML、支付宝 / 微信 CSV 或收据截图拖进窗口，它们会一张张飞进来；也可以直接手动记一笔。</p>
             <div class="btn-row" style="justify-content:center">
               <button type="button" id="btn-empty-import" class="btn btn-ink btn-sm">选择文件导入</button>
               <button type="button" id="btn-empty-manual" class="btn btn-soft btn-sm">记一笔</button>
@@ -762,7 +1322,10 @@
             </div>
           </div>
         `;
-        $("btn-empty-import").addEventListener("click", () => $("file-picker-input").click());
+        $("btn-empty-import").addEventListener("click", (e) => {
+          state.importOrigin = importOriginFor(e.currentTarget);
+          $("file-picker-input").click();
+        });
         $("btn-empty-manual").addEventListener("click", openManualModal);
         const demoBtn = $("btn-load-demo-pack");
         demoBtn.addEventListener("click", async () => {
@@ -772,7 +1335,8 @@
             const snap = await api("POST", "/api/import-demo-pack", {});
             state.workspace = snap;
             renderWorkspace();
-            showToast("已加载示例数据，顶部可随时清除", "ok");
+            launchConfetti({ count: 80 });
+            showToast("示例数据已就位，顶部可随时清除", "ok");
           } catch (err) {
             showToast(err.message, "error");
             demoBtn.disabled = false;
@@ -808,6 +1372,7 @@
     } else {
       renderTableView(list, stage);
     }
+    assignStagger(stage);
   }
 
   function renderFocusedContextStrip(ws, hero) {
@@ -1089,6 +1654,11 @@
       `);
     }
 
+    const heroCur = activeCur.currency;
+    const monthlyCents = amountToCents(activeCur.monthly_equiv_recurring);
+    const facts = funFactsFor(heroCur, monthlyCents);
+    const factIdx = ((state.funIdx || 0) % facts.length + facts.length) % facts.length;
+
     hero.innerHTML = `
       <div class="hero-primary">
         <div class="hero-top-bar">
@@ -1098,26 +1668,45 @@
 
         <div class="hero-figures">
           <div>
-            <div class="hero-big-label">${esc(activeCur.currency)} 合计</div>
-            <div class="hero-big-num sensitive">${renderEditorialMoney(activeCur.currency, activeCur.total_recorded, false)}</div>
+            <div class="hero-big-label">${esc(heroCur)} 合计</div>
+            <div class="hero-big-num sensitive" data-countup="hero-total-${esc(heroCur)}" data-cur="${esc(heroCur)}" data-cents="${amountToCents(activeCur.total_recorded)}">${renderEditorialMoney(heroCur, activeCur.total_recorded, false)}</div>
           </div>
           <div class="hero-secondary-stats">
             <div>
               <div class="mini-stat-k">订阅月均</div>
-              <div class="mini-stat-v sensitive">${esc(formatMoneyShort(activeCur.currency, activeCur.monthly_equiv_recurring))}<span style="font-size:11.5px;color:var(--ink-3);font-weight:500"> /月</span></div>
+              <div class="mini-stat-v sensitive"><span data-countup="hero-m-${esc(heroCur)}" data-count-mode="short" data-cur="${esc(heroCur)}" data-cents="${monthlyCents}">${esc(formatMoneyShort(heroCur, activeCur.monthly_equiv_recurring))}</span><span style="font-size:11.5px;color:var(--ink-3);font-weight:500"> /月</span></div>
             </div>
             <div>
               <div class="mini-stat-k">订阅年计</div>
-              <div class="mini-stat-v sensitive">${esc(formatMoneyShort(activeCur.currency, activeCur.yearly_equiv_recurring))}</div>
+              <div class="mini-stat-v sensitive"><span data-countup="hero-y-${esc(heroCur)}" data-count-mode="short" data-cur="${esc(heroCur)}" data-cents="${amountToCents(activeCur.yearly_equiv_recurring)}">${esc(formatMoneyShort(heroCur, activeCur.yearly_equiv_recurring))}</span></div>
             </div>
           </div>
         </div>
+
+        <button type="button" class="fun-fact sensitive" data-fun-cycle title="点一下，换个算法">
+          <span class="ff-spark" aria-hidden="true">✦</span>
+          <span class="ff-text">${esc(facts[factIdx])}</span>
+          <span class="ff-hint">换一个</span>
+        </button>
 
         ${ribbonHtml}
       </div>
 
       <div class="hero-signals">${signalCards.join("")}</div>
     `;
+
+    runCountUps(hero);
+    assignStagger(hero);
+    const funBtn = hero.querySelector("[data-fun-cycle]");
+    if (funBtn) {
+      funBtn.addEventListener("click", () => {
+        state.funIdx = (state.funIdx || 0) + 1;
+        const textEl = funBtn.querySelector(".ff-text");
+        textEl.textContent = facts[((state.funIdx % facts.length) + facts.length) % facts.length];
+        pulseClass(textEl, "flip", 420);
+        pulseClass(funBtn.querySelector(".ff-spark"), "pop", 500);
+      });
+    }
 
     hero.querySelectorAll("[data-hero-cur]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -1635,6 +2224,7 @@
     const pane = $("pane-calendar");
     const year = state.calendarYear;
     const month = state.calendarMonth;
+    if (state.activeNav === "calendar") markScene(`calendar|${year}-${month}`);
     const startWeekday = new Date(year, month, 1).getDay();
     const daysInMonth = new Date(year, month + 1, 0).getDate();
     const prevMonthDays = new Date(year, month, 0).getDate();
@@ -1778,18 +2368,29 @@
       </div>
     `;
 
+    assignStagger(pane);
+    if (state.calDir) {
+      pane.querySelector(".cal-grid")?.classList.add(state.calDir > 0 ? "slide-from-right" : "slide-from-left");
+      pane.querySelector(".cal-month-title")?.classList.add("flip");
+      state.calDir = 0;
+    }
+
     $("cal-prev").addEventListener("click", () => {
       state.calendarMonth -= 1;
+      state.calDir = -1;
       if (state.calendarMonth < 0) { state.calendarMonth = 11; state.calendarYear -= 1; }
       renderCalendarPane(ws);
     });
     $("cal-next").addEventListener("click", () => {
       state.calendarMonth += 1;
+      state.calDir = 1;
       if (state.calendarMonth > 11) { state.calendarMonth = 0; state.calendarYear += 1; }
       renderCalendarPane(ws);
     });
     $("cal-today").addEventListener("click", () => {
       const n = new Date();
+      const diff = (n.getFullYear() * 12 + n.getMonth()) - (state.calendarYear * 12 + state.calendarMonth);
+      state.calDir = Math.sign(diff);
       state.calendarYear = n.getFullYear();
       state.calendarMonth = n.getMonth();
       renderCalendarPane(ws);
@@ -1838,6 +2439,7 @@
 
     if (!curList.includes(state.insightsCurrency)) state.insightsCurrency = curList[0];
     const cur = state.insightsCurrency;
+    if (state.activeNav === "insights") markScene(`insights|${cur}`);
     const analytics = ws.analytics || { categories: {}, accounts: {}, monthly_trend: {} };
     const catRows = (analytics.categories && analytics.categories[cur]) || [];
     const accRows = (analytics.accounts && analytics.accounts[cur]) || [];
@@ -1995,7 +2597,7 @@
               <h3 class="folio-h3" style="margin:0">取消订阅试算</h3>
               <span class="micro-pill slate">仅试算，不修改账本</span>
             </div>
-            <div class="sim-figure sensitive">每年少花 ${renderEditorialMoney(cur, centsToText(yearlySave), true)}</div>
+            <div class="sim-figure sensitive">每年少花 <span data-countup="sim-${esc(cur)}" data-cur="${esc(cur)}" data-code="1" data-cents="${yearlySave}">${renderEditorialMoney(cur, centsToText(yearlySave), true)}</span></div>
             <div class="folio-p">${esc(buildSavingsNote(cur, yearlySave, cutList.length))}</div>
             <div class="btn-row" style="margin-top:4px">
               <button type="button" id="btn-sim-copy" class="btn btn-ink btn-sm" ${cutList.length === 0 ? "disabled" : ""}>复制清单 (${cutList.length})</button>
@@ -2009,6 +2611,8 @@
       </div>
     `;
 
+    runCountUps(pane);
+    assignStagger(pane);
     pane.querySelectorAll("[data-ins-cur]").forEach((b) => b.addEventListener("click", () => { state.insightsCurrency = b.getAttribute("data-ins-cur"); renderInsightsPane(ws); }));
     const slices = [...pane.querySelectorAll("[data-cat-slice]")];
     const catLegends = [...pane.querySelectorAll("[data-jump-cat]")];
@@ -2042,7 +2646,10 @@
     pane.querySelectorAll("[data-jump-vendor]").forEach((t) => t.addEventListener("click", () => { const v = t.getAttribute("data-jump-vendor") || ""; state.searchQuery = v; $("search-box").value = v; navigateTo("assets", "all"); }));
     pane.querySelectorAll("[data-sim-sid]").forEach((chk) => chk.addEventListener("change", () => {
       const sid = chk.getAttribute("data-sim-sid");
-      if (chk.checked) state.simCutIds.add(sid); else state.simCutIds.delete(sid);
+      if (chk.checked) {
+        state.simCutIds.add(sid);
+        burstFrom(chk.closest(".ios-switch"), { count: 12, shape: "coin", spread: 1.6, symbol: coinSymbol(cur) });
+      } else state.simCutIds.delete(sid);
       renderInsightsPane(ws);
     }));
     if ($("btn-sim-reset")) $("btn-sim-reset").addEventListener("click", () => { state.simCutIds.clear(); renderInsightsPane(ws); });
@@ -2061,11 +2668,12 @@
   function renderTriagePane(ws) {
     const pane = $("pane-triage");
     const queue = getTriageQueue(ws);
+    if (state.activeNav === "triage") markScene(`triage|${queue[0]?.source_id || "done"}`);
     if (!queue.length) {
       const skipped = state.triageSkippedIds.size;
       pane.innerHTML = `
         <div class="empty-gallery">
-          <div class="empty-emblem" style="background:var(--green-bg);color:var(--green)">${ICO.sparkle}</div>
+          <div class="empty-emblem twinkle" style="background:var(--green-bg);color:var(--green)">${ICO.sparkle}</div>
           <h3>待处理项已清空</h3>
           <p>以后导入扫描件、截图或金额有歧义的账单时，可以在这里对照原件补充信息。</p>
           <div class="btn-row" style="justify-content:center">
@@ -2170,7 +2778,7 @@
           category: $("tr-category").value, bill_date: $("tr-date").value,
         });
         state.workspace = snap; renderWorkspace();
-        if (getTriageQueue(snap).length === 0) { launchConfetti(); showToast("待整理项已全部处理", "ok"); }
+        if (getTriageQueue(snap).length === 0) { launchConfetti(); showToast("待整理项全部清空，干得漂亮", "ok"); }
         else showToast("已保存，进入下一项", "ok");
       } catch (err) {
         showToast(err.message, "error"); btn.disabled = false; btn.textContent = "保存并切下一张";
@@ -2218,6 +2826,7 @@
         </div>
       </div>
     `;
+    assignStagger(wrap);
     wrap.querySelectorAll("[data-open-sid]").forEach((btn) => btn.addEventListener("click", () => {
       const found = items.find((i) => i.source_id === btn.getAttribute("data-open-sid"));
       if (found) openDrawer(found);
@@ -2233,8 +2842,8 @@
     $("redact-custom-terms").value = "";
     $("delete-confirm-bar").classList.add("hidden");
     $("btn-ask-delete-item").classList.remove("hidden");
-    $("drawer-backdrop").classList.remove("hidden");
-    $("detail-drawer").classList.remove("hidden");
+    $("drawer-backdrop").classList.remove("hidden", "closing");
+    $("detail-drawer").classList.remove("hidden", "closing");
 
     const isCsv = item.status_flags && item.status_flags.is_csv_statement;
     $("dtab-csv-btn").classList.toggle("hidden", !isCsv);
@@ -2244,8 +2853,22 @@
 
   function closeDrawer() {
     state.selectedSourceId = null;
-    $("drawer-backdrop").classList.add("hidden");
-    $("detail-drawer").classList.add("hidden");
+    const drawer = $("detail-drawer");
+    const back = $("drawer-backdrop");
+    if (drawer.classList.contains("hidden") || !motionOK()) {
+      drawer.classList.add("hidden");
+      back.classList.add("hidden");
+      return;
+    }
+    drawer.classList.add("closing");
+    back.classList.add("closing");
+    setTimeout(() => {
+      drawer.classList.remove("closing");
+      back.classList.remove("closing");
+      if (state.selectedSourceId) return;
+      drawer.classList.add("hidden");
+      back.classList.add("hidden");
+    }, 190);
   }
 
   function switchDrawerTab(tab) {
@@ -2465,6 +3088,8 @@
       { ico: ICO.sun, label: "切换外观", sub: "浅色 / 暖白 / 深色", run: () => cycleTheme() },
       { ico: ICO.eye, label: "隐藏或显示金额", sub: "快捷键 P", run: () => togglePrivacy() },
       { ico: ICO.lock, label: "锁定账本", sub: "返回解锁界面", run: () => $("btn-lock-vault").click() },
+      { ico: ICO.party, label: "撒个花", sub: "没什么理由，就是想庆祝一下", egg: ["撒花", "庆祝", "party", "confetti", "🎉"], run: () => launchConfetti() },
+      { ico: ICO.party, label: "下一场金币雨", sub: "看看钱都去哪儿了", egg: ["金币", "下雨", "coin", "money", "rain"], run: () => launchConfetti({ coins: true, count: 70 }) },
     );
 
     const assets = (state.workspace?.items || []).map((it) => {
@@ -2478,7 +3103,10 @@
       };
     });
 
-    const filtered = [...acts, ...assets].filter((a) => !q || a.label.toLowerCase().includes(q) || a.sub.toLowerCase().includes(q));
+    const filtered = [...acts, ...assets].filter((a) => {
+      if (a.egg) return Boolean(q) && a.egg.some((k) => k.startsWith(q) || q.includes(k));
+      return !q || a.label.toLowerCase().includes(q) || a.sub.toLowerCase().includes(q);
+    });
     state.cmdActions = filtered.slice(0, 14);
     state.cmdIndex = Math.min(state.cmdIndex, Math.max(0, state.cmdActions.length - 1));
 
@@ -2525,16 +3153,21 @@
   function closeManualModal() { $("modal-manual").classList.add("hidden"); }
 
   // --- Upload & Drop ---
-  async function importFileList(files) {
+  async function importFileList(files, origin) {
     const valid = Array.from(files).filter((f) => f && f.size > 0);
     if (!valid.length) return;
+    const from = origin || state.importOrigin || importOriginFor($("btn-import-files"));
+    state.importOrigin = null;
+    if (from) flyPapersInto(from.x, from.y, valid);
+    const prevIds = itemIdSet();
     const prog = $("import-progress");
     prog.classList.remove("hidden");
     const batchId = `b_${Date.now().toString(36)}`;
     let added = 0, reused = 0, failed = 0, lastError = "";
     for (let i = 0; i < valid.length; i++) {
       const f = valid[i];
-      prog.textContent = `导入 ${i + 1}/${valid.length} · ${f.name}`;
+      const pct = Math.round(((i + 0.5) / valid.length) * 100);
+      prog.innerHTML = `<span class="ip-bar" style="width:${pct}%"></span><span class="ip-text">收进金库 ${i + 1}/${valid.length} · ${esc(f.name)}</span>`;
       try {
         const res = await api("POST", "/api/import", { filename: f.name, content_base64: arrayBufferToBase64(await f.arrayBuffer()), batch_id: batchId });
         if (res.reused) reused += 1; else added += 1;
@@ -2542,9 +3175,10 @@
     }
     prog.classList.add("hidden");
     await refreshWorkspace();
+    highlightNewItems(prevIds);
     const parts = [];
-    if (added) parts.push(`已导入 ${added} 份`);
-    if (reused) parts.push(`跳过重复 ${reused} 份`);
+    if (added) parts.push(`已收进 ${added} 份`);
+    if (reused) parts.push(`认出 ${reused} 份重复，已跳过`);
     if (failed) parts.push(`失败 ${failed} 份（${lastError}）`);
     showToast(parts.join("，") || "导入完成", failed && !added ? "error" : "ok");
   }
@@ -2575,6 +3209,7 @@
     $("chk-recovery-saved").checked = false;
     $("btn-confirm-recovery").disabled = true;
     $("modal-recovery").classList.remove("hidden");
+    scrambleText($("modal-recovery-key"), recoveryKey, 1300);
     $("btn-confirm-recovery").onclick = () => {
       $("modal-recovery").classList.add("hidden");
       state.pendingRecoveryKey = null;
@@ -2592,8 +3227,12 @@
     $("btn-open-manual").addEventListener("click", openManualModal);
     $("btn-close-manual").addEventListener("click", closeManualModal);
     $("btn-cancel-manual").addEventListener("click", closeManualModal);
-    $("btn-import-files").addEventListener("click", () => $("file-picker-input").click());
-    $("btn-import-folder").addEventListener("click", () => $("folder-picker-input").click());
+    $("btn-import-files").addEventListener("click", (e) => { state.importOrigin = importOriginFor(e.currentTarget); $("file-picker-input").click(); });
+    $("btn-import-folder").addEventListener("click", (e) => { state.importOrigin = importOriginFor(e.currentTarget); $("folder-picker-input").click(); });
+    bindTiltEffects();
+    window.addEventListener("resize", () => moveDockGlider(true));
+    $("create-passphrase").addEventListener("input", updateTumblers);
+    $("create-passphrase-confirm").addEventListener("input", updateTumblers);
 
     // Vault pill popover
     $("vault-pill-btn").addEventListener("click", (e) => {
@@ -2665,15 +3304,19 @@
     $("form-unlock-vault").addEventListener("submit", async (e) => {
       e.preventDefault();
       const errBox = $("unlock-error"); errBox.classList.add("hidden");
-      const btn = $("btn-unlock-submit"); btn.disabled = true; btn.textContent = "解锁中…";
+      const btn = $("btn-unlock-submit"); btn.disabled = true; btn.innerHTML = `<span class="dial-spin" aria-hidden="true"></span>正在转动转盘…`;
       try {
         const payload = { path: $("unlock-path").value.trim() };
         if (state.unlockMode === "passphrase") payload.passphrase = $("unlock-passphrase").value;
         else if (state.unlockMode === "recovery") payload.recovery_key = $("unlock-recovery").value.trim();
         const snap = await api("POST", "/api/vault/unlock", payload);
         $("unlock-passphrase").value = ""; $("unlock-recovery").value = "";
-        state.workspace = snap; showWorkspaceScreen(); showToast("账本已打开", "ok");
-      } catch (err) { errBox.textContent = err.message; errBox.classList.remove("hidden"); }
+        await playVaultDoor(() => { state.workspace = snap; showWorkspaceScreen(); });
+        showToast("金库门已打开，欢迎回来", "ok");
+      } catch (err) {
+        errBox.textContent = err.message; errBox.classList.remove("hidden");
+        if (motionOK()) pulseClass($("form-unlock-vault"), "shake", 520);
+      }
       finally { btn.disabled = false; btn.textContent = "打开账本"; }
     });
 
@@ -2683,17 +3326,26 @@
       const prot = document.querySelector('input[name="create-protection"]:checked').value;
       const pass = $("create-passphrase").value, cpass = $("create-passphrase-confirm").value;
       if (prot === "passphrase") {
-        if (pass.length < 6) { errBox.textContent = "密码至少需要 6 位字符"; errBox.classList.remove("hidden"); return; }
-        if (pass !== cpass) { errBox.textContent = "两次输入的密码不一致"; errBox.classList.remove("hidden"); return; }
+        const fail = (msg) => { errBox.textContent = msg; errBox.classList.remove("hidden"); if (motionOK()) pulseClass($("form-create-vault"), "shake", 520); };
+        if (pass.length < 6) { fail("密码至少需要 6 位字符"); return; }
+        if (pass !== cpass) { fail("两次输入的密码不一致"); return; }
       }
-      const btn = $("btn-create-submit"); btn.disabled = true; btn.textContent = "创建中…";
+      const btn = $("btn-create-submit"); btn.disabled = true; btn.innerHTML = `<span class="dial-spin" aria-hidden="true"></span>正在浇筑金库…`;
       try {
         const res = await api("POST", "/api/vault/init", { path: $("create-path").value.trim(), protection: prot, passphrase: prot === "passphrase" ? pass : "" });
-        $("create-passphrase").value = ""; $("create-passphrase-confirm").value = "";
+        $("create-passphrase").value = ""; $("create-passphrase-confirm").value = ""; updateTumblers();
         await refreshWorkspace();
-        if (res.recovery_key) openRecoveryModal(res.recovery_key, () => { showWorkspaceScreen(); showToast("账本已创建", "ok"); });
-        else { showWorkspaceScreen(); showToast("账本已创建", "ok"); }
-      } catch (err) { errBox.textContent = err.message; errBox.classList.remove("hidden"); }
+        const enter = async () => {
+          await playVaultDoor(() => showWorkspaceScreen());
+          launchConfetti({ count: 90 });
+          showToast("新金库落成，开始往里放东西吧", "ok");
+        };
+        if (res.recovery_key) openRecoveryModal(res.recovery_key, enter);
+        else await enter();
+      } catch (err) {
+        errBox.textContent = err.message; errBox.classList.remove("hidden");
+        if (motionOK()) pulseClass($("form-create-vault"), "shake", 520);
+      }
       finally { btn.disabled = false; btn.textContent = "创建账本"; }
     });
 
@@ -2734,8 +3386,9 @@
         if (state.manualKind === "license") { payload.license_key = $("man-license-key").value; payload.license_scope = $("man-license-scope").value; }
         else if (state.manualKind === "hardware") payload.warranty_end = $("man-warranty-end").value;
         else if (state.manualKind === "reimbursable") payload.reimburse_status = $("man-reimburse-status").value;
+        const prevIds = itemIdSet();
         const snap = await api("POST", "/api/manual-entry", payload);
-        state.workspace = snap; closeManualModal(); renderWorkspace(); showToast("已保存", "ok");
+        state.workspace = snap; closeManualModal(); renderWorkspace(); highlightNewItems(prevIds); showToast("记好了", "ok");
       } catch (err) { showToast(err.message, "error"); }
       finally { btn.disabled = false; }
     });
@@ -2779,11 +3432,16 @@
       state.workspace = null;
       const info = await api("GET", "/api/bootstrap");
       renderRecentVaults(info.recent_vaults || []);
-      showLobbyScreen(); showToast("账本已锁定", "ok");
+      await playVaultDoor(() => {
+        showLobbyScreen();
+        setLobbyTab("unlock");
+        if ((info.recent_vaults || []).length) selectRecentVault(info.recent_vaults[0]);
+      }, true);
+      showToast("金库已锁好", "ok");
     });
     $("btn-shutdown-app").addEventListener("click", async () => {
       try { await api("POST", "/api/shutdown", {}); } catch (_) {}
-      document.body.innerHTML = `<div style="max-width:440px;margin:130px auto;text-align:center;font-family:var(--font-sans);padding:24px"><h2 style="margin:0 0 8px">SubVault 已退出</h2><p style="margin:0;color:var(--ink-2)">本地服务已停止，可以直接关闭这个页面。</p></div>`;
+      document.body.innerHTML = `<div class="farewell"><div class="farewell-lock">${LOCK_ART}</div><h2>SubVault 已安全退出</h2><p>金库门已锁好，本地服务已停止，可以直接关闭这个页面。</p></div>`;
     });
 
     // Global drag & drop
@@ -2794,7 +3452,9 @@
     window.addEventListener("drop", async (e) => {
       state.dragDepth = 0; overlay.classList.add("hidden");
       if ($("screen-workspace").classList.contains("hidden")) return;
-      e.preventDefault(); importFileList(await collectDroppedFiles(e.dataTransfer));
+      e.preventDefault();
+      const origin = { x: e.clientX, y: e.clientY };
+      importFileList(await collectDroppedFiles(e.dataTransfer), origin);
     });
 
     // Tools
@@ -2819,6 +3479,7 @@
       e.preventDefault();
       if (!state.selectedSourceId) return;
       const btn = $("btn-save-item"); btn.disabled = true; btn.textContent = "保存中…";
+      let saved = false;
       try {
         const payload = {
           source_id: state.selectedSourceId, vendor: $("ed-vendor").value, plan_name: $("ed-plan").value, account_label: $("ed-account").value,
@@ -2831,9 +3492,11 @@
         state.workspace = snap; renderWorkspace();
         const ref = (snap.items || []).find((i) => i.source_id === state.selectedSourceId);
         if (ref) renderDrawer(ref);
+        saved = true;
+        flashButtonSuccess(btn, "已保存", "保存修改");
         showToast("已保存修改", "ok");
       } catch (err) { showToast(err.message, "error"); }
-      finally { btn.disabled = false; btn.textContent = "保存修改"; }
+      finally { if (!saved) { btn.disabled = false; btn.textContent = "保存修改"; } }
     });
 
     // Redact & Exports

@@ -11,8 +11,14 @@
   <!-- 全屏拖拽层 -->
   <div id="global-drop-overlay" class="drop-overlay hidden" aria-hidden="true">
     <div class="drop-overlay-card">
-      <div class="drop-overlay-ring">
-        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>
+      <div class="drop-stage">
+        <span class="drop-chip c1">PDF</span>
+        <span class="drop-chip c2">CSV</span>
+        <span class="drop-chip c3">HTML</span>
+        <span class="drop-chip c4">PNG</span>
+        <div class="drop-overlay-ring">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>
+        </div>
       </div>
       <h2>松手即可导入</h2>
       <p>支持 PDF 发票、邮件 HTML、支付宝 / 微信 CSV、收据截图或整个文件夹</p>
@@ -29,10 +35,33 @@
   <!-- 庆祝彩纸 Canvas -->
   <canvas id="confetti-canvas" class="confetti-canvas hidden" aria-hidden="true"></canvas>
 
+  <!-- 金库大门转场：解锁 / 锁定时合拢、转动转盘、再打开 -->
+  <div id="vault-door" class="vault-door hidden" aria-hidden="true">
+    <div class="vd-half vd-left"></div>
+    <div class="vd-half vd-right"></div>
+    <div class="vd-wheel">
+      <svg viewBox="0 0 168 168" width="168" height="168" fill="none" stroke="currentColor" stroke-linecap="round">
+        <circle cx="84" cy="84" r="82" style="fill: var(--door-plate)" stroke-width="1.5" stroke-opacity="0.22"/>
+        <circle cx="84" cy="84" r="72" stroke-width="1" stroke-opacity="0.3" stroke-dasharray="1.5 7"/>
+        <circle cx="84" cy="84" r="50" stroke-width="7"/>
+        <g stroke-width="7">
+          <line x1="84" y1="70" x2="84" y2="24"/>
+          <line x1="84" y1="70" x2="84" y2="24" transform="rotate(60 84 84)"/>
+          <line x1="84" y1="70" x2="84" y2="24" transform="rotate(120 84 84)"/>
+          <line x1="84" y1="70" x2="84" y2="24" transform="rotate(180 84 84)"/>
+          <line x1="84" y1="70" x2="84" y2="24" transform="rotate(240 84 84)"/>
+          <line x1="84" y1="70" x2="84" y2="24" transform="rotate(300 84 84)"/>
+        </g>
+        <circle class="vdw-hub" cx="84" cy="84" r="15" fill="currentColor" stroke="none"/>
+      </svg>
+    </div>
+  </div>
+
   <!-- 底部浮雕 Toast -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite">
     <span class="toast-dot"></span>
     <span id="toast-msg"></span>
+    <span class="toast-timer" aria-hidden="true"></span>
     <button id="toast-close" class="toast-close" type="button" aria-label="关闭提示">
       <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
     </button>
@@ -59,7 +88,7 @@
           </div>
         </div>
 
-        <h1 class="lobby-display">把订阅、软件密钥和保修留在本地</h1>
+        <h1 class="lobby-display">把<span class="hl">订阅</span>、<span class="hl">软件密钥</span>和<span class="hl">保修</span>留在本地</h1>
 
         <!-- 概念性实体资产缩略叠卡（纯粹视觉叙事，传达实物感） -->
         <div class="lobby-artifact-stack" aria-hidden="true">
@@ -167,6 +196,15 @@
                 <span>确认主密码</span>
                 <input id="create-passphrase-confirm" name="confirm-password" type="password" autocomplete="new-password" placeholder="再次输入">
               </label>
+              <div id="pass-tumblers" class="tumbler-meter lvl-0" aria-live="polite">
+                <div class="tm-pins" aria-hidden="true">
+                  <span class="tm-pin"></span><span class="tm-pin"></span><span class="tm-pin"></span><span class="tm-pin"></span><span class="tm-pin"></span>
+                </div>
+                <div class="tm-copy">
+                  <span id="tm-label" class="tm-label">锁芯 0/5 · 还没设置</span>
+                  <span id="tm-match" class="tm-match">密码越长，锁芯里顶起的弹子越多</span>
+                </div>
+              </div>
             </div>
 
             <div id="create-error" class="form-error hidden"></div>
@@ -219,6 +257,7 @@
         </div>
 
         <nav class="floating-dock" aria-label="主视图切换">
+          <span class="dock-glider" aria-hidden="true"></span>
           <button class="dock-item active" data-nav="assets" type="button">账本</button>
           <button class="dock-item" data-nav="calendar" type="button">日历</button>
           <button class="dock-item" data-nav="insights" type="button">统计</button>
