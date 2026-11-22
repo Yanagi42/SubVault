@@ -2482,29 +2482,38 @@ html[data-theme="night"] .dock-glider { box-shadow: var(--shadow-xs), var(--top-
 .hero-big-num.is-counting,
 .is-counting { font-variant-numeric: tabular-nums; }
 .fun-fact {
-  align-self: flex-start;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 5px 12px 5px 10px;
-  border-radius: 999px;
-  border: 1px dashed var(--hairline-strong);
-  background: var(--surface-tint);
-  color: var(--ink-2);
+  gap: 6px;
+  margin-top: 6px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ink-3);
   font-family: inherit;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
-  transition: border-color 0.15s, color 0.15s, background 0.15s, filter 0.34s var(--ease);
+  transition: color 0.15s, filter 0.34s var(--ease);
 }
-.fun-fact:hover { border-color: var(--focus); color: var(--ink); background: var(--blue-bg); }
-.ff-spark { color: var(--amber); display: inline-block; animation: sparkTwinkle 2.8s ease-in-out infinite; }
+.fun-fact:hover { color: var(--ink); }
+.ff-spark { color: var(--amber); font-size: 11px; display: inline-block; animation: sparkTwinkle 2.8s ease-in-out infinite; }
 .ff-spark.pop { animation: stampPop 0.45s var(--ease); }
 .ff-text { display: inline-block; }
 .ff-text.flip { animation: ffFlip 0.38s var(--ease); }
 @keyframes ffFlip { from { opacity: 0; transform: translateY(7px); filter: blur(2px); } }
 .ff-hint { font-size: 10.5px; color: var(--ink-3); opacity: 0; transition: opacity 0.15s; }
 .fun-fact:hover .ff-hint { opacity: 1; }
+
+/* Declutter: quieter demo notice, compact account filter */
+.demo-banner {
+  padding: 6px 8px 6px 14px;
+  background: var(--surface-tint);
+  border-color: var(--divider);
+}
+.demo-banner-left { font-size: 12px; color: var(--ink-2); }
+.demo-banner .btn { padding: 4px 11px; font-size: 12px; }
+.ghost-select { max-width: 150px; text-overflow: ellipsis; }
 
 /* Tactile cards: 3D tilt with a light that follows the cursor */
 .brand-badge { transition: transform 0.32s cubic-bezier(0.34, 1.56, 0.64, 1); }

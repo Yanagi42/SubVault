@@ -1219,6 +1219,8 @@
     sel.innerHTML = `<option value="">所有账号</option>` +
       (ws.accounts || []).map((a) => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
     sel.value = state.accountFilter;
+    // 只有一个（或没有）账号时，筛选毫无意义，直接隐藏
+    sel.classList.toggle("hidden", (ws.accounts || []).length <= 1 && !state.accountFilter);
   }
 
   function filteredItems(ws) {
@@ -1578,14 +1580,14 @@
                 return `<button type="button" class="comp-leg-btn" data-ribbon-kind="${m.key}"><span class="c-dot" style="background:${m.color}"></span>${m.label} <strong class="sensitive num">${pct}%</strong></button>`;
               }).join("")}
             </div>
-            <span style="color:var(--ink-3)">按币种分开统计，不做汇率换算</span>
+            <span style="color:var(--ink-3)">按币种分开统计</span>
           </div>
         </div>
       `
       : "";
 
     const curTabsHtml = curList.length > 0
-      ? `<div class="cur-switcher">${curList.map((c) => `<button type="button" class="cur-tab ${c.currency === activeCur.currency ? "active" : ""}" data-hero-cur="${esc(c.currency)}">${esc(c.currency)} · ${esc(CURRENCY_NAMES[c.currency] || c.currency)}</button>`).join("")}</div>`
+      ? `<div class="cur-switcher" title="各币种分开统计，不做汇率换算">${curList.map((c) => `<button type="button" class="cur-tab ${c.currency === activeCur.currency ? "active" : ""}" data-hero-cur="${esc(c.currency)}" title="${esc(CURRENCY_NAMES[c.currency] || c.currency)}">${esc(c.currency)}</button>`).join("")}</div>`
       : `<span class="micro-eyebrow">账本概览</span>`;
 
     // Living Signals Column (up to 3 crisp tactile cards)
@@ -1663,13 +1665,17 @@
       <div class="hero-primary">
         <div class="hero-top-bar">
           ${curTabsHtml}
-          <span class="micro-pill slate">${activeCur.bill_count} 笔</span>
         </div>
 
         <div class="hero-figures">
           <div>
-            <div class="hero-big-label">${esc(heroCur)} 合计</div>
+            <div class="hero-big-label">${esc(heroCur)} 合计 · ${activeCur.bill_count} 笔</div>
             <div class="hero-big-num sensitive" data-countup="hero-total-${esc(heroCur)}" data-cur="${esc(heroCur)}" data-cents="${amountToCents(activeCur.total_recorded)}">${renderEditorialMoney(heroCur, activeCur.total_recorded, false)}</div>
+            <button type="button" class="fun-fact sensitive" data-fun-cycle title="点一下，换个算法">
+              <span class="ff-spark" aria-hidden="true">✦</span>
+              <span class="ff-text">${esc(facts[factIdx])}</span>
+              <span class="ff-hint">换一个</span>
+            </button>
           </div>
           <div class="hero-secondary-stats">
             <div>
@@ -1682,12 +1688,6 @@
             </div>
           </div>
         </div>
-
-        <button type="button" class="fun-fact sensitive" data-fun-cycle title="点一下，换个算法">
-          <span class="ff-spark" aria-hidden="true">✦</span>
-          <span class="ff-text">${esc(facts[factIdx])}</span>
-          <span class="ff-hint">换一个</span>
-        </button>
 
         ${ribbonHtml}
       </div>
@@ -1765,7 +1765,7 @@
       const cyc = kind === "hardware" ? "一次购入" : kind === "license" ? "终身买断" : (CYCLE_LABELS[ann.billing_cycle] || "未标注");
       priceHtml = `
         <div class="oc-price-cluster">
-          <div class="oc-amount sensitive">${renderEditorialMoney(amtVal.currency, amtVal.amount_text, true)}</div>
+          <div class="oc-amount sensitive">${renderEditorialMoney(amtVal.currency, amtVal.amount_text, !CURRENCY_SYMBOLS[amtVal.currency])}</div>
           ${driftPill}
         </div>
         <span class="oc-cycle">${esc(cyc)}</span>
@@ -1840,6 +1840,12 @@
 
     const metaStr = [ann.account_label, ann.category, flags.has_duplicate ? `防重 ×${item.occurrence_count}` : ""].filter(Boolean).join(" · ") || "未分组";
     const spineHtml = kind === "subscription" ? `<span class="obj-spine" style="background:${brand.bg}"></span>` : "";
+    // 只在“全部”里标类型；进入某个分类后类型不言自明，仅保留冲突 / 往期等异常标记
+    const showKindPill = flags.has_conflict || prog?.expired || state.collection === "all";
+    const kindPillHtml = showKindPill
+      ? `<span class="micro-pill ${flags.has_conflict ? "amber" : prog?.expired ? "slate" : kindMeta.pill}">${flags.has_conflict ? "冲突" : prog?.expired ? "往期" : esc(kindMeta.label)}</span>`
+      : "";
+    const integrityHtml = item.object_intact ? "" : `<span class="micro-pill rose" title="原件校验异常">校验异常</span>`;
 
     return `
       <article class="obj-card kind-${esc(kind)} ${prog?.expired ? "is-expired" : ""}" data-source-id="${esc(item.source_id)}">
@@ -1852,7 +1858,7 @@
               <div class="oc-sub">${esc(sub)}</div>
             </div>
           </div>
-          <span class="micro-pill ${flags.has_conflict ? "amber" : prog?.expired ? "slate" : kindMeta.pill}">${flags.has_conflict ? "冲突" : prog?.expired ? "往期" : esc(kindMeta.label)}</span>
+          ${kindPillHtml}
         </div>
 
         <div class="oc-price-row">${priceHtml}</div>
@@ -1860,7 +1866,7 @@
 
         <div class="oc-foot ${kind === "reimbursable" ? "" : "ruled"}">
           <span class="sensitive" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(metaStr)}</span>
-          ${stampHtml || (item.object_intact ? `<span class="verified-check" title="原件校验完整">${ICO.check}</span>` : "")}
+          ${stampHtml || integrityHtml}
         </div>
       </article>
     `;
@@ -2168,7 +2174,7 @@
           <td style="color:var(--ink-2)">${esc(CYCLE_LABELS[ann.billing_cycle] || "—")}</td>
           <td class="right">${amtHtml}</td>
           <td style="font-size:12px;color:var(--ink-3);white-space:nowrap">${esc(dateStr)}</td>
-          <td class="right"><div class="btn-row" style="justify-content:flex-end">${acts.join("") || (item.object_intact ? `<span class="verified-check">${ICO.check}</span>` : "")}</div></td>
+          <td class="right"><div class="btn-row" style="justify-content:flex-end">${acts.join("") || (item.object_intact ? "" : `<span class="micro-pill rose">校验异常</span>`)}</div></td>
         </tr>
       `;
     }).join("");
