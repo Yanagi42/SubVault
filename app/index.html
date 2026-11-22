@@ -222,119 +222,85 @@
     </div>
   </main>
 
-  <!-- 主工作台：左侧栏 + 纸面主区 -->
-  <div id="screen-workspace" class="shell hidden">
+  <!-- 主工作台 -->
+  <div id="screen-workspace" class="folio-app hidden">
     <input id="file-picker-input" type="file" multiple accept=".pdf,.html,.htm,.csv,.txt,.png,.jpg,.jpeg,.webp" class="hidden">
     <input id="folder-picker-input" type="file" webkitdirectory multiple class="hidden">
 
-    <aside class="sidebar" aria-label="账本导航">
-      <div class="vault-anchor">
-        <button id="vault-pill-btn" class="vault-pill sb-vault" type="button" title="账本状态、外观与安全退出">
-          <img src="/icon.svg" alt="SubVault" width="22" height="22" class="vp-logo">
-          <span class="sb-text sb-vault-copy">
+    <!-- 顶部极简浮空导览栏 -->
+    <header class="masthead">
+      <div class="masthead-inner">
+        <!-- 左：账本身份胶囊（点击展开路径 / 锁定 / 退出浮层） -->
+        <div class="vault-anchor">
+          <button id="vault-pill-btn" class="vault-pill" type="button" title="账本状态与安全退出">
+            <img src="/icon.svg" alt="SubVault" width="20" height="20" class="vp-logo">
             <span id="mh-vault-name" class="vp-name">我的订阅账本</span>
-            <span class="sb-vault-sub"><span id="mh-vault-dot" class="vp-dot green"></span>仅在本机</span>
-          </span>
-          <svg class="sb-text" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/></svg>
-        </button>
-        <div id="vault-popover" class="vault-popover hidden">
-          <div class="vp-pop-head">
-            <div id="vp-vault-status" class="vp-pop-status">本机已加密 · 离线运行</div>
-            <div id="vp-vault-path" class="vp-pop-path"></div>
-          </div>
-          <div class="vp-pop-actions">
-            <button id="btn-lock-vault" class="vp-pop-btn" type="button">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-              锁定账本
-            </button>
-            <button id="btn-shutdown-app" class="vp-pop-btn danger" type="button">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" x2="12" y1="2" y2="12"/></svg>
-              退出 SubVault
-            </button>
+            <span id="mh-vault-dot" class="vp-dot green"></span>
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+          <div id="vault-popover" class="vault-popover hidden">
+            <div class="vp-pop-head">
+              <div id="vp-vault-status" class="vp-pop-status">本机已加密 · 离线运行</div>
+              <div id="vp-vault-path" class="vp-pop-path"></div>
+            </div>
+            <div class="vp-pop-actions">
+              <button id="btn-lock-vault" class="vp-pop-btn" type="button">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                锁定账本
+              </button>
+              <button id="btn-shutdown-app" class="vp-pop-btn danger" type="button">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" x2="12" y1="2" y2="12"/></svg>
+                退出 SubVault
+              </button>
+            </div>
           </div>
         </div>
-      </div>
 
-      <button id="btn-cmd-open" class="sb-search" type="button" title="搜索或跳转（Ctrl+K）">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <span class="sb-text">搜索或跳转</span>
-        <kbd class="sb-text">Ctrl K</kbd>
-      </button>
+        <nav class="floating-dock" aria-label="主视图切换">
+          <span class="dock-glider" aria-hidden="true"></span>
+          <button class="dock-item active" data-nav="assets" type="button">账本</button>
+          <button class="dock-item" data-nav="calendar" type="button">日历</button>
+          <button class="dock-item" data-nav="insights" type="button">统计</button>
+          <button class="dock-item" data-nav="triage" type="button">
+            待整理 <span id="cnt-triage" class="dock-badge amber hidden">0</span>
+          </button>
+          <button class="dock-item" data-nav="security" type="button">
+            备份 <span id="cnt-attention" class="dock-badge hidden">0</span>
+          </button>
+        </nav>
 
-      <nav class="sb-nav">
-        <span class="sb-glider" aria-hidden="true"></span>
-        <button class="sb-item active" data-nav="overview" type="button" title="概览">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/></svg>
-          <span class="sb-text">概览</span>
-        </button>
+        <div class="masthead-right">
+          <div id="import-progress" class="import-pill hidden"></div>
 
-        <div class="sb-label sb-text">资产</div>
-        <button class="sb-item" data-nav="subscription" type="button" title="订阅">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>
-          <span class="sb-text">订阅</span><span id="cnt-sub" class="sb-count sb-text"></span>
-        </button>
-        <button class="sb-item" data-nav="license" type="button" title="买断与密钥">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>
-          <span class="sb-text">买断与密钥</span><span id="cnt-lic" class="sb-count sb-text"></span>
-        </button>
-        <button class="sb-item" data-nav="hardware" type="button" title="硬件保修">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect width="16" height="11" x="4" y="4" rx="2"/><path d="M2 20h20"/></svg>
-          <span class="sb-text">硬件保修</span><span id="cnt-hw" class="sb-count sb-text"></span>
-        </button>
-        <button class="sb-item" data-nav="reimbursable" type="button" title="报销">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/><path d="M8 8h8M8 12h6"/></svg>
-          <span class="sb-text">报销</span><span id="cnt-reimb" class="sb-count sb-text"></span>
-        </button>
-
-        <div class="sb-label sb-text">记录</div>
-        <button class="sb-item" data-nav="all" type="button" title="全部账单">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>
-          <span class="sb-text">全部账单</span><span id="cnt-all" class="sb-count sb-text"></span>
-        </button>
-        <button class="sb-item" data-nav="csv" type="button" title="流水">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/></svg>
-          <span class="sb-text">流水</span><span id="cnt-csv" class="sb-count sb-text"></span>
-        </button>
-
-        <div class="sb-label sb-text">维护</div>
-        <button class="sb-item" data-nav="inbox" type="button" title="收件箱">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
-          <span class="sb-text">收件箱</span><span id="cnt-inbox" class="sb-badge hidden">0</span>
-        </button>
-        <button class="sb-item" data-nav="backup" type="button" title="备份与导出">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/><path d="m9 12 2 2 4-4"/></svg>
-          <span class="sb-text">备份与导出</span>
-        </button>
-      </nav>
-
-      <div class="sb-foot">
-        <div id="import-progress" class="import-pill hidden"></div>
-        <div class="sb-actions">
-          <div class="split-ink-btn sb-import">
-            <button id="btn-import-files" class="btn btn-ink btn-sm" type="button" title="导入文件">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-              <span class="sb-text">导入</span>
-            </button>
-            <button id="btn-import-folder" class="btn btn-ink btn-sm btn-icon-pad sb-text" type="button" title="导入整个文件夹">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-            </button>
-          </div>
-          <button id="btn-open-manual" class="btn btn-soft btn-sm sb-text" type="button">记一笔</button>
-        </div>
-        <div class="sb-tools">
+          <button id="btn-cmd-open" class="icon-circle" type="button" title="搜索或快捷操作（Ctrl+K）">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          </button>
           <button id="btn-privacy-toggle" class="icon-circle" type="button" title="隐藏金额与密钥（快捷键 P）">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
           </button>
           <button id="btn-theme-cycle" class="icon-circle" type="button" title="切换外观（浅色 / 暖白 / 深色）">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
           </button>
-          <span class="sb-hint sb-text">纯本地 · 不联网</span>
+
+          <button id="btn-open-manual" class="btn btn-soft btn-sm" type="button">记一笔</button>
+
+          <div class="split-ink-btn">
+            <button id="btn-import-files" class="btn btn-ink btn-sm" type="button">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+              导入
+            </button>
+            <button id="btn-import-folder" class="btn btn-ink btn-sm btn-icon-pad" type="button" title="导入整个文件夹">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            </button>
+          </div>
         </div>
       </div>
-    </aside>
+    </header>
 
-    <main class="stage">
-      <div class="stage-inner">
+    <!-- 主画布 -->
+    <main class="folio-container">
+      <!-- 视图 A：账本 -->
+      <section id="pane-assets" class="view-pane">
         <div id="demo-notice-bar" class="demo-banner hidden">
           <div class="demo-banner-left">
             <span class="micro-pill blue">示例数据</span>
@@ -343,124 +309,142 @@
           <button id="btn-clear-demo-pack" class="btn btn-soft btn-sm" type="button">清除示例</button>
         </div>
 
-        <section id="pane-overview" class="view-pane"></section>
-        <section id="pane-subscription" class="view-pane hidden"></section>
-        <section id="pane-license" class="view-pane hidden"></section>
-        <section id="pane-hardware" class="view-pane hidden"></section>
-        <section id="pane-reimbursable" class="view-pane hidden"></section>
-        <section id="pane-all" class="view-pane hidden"></section>
-        <section id="pane-csv" class="view-pane hidden"></section>
-        <section id="pane-inbox" class="view-pane hidden"></section>
+        <div id="editorial-hero" class="editorial-hero"></div>
 
-        <section id="pane-backup" class="view-pane hidden">
-          <header class="page-head">
-            <div class="page-head-copy">
-              <h1 class="page-title">备份与导出</h1>
-              <div class="page-meta">导出的文件脱离 SubVault 也能直接打开和核验，没有任何锁定</div>
-            </div>
-          </header>
+        <div id="collection-bar" class="collection-bar hidden">
+          <div class="collection-pills" id="collection-pills">
+            <button type="button" class="cpill active" data-collection="all">全部 <span class="cp-n" id="cnt-all">0</span></button>
+            <button type="button" class="cpill" data-collection="subscription">订阅 <span class="cp-n" id="cnt-sub"></span></button>
+            <button type="button" class="cpill" data-collection="license">买断与密钥 <span class="cp-n" id="cnt-lic"></span></button>
+            <button type="button" class="cpill" data-collection="hardware">硬件保修 <span class="cp-n" id="cnt-hw"></span></button>
+            <button type="button" class="cpill" data-collection="reimbursable">报销 <span class="cp-n" id="cnt-reimb"></span></button>
+            <button type="button" class="cpill" data-collection="csv">CSV 流水 <span class="cp-n" id="cnt-csv"></span></button>
+          </div>
 
-          <div class="bk-hero">
-            <div class="bk-emblem">
-              <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/><path d="m9 12 2 2 4-4"/></svg>
+          <div class="collection-tools">
+            <div id="active-filter-chips" class="inline-chips"></div>
+            <div class="search-capsule">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+              <input id="search-box" type="search" placeholder="搜索商家、型号、备注…">
             </div>
-            <div class="bk-copy">
-              <div id="bk-status-title" class="bk-title">原件全部完整</div>
-              <div id="bk-status-sub" class="bk-sub">还没有在这台电脑下载过完整备份</div>
-              <label id="zip-ack-row" class="check-row hidden">
-                <input id="chk-zip-ack" type="checkbox">
-                <span>我知道导出的是未加密文件，会妥善保管</span>
+            <select id="filter-account" class="ghost-select" title="按账号筛选">
+              <option value="">所有账号</option>
+            </select>
+            <select id="sort-order" class="ghost-select" title="排序方式">
+              <option value="recent">按录入时间</option>
+              <option value="amount_desc">金额从高到低</option>
+              <option value="date_desc">日期最近</option>
+            </select>
+            <div class="view-toggle" role="group" aria-label="切换卡片或列表">
+              <button class="vt-btn active" data-view-mode="cards" type="button" title="卡片">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="7" height="7" x="3" y="3" rx="1.2"/><rect width="7" height="7" x="14" y="3" rx="1.2"/><rect width="7" height="7" x="14" y="14" rx="1.2"/><rect width="7" height="7" x="3" y="14" rx="1.2"/></svg>
+              </button>
+              <button class="vt-btn" data-view-mode="table" type="button" title="列表">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 卡片/列表区 -->
+        <div id="ledger-stage"></div>
+      </section>
+
+      <!-- 视图 B：日历 -->
+      <section id="pane-calendar" class="view-pane hidden"></section>
+
+      <!-- 视图 C：统计与试算 -->
+      <section id="pane-insights" class="view-pane hidden"></section>
+
+      <!-- 视图 D：待整理 -->
+      <section id="pane-triage" class="view-pane hidden"></section>
+
+      <section id="pane-security" class="view-pane hidden">
+        <div class="page-intro">
+          <h2>备份与核对</h2>
+          <p>随时导出原始文件和表格，脱离软件也能直接打开和核验。</p>
+        </div>
+
+        <div id="security-attention-wrap" class="sec-stack"></div>
+
+        <div class="sec-grid-2">
+          <div class="folio-card pad-24 stack-12">
+            <h3 class="folio-h3">导出 Excel 表格（.csv）</h3>
+            <p class="folio-p">可直接用 Excel 打开，包含分类、保修期、报销状态和原件校验码（不含明文密钥）。</p>
+            <div style="margin-top:auto">
+              <button id="btn-dl-excel" class="btn btn-ink btn-sm" type="button">下载表格 (.csv)</button>
+            </div>
+          </div>
+
+          <div class="folio-card pad-24 stack-12">
+            <h3 class="folio-h3">下载完整备份包（.zip）</h3>
+            <p class="folio-p">打包全部账单原件、明细表格和校验清单。</p>
+            <label id="zip-ack-row" class="check-row hidden">
+              <input id="chk-zip-ack" type="checkbox">
+              <span>我知道导出的是未加密文件，会妥善保管</span>
+            </label>
+            <div style="margin-top:auto">
+              <button id="btn-dl-zip" class="btn btn-ink btn-sm" type="button">下载备份包 (.zip)</button>
+            </div>
+          </div>
+
+          <div class="folio-card pad-24 stack-12">
+            <h3 class="folio-h3">导出到本地文件夹</h3>
+            <p class="folio-p">写入指定文件夹后，自动逐文件核对完整性。</p>
+            <label class="field">
+              <span>目标文件夹（不能选在当前账本内部）</span>
+              <div class="input-row">
+                <input id="export-dir-path" type="text" placeholder="例如 C:\Users\你\Documents\SubVault-备份">
+                <button type="button" class="btn btn-soft btn-sm" data-pick-target="export-dir-path" data-pick-title="选择备份包保存位置" data-pick-suffix="SubVault-备份包">浏览</button>
+              </div>
+            </label>
+            <label id="dir-ack-row" class="check-row hidden">
+              <input id="chk-dir-ack" type="checkbox">
+              <span>我知道导出的是未加密文件</span>
+            </label>
+            <div><button id="btn-export-dir" class="btn btn-soft btn-sm" type="button">导出并校验</button></div>
+            <div id="export-dir-result" class="inline-banner hidden"></div>
+          </div>
+
+          <div class="folio-card pad-24 stack-12">
+            <h3 class="folio-h3">校验已有备份包</h3>
+            <p class="folio-p">选择以前导出的备份目录，检查原件是否完整。</p>
+            <label class="field">
+              <span>备份目录路径</span>
+              <div class="input-row">
+                <input id="verify-dir-path" type="text" placeholder="选择包含 manifest.json 的目录">
+                <button type="button" class="btn btn-soft btn-sm" data-pick-target="verify-dir-path" data-pick-title="选择要校验的备份包目录">浏览</button>
+              </div>
+            </label>
+            <div><button id="btn-verify-dir" class="btn btn-soft btn-sm" type="button">开始校验</button></div>
+            <div id="verify-dir-result" class="inline-banner hidden"></div>
+          </div>
+        </div>
+
+        <div id="card-security-rotate" class="folio-card pad-24 stack-14 hidden" style="margin-top:16px">
+          <div>
+            <h3 class="folio-h3">修改账本主密码</h3>
+            <p class="folio-p">直接更换密码，不需要重新导入文件。</p>
+          </div>
+          <form id="form-rotate-pass" class="stack-12">
+            <div class="grid-2">
+              <label class="field">
+                <span>新主密码（至少 6 位）</span>
+                <input id="rotate-new-pass" type="password" required placeholder="输入新密码">
+              </label>
+              <label class="field">
+                <span>确认新主密码</span>
+                <input id="rotate-new-pass-confirm" type="password" required placeholder="再次输入">
               </label>
             </div>
-            <button id="btn-dl-zip" class="btn btn-ink btn-lg" type="button">下载完整备份（.zip）</button>
-          </div>
-          <p class="bk-note">备份包里有全部账单原件、明细表格（records.json / facts.csv）和逐文件 SHA-256 校验清单。</p>
-
-          <div class="bk-section-title">更多方式</div>
-          <div class="bk-list">
-            <div class="bk-row">
-              <div class="bk-row-copy">
-                <strong>导出 Excel 表格（.csv）</strong>
-                <span>可直接用 Excel 打开，包含分类、保修期、报销状态和原件校验码（不含明文密钥）</span>
-              </div>
-              <button id="btn-dl-excel" class="btn btn-soft btn-sm" type="button">下载表格</button>
-            </div>
-
-            <details class="bk-row bk-expand">
-              <summary>
-                <span class="bk-row-copy">
-                  <strong>导出到本地文件夹</strong>
-                  <span>写入指定文件夹后，自动逐文件核对完整性</span>
-                </span>
-                <span class="bk-chev">›</span>
-              </summary>
-              <div class="bk-form">
-                <label class="field">
-                  <span>目标文件夹（不能选在当前账本内部）</span>
-                  <div class="input-row">
-                    <input id="export-dir-path" type="text" placeholder="例如 C:\Users\你\Documents\SubVault-备份">
-                    <button type="button" class="btn btn-soft btn-sm" data-pick-target="export-dir-path" data-pick-title="选择备份包保存位置" data-pick-suffix="SubVault-备份包">浏览</button>
-                  </div>
-                </label>
-                <label id="dir-ack-row" class="check-row hidden">
-                  <input id="chk-dir-ack" type="checkbox">
-                  <span>我知道导出的是未加密文件</span>
-                </label>
-                <div><button id="btn-export-dir" class="btn btn-soft btn-sm" type="button">导出并校验</button></div>
-                <div id="export-dir-result" class="inline-banner hidden"></div>
-              </div>
-            </details>
-
-            <details class="bk-row bk-expand">
-              <summary>
-                <span class="bk-row-copy">
-                  <strong>校验已有备份包</strong>
-                  <span>选择以前导出的备份目录，检查原件有没有缺失或被改动</span>
-                </span>
-                <span class="bk-chev">›</span>
-              </summary>
-              <div class="bk-form">
-                <label class="field">
-                  <span>备份目录路径</span>
-                  <div class="input-row">
-                    <input id="verify-dir-path" type="text" placeholder="选择包含 manifest.json 的目录">
-                    <button type="button" class="btn btn-soft btn-sm" data-pick-target="verify-dir-path" data-pick-title="选择要校验的备份包目录">浏览</button>
-                  </div>
-                </label>
-                <div><button id="btn-verify-dir" class="btn btn-soft btn-sm" type="button">开始校验</button></div>
-                <div id="verify-dir-result" class="inline-banner hidden"></div>
-              </div>
-            </details>
-
-            <details id="card-security-rotate" class="bk-row bk-expand hidden">
-              <summary>
-                <span class="bk-row-copy">
-                  <strong>修改账本主密码</strong>
-                  <span>直接更换密码，不需要重新导入文件</span>
-                </span>
-                <span class="bk-chev">›</span>
-              </summary>
-              <form id="form-rotate-pass" class="bk-form">
-                <div class="grid-2">
-                  <label class="field">
-                    <span>新主密码（至少 6 位）</span>
-                    <input id="rotate-new-pass" type="password" required placeholder="输入新密码">
-                  </label>
-                  <label class="field">
-                    <span>确认新主密码</span>
-                    <input id="rotate-new-pass-confirm" type="password" required placeholder="再次输入">
-                  </label>
-                </div>
-                <label class="check-row">
-                  <input id="chk-rotate-recovery" type="checkbox">
-                  <span>同步生成新的离线恢复密钥（旧恢复密钥立即作废）</span>
-                </label>
-                <div><button class="btn btn-soft btn-sm" type="submit">更新主密码</button></div>
-              </form>
-            </details>
-          </div>
-        </section>
-      </div>
+            <label class="check-row">
+              <input id="chk-rotate-recovery" type="checkbox">
+              <span>同步生成新的离线恢复密钥（旧恢复密钥立即作废）</span>
+            </label>
+            <div><button class="btn btn-soft btn-sm" type="submit">更新主密码</button></div>
+          </form>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -569,10 +553,17 @@
           </label>
         </div>
 
+        <div class="chip-strip">
+          <span class="chip-strip-lbl">账号</span>
+          <button type="button" class="tap-chip active" data-man-acc="个人">个人</button>
+          <button type="button" class="tap-chip" data-man-acc="公司工作">公司工作</button>
+          <button type="button" class="tap-chip" data-man-acc="家庭共享">家庭共享</button>
+        </div>
+
         <div class="grid-2">
           <label class="field">
             <span>归属账号</span>
-            <input id="man-account" type="text" list="account-presets" value="个人" placeholder="个人 / 公司工作 / 邮箱">
+            <input id="man-account" type="text" value="个人" placeholder="个人 / 公司工作 / 邮箱">
           </label>
           <label class="field">
             <span>分类</span>
