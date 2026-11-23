@@ -20,7 +20,6 @@
     shield: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10"/><path d="m9 12 2 2 4-4"/></svg>`,
     receipt: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/><path d="M8 8h8M8 12h6"/></svg>`,
     key: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg>`,
-    inbox: `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>`,
     sparkle: `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/></svg>`,
     plus: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>`,
     calendar: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>`,
@@ -102,14 +101,6 @@
     return state.theme === "night" ? DARK_CHART_PALETTE : LIGHT_CHART_PALETTE;
   }
 
-  const KIND_COLORS = {
-    hardware: "var(--iris)",
-    subscription: "var(--blue)",
-    license: "var(--green)",
-    reimbursable: "var(--amber)",
-    general: "var(--ink-3)",
-  };
-
   const BRAND_PRESETS = {
     openai: { bg: "#10a37f", mark: "AI" },
     anthropic: { bg: "#b85d3b", mark: "CL" },
@@ -161,6 +152,19 @@
     reimbursed: { label: "已到账", next: "pending", cls: "reimbursed" },
   };
 
+  const UNGROUPED_ACCOUNT = "__ungrouped__";
+
+  const VERIFY_REASON_LABELS = {
+    length_mismatch: "文件长度与校验清单不符（可能已被修改）",
+    hash_mismatch: "文件 SHA-256 校验码不匹配（内容已被篡改）",
+    missing_file: "缺少校验清单中记录的文件",
+    extra_file: "目录中存在未登记的多余文件",
+    manifest_missing: "目录中缺少 manifest.json 清单文件",
+    manifest_invalid: "manifest.json 格式损坏或无法解析",
+    snapshot_id_mismatch: "records.json 快照指纹与清单不一致",
+    facts_csv_mismatch: "facts.csv 内容与 records.json 不一致",
+  };
+
   const state = {
     bootstrap: null,
     workspace: null,
@@ -171,8 +175,6 @@
     activeNav: "assets",
     collection: "all",
     viewMode: "cards",
-    heroCurrency: "",
-    reimburseFilter: "",
     accountFilter: "",
     currencyFilter: "",
     categoryFilter: "",
@@ -320,7 +322,17 @@
   }
 
   const activeBlobUrls = new Set();
-  function trackBlobUrl(url) {
+  const containerBlobUrls = new WeakMap();
+  const previewLoadSeqs = new WeakMap();
+  function trackBlobUrl(url, container) {
+    if (container) {
+      const prev = containerBlobUrls.get(container);
+      if (prev) {
+        try { URL.revokeObjectURL(prev); } catch (_) {}
+        activeBlobUrls.delete(prev);
+      }
+      containerBlobUrls.set(container, url);
+    }
     activeBlobUrls.add(url);
     return url;
   }
@@ -370,10 +382,10 @@
     }
   }
 
-  let previewLoadSeq = 0;
   async function loadAuthedPreviewInto(container, item) {
     if (!container || !item) return;
-    const seq = ++previewLoadSeq;
+    const seq = (previewLoadSeqs.get(container) || 0) + 1;
+    previewLoadSeqs.set(container, seq);
     const baseMime = (item.media_type || "").split(";")[0].trim().toLowerCase();
     const isPdf = baseMime === "application/pdf";
     const isImg = ["image/png", "image/jpeg", "image/webp"].includes(baseMime);
@@ -382,7 +394,7 @@
     container.innerHTML = `<div class="preview-loading" style="padding:24px;text-align:center;color:var(--ink-3);font-size:13px">原件加载中…</div>`;
     try {
       const { blob } = await fetchAuthedBlob(`/api/sources/${encodeURIComponent(item.source_id)}/raw`);
-      if (seq !== previewLoadSeq) return;
+      if (previewLoadSeqs.get(container) !== seq) return;
       if (isHtml) {
         const buf = new Uint8Array(await blob.arrayBuffer());
         let htmlText;
@@ -397,7 +409,7 @@
             try { htmlText = new TextDecoder("gb18030").decode(buf); } catch (__) { htmlText = new TextDecoder("utf-8").decode(buf); }
           }
         }
-        if (seq !== previewLoadSeq) return;
+        if (previewLoadSeqs.get(container) !== seq) return;
         const iframe = document.createElement("iframe");
         iframe.setAttribute("sandbox", "");
         iframe.title = "静态 HTML 原件";
@@ -406,14 +418,14 @@
         container.appendChild(iframe);
       } else if (isPdf) {
         const pdfBlob = blob.type === "application/pdf" ? blob : new Blob([blob], { type: "application/pdf" });
-        const url = trackBlobUrl(URL.createObjectURL(pdfBlob));
+        const url = trackBlobUrl(URL.createObjectURL(pdfBlob), container);
         const iframe = document.createElement("iframe");
         iframe.src = `${url}#navpanes=0&view=FitH`;
         iframe.title = "PDF 原件";
         container.innerHTML = "";
         container.appendChild(iframe);
       } else if (isImg) {
-        const url = trackBlobUrl(URL.createObjectURL(blob));
+        const url = trackBlobUrl(URL.createObjectURL(blob), container);
         const img = document.createElement("img");
         img.src = url;
         img.alt = item.display_name || "原件截图";
@@ -421,7 +433,7 @@
         container.appendChild(img);
       }
     } catch (err) {
-      if (seq !== previewLoadSeq) return;
+      if (previewLoadSeqs.get(container) !== seq) return;
       container.innerHTML = `<div class="preview-loading" style="padding:24px;text-align:center;color:var(--ink-3);font-size:13px">原件预览失败：${esc(err.message)}</div>`;
     }
   }
@@ -665,7 +677,7 @@
   function launchConfetti(opts = {}) {
     const w = window.innerWidth;
     const palette = getChartPalette();
-    const symbol = opts.symbol || coinSymbol(state.heroCurrency || "CNY");
+    const symbol = opts.symbol || coinSymbol(recurringTotals(state.groups)[0]?.[0] || "CNY");
     const list = Array.from({ length: opts.count || 110 }, (_, i) => {
       const roll = Math.random();
       const shape = opts.coins ? "coin" : roll < 0.14 ? "coin" : roll < 0.26 ? "receipt" : roll < 0.42 ? "dot" : "ribbon";
@@ -792,7 +804,7 @@
   }
 
   const STAGGER_SELECTORS = [
-    ".object-gallery > .obj-card", ".filing-strip", ".clean-table tbody tr", ".signal-tile", ".agenda-row",
+    ".object-gallery > .obj-card", ".ticket", ".filing-strip", ".clean-table tbody tr", ".signal-tile", ".agenda-row",
     ".vendor-tile", ".sim-row", ".bar-col", ".legend-row", ".attn-row", ".csv-ws-card",
   ];
   function assignStagger(root) {
@@ -965,16 +977,15 @@
 
   function funFactsForAll(totals) {
     if (!totals || !totals.length) return ["还没有周期订阅，钱包表示很安心"];
-    const dailyParts = totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(Math.max(1, Math.round((c * 12) / 365)))));
-    const yearlyParts = totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(c * 12)));
+    const dailyParts = totals.map(([cur, , y]) => formatMoneyShort(cur, centsToText(Math.max(1, Math.round(y / 365)))));
+    const yearlyParts = totals.map(([cur, , y]) => formatMoneyShort(cur, centsToText(y)));
     const facts = [`按周期折算，每天约 ${dailyParts.join(" + ")}`];
-    totals.forEach(([cur, monthlyCents]) => {
+    totals.forEach(([cur, monthlyCents, yearlyCents]) => {
       if (!monthlyCents || monthlyCents <= 0) return;
-      const yearly = monthlyCents * 12;
       const curLabel = totals.length > 1 ? (CURRENCY_NAMES[cur] || cur) : "";
       (FUN_EQUIV[cur] || []).slice(0, totals.length > 1 ? 2 : 4).forEach((eq, i) => {
         const monthlyView = i % 2 === 0;
-        const n = (monthlyView ? monthlyCents : yearly) / eq.cents;
+        const n = (monthlyView ? monthlyCents : yearlyCents) / eq.cents;
         const nTxt = n >= 10 ? String(Math.round(n)) : n.toFixed(1).replace(/\.0$/, "");
         facts.push(`${monthlyView ? "每月" : "一年"}${curLabel}订阅 ≈ ${nTxt} ${eq.unit}`);
       });
@@ -1261,8 +1272,6 @@
     state.groups = [];
     state.activeNav = "assets";
     state.collection = "all";
-    state.heroCurrency = "";
-    state.reimburseFilter = "";
     state.accountFilter = "";
     state.currencyFilter = "";
     state.categoryFilter = "";
@@ -1294,6 +1303,7 @@
     $("screen-lobby").classList.remove("hidden");
     $("screen-workspace").classList.add("hidden");
     closeDrawer();
+    window.scrollTo(0, 0);
   }
 
   function showWorkspaceScreen() {
@@ -1301,6 +1311,7 @@
     $("screen-lobby").classList.add("hidden");
     $("screen-workspace").classList.remove("hidden");
     renderWorkspace();
+    window.scrollTo(0, 0);
     requestAnimationFrame(() => moveDockGlider(true));
   }
 
@@ -1327,7 +1338,10 @@
     ["assets", "calendar", "insights", "triage", "security"].forEach((name) => {
       $(`pane-${name}`).classList.toggle("hidden", name !== navKey);
     });
-    if (navChanged && motionOK()) pulseClass($(`pane-${navKey}`), "pane-enter", 420);
+    if (navChanged) {
+      window.scrollTo(0, 0);
+      if (motionOK()) pulseClass($(`pane-${navKey}`), "pane-enter", 420);
+    }
     if (navKey === "security") markScene("security");
 
     if (state.workspace) {
@@ -1339,6 +1353,21 @@
     }
   }
 
+  function getSecurityAttentionBuckets(ws) {
+    const items = ws.items || [];
+    const needs = items.filter((i) => i.status_flags.needs_manual_entry || i.status_flags.has_conflict || i.status_flags.is_credit_or_order_warning);
+    const dups = items.filter((i) => i.status_flags.has_duplicate);
+    return { needs, dups };
+  }
+
+  function syncTriageBadge(ws) {
+    const triageCount = getTriageQueue(ws).length;
+    const triEl = $("cnt-triage");
+    triEl.textContent = String(triageCount);
+    triEl.classList.toggle("hidden", triageCount === 0);
+    moveDockGlider();
+  }
+
   // --- Workspace Rendering ---
   function renderWorkspace() {
     const ws = state.workspace;
@@ -1347,8 +1376,8 @@
     const ac = ws.asset_counts || {};
     state.groups = buildAssetGroups(ws);
     const subGroupCount = state.groups.filter((g) => g.kind === "subscription").length;
-    const triageCount = getTriageQueue(ws).length;
-    const attnCount = (v.duplicate_count || 0) + (v.conflict_count || 0) + (v.needs_entry_count || 0);
+    const { needs, dups } = getSecurityAttentionBuckets(ws);
+    const attnCount = needs.length + dups.length;
 
     $("mh-vault-name").textContent = v.name || "我的账本";
     $("mh-vault-dot").className = `vp-dot ${v.encrypted ? "green" : "slate"}`;
@@ -1366,9 +1395,7 @@
     $("cnt-reimb").textContent = ac.reimbursable > 0 ? String(ac.reimbursable) : "";
     $("cnt-csv").textContent = v.csv_statement_count > 0 ? String(v.csv_statement_count) : "";
 
-    const triEl = $("cnt-triage");
-    triEl.textContent = String(triageCount);
-    triEl.classList.toggle("hidden", triageCount === 0);
+    syncTriageBadge(ws);
 
     const attnEl = $("cnt-attention");
     attnEl.textContent = String(attnCount);
@@ -1385,15 +1412,18 @@
 
   function syncAccountDropdown(ws) {
     const sel = $("filter-account");
+    const accounts = ws.accounts || [];
     sel.innerHTML = `<option value="">所有账号</option>` +
-      (ws.accounts || []).map((a) => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
-    sel.value = state.accountFilter;
-    // 只有一个（或没有）账号时，筛选毫无意义，直接隐藏
-    sel.classList.toggle("hidden", (ws.accounts || []).length <= 1 && !state.accountFilter);
+      accounts.map((a) => `<option value="${esc(a)}">${esc(a)}</option>`).join("");
+    const namedFilter = state.accountFilter && state.accountFilter !== UNGROUPED_ACCOUNT ? state.accountFilter : "";
+    sel.value = namedFilter;
+    // 只有一个（或没有）账号且未激活命名筛选时，筛选无意义，直接隐藏
+    sel.classList.toggle("hidden", accounts.length <= 1 && !namedFilter);
   }
 
   // --- Asset grouping: bills of the same subscription collapse into one card ---
   const RECURRING_MONTHLY = { monthly: 1, quarterly: 1 / 3, yearly: 1 / 12, weekly: 52 / 12 };
+  const RECURRING_YEARLY = { monthly: 12, quarterly: 4, yearly: 1, weekly: 52 };
 
   function itemDate(it) {
     return it.annotation?.bill_date || it.period_fact?.value?.period_start || "";
@@ -1468,6 +1498,7 @@
       g.cents = g.amount ? amountToCents(g.amount.amount_text) : 0;
       g.renewal = g.kind === "subscription" ? nextRenewalInfo(latest) : null;
       g.monthlyCents = g.kind === "subscription" && g.amount && RECURRING_MONTHLY[g.cycle] ? Math.round(g.cents * RECURRING_MONTHLY[g.cycle]) : 0;
+      g.yearlyCents = g.kind === "subscription" && g.amount && RECURRING_YEARLY[g.cycle] ? g.cents * RECURRING_YEARLY[g.cycle] : 0;
       return g;
     });
   }
@@ -1476,14 +1507,19 @@
     return (state.groups || []).find((g) => g.items.some((i) => i.source_id === sourceId)) || null;
   }
 
-  // 每月周期折算：每个独立订阅只取最新一张账单，按币种分开，不依本机时钟私自剔除
+  // 每月/每年周期折算：每个独立订阅只取最新一张账单，按币种分开，不依本机时钟私自剔除
   function recurringTotals(groups) {
     const out = {};
     (groups || []).forEach((g) => {
       if (!g.monthlyCents) return;
-      out[g.amount.currency] = (out[g.amount.currency] || 0) + g.monthlyCents;
+      const cur = g.amount.currency;
+      if (!out[cur]) out[cur] = { monthly: 0, yearly: 0 };
+      out[cur].monthly += g.monthlyCents;
+      out[cur].yearly += g.yearlyCents;
     });
-    return Object.entries(out).sort((a, b) => b[1] - a[1]);
+    return Object.entries(out)
+      .map(([cur, v]) => [cur, v.monthly, v.yearly])
+      .sort((a, b) => b[1] - a[1]);
   }
 
   function reimbStatusOf(it) {
@@ -1519,7 +1555,7 @@
       const brand = brandStyleFor(ann.vendor || it.display_name);
       const nextSt = REIMBURSE_META[st].next;
       return `
-        <article class="ticket" draggable="true" data-ticket-sid="${esc(it.source_id)}" data-source-id="${esc(it.source_id)}">
+        <article class="ticket" tabindex="0" role="button" draggable="true" data-ticket-sid="${esc(it.source_id)}" data-source-id="${esc(it.source_id)}">
           <div class="tk-top">
             <span class="brand-badge brand-badge-sm" style="background:${brand.bg}">${esc(brand.mark)}</span>
             <span class="tk-name"><strong>${esc(ann.vendor || it.display_name)}</strong><small>${esc(ann.plan_name || ann.category || "")}</small></span>
@@ -1592,12 +1628,14 @@
       if (state.collection === "hardware" && kind !== "hardware") return false;
       if (state.collection === "reimbursable") {
         if (kind !== "reimbursable" && (!ann.reimburse_status || ann.reimburse_status === "none")) return false;
-        const st = ann.reimburse_status && ann.reimburse_status !== "none" ? ann.reimburse_status : "pending";
-        if (state.reimburseFilter && st !== state.reimburseFilter) return false;
       }
       if (state.collection === "csv" && !flags.is_csv_statement) return false;
 
-      if (state.accountFilter && (ann.account_label || "") !== state.accountFilter) return false;
+      if (state.accountFilter === UNGROUPED_ACCOUNT) {
+        if ((ann.account_label || "").trim() !== "") return false;
+      } else if (state.accountFilter && (ann.account_label || "") !== state.accountFilter) {
+        return false;
+      }
       if (state.currencyFilter && (!amtVal || amtVal.currency !== state.currencyFilter)) return false;
       if (state.categoryFilter && (ann.category || "未分类") !== state.categoryFilter) return false;
 
@@ -1648,17 +1686,21 @@
     });
     const viewToggleEl = document.querySelector(".view-toggle");
     if (viewToggleEl) viewToggleEl.classList.toggle("hidden", state.collection === "csv");
+    syncAccountDropdown(ws);
 
     // Active filter chips
     const chips = [];
+    if (state.accountFilter === UNGROUPED_ACCOUNT) chips.push(`<span class="active-chip">账号：未分组 <button type="button" data-clear-f="account">×</button></span>`);
     if (state.categoryFilter) chips.push(`<span class="active-chip">分类：${esc(state.categoryFilter)} <button type="button" data-clear-f="category">×</button></span>`);
     if (state.currencyFilter) chips.push(`<span class="active-chip">币种：${esc(state.currencyFilter)} <button type="button" data-clear-f="currency">×</button></span>`);
     const chipBox = $("active-filter-chips");
     chipBox.innerHTML = chips.join("");
     chipBox.querySelectorAll("[data-clear-f]").forEach((b) => {
       b.addEventListener("click", () => {
-        if (b.getAttribute("data-clear-f") === "category") state.categoryFilter = "";
-        if (b.getAttribute("data-clear-f") === "currency") state.currencyFilter = "";
+        const k = b.getAttribute("data-clear-f");
+        if (k === "account") state.accountFilter = "";
+        if (k === "category") state.categoryFilter = "";
+        if (k === "currency") state.currencyFilter = "";
         renderAssetsPane(ws);
       });
     });
@@ -1715,7 +1757,6 @@
           state.accountFilter = "";
           state.currencyFilter = "";
           state.categoryFilter = "";
-          state.reimburseFilter = "";
           state.collection = "all";
           renderWorkspace();
         });
@@ -1804,7 +1845,6 @@
     }
 
     if (col === "reimbursable") {
-      state.reimburseFilter = "";
       const pend = {};
       const done = {};
       let pendN = 0;
@@ -1837,7 +1877,7 @@
       const subGroups = (state.groups || []).filter((g) => g.kind === "subscription");
       const totals = recurringTotals(subGroups);
       const monthStr = totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(c))).join(" + ") || "—";
-      const yearStr = totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(c * 12))).join(" + ") || "—";
+      const yearStr = totals.map(([cur, , y]) => formatMoneyShort(cur, centsToText(y))).join(" + ") || "—";
       hero.innerHTML = `
         <div class="context-strip">
           <div class="ctx-title-group">
@@ -1967,7 +2007,7 @@
           </div>`).join("")
       : `<div class="hero-fig"><div class="hero-big-num" style="color:var(--ink-3)">—</div><div class="hero-fig-cap">还没有周期订阅</div></div>`;
     const yearLine = totals.length
-      ? `按标注周期折算，一年约 <strong class="sensitive">${esc(totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(c * 12))).join(" + "))}</strong>`
+      ? `按标注周期折算，一年约 <strong class="sensitive">${esc(totals.map(([cur, , y]) => formatMoneyShort(cur, centsToText(y))).join(" + "))}</strong>`
       : "记一笔周期订阅后，这里会显示按周期折算的月度参考";
     const recordedLine = recorded.length
       ? `已录金额 ${billCount} 笔（共 ${items.length} 份文件），账本已记录 <span class="sensitive">${esc(recorded.map((c) => formatMoneyShort(c.currency, c.total_recorded)).join(" + "))}</span>`
@@ -2221,6 +2261,11 @@
       const g = it.annotation?.asset_kind === "subscription" ? groupOfItem(it.source_id) : null;
       return g ? g.latest : it;
     }).filter((it) => (seen.has(it.source_id) ? false : seen.add(it.source_id)));
+    if (state.sortOrder === "amount_desc") {
+      list.sort((a, b) => amountToCents(b.amount_fact?.value?.amount_text) - amountToCents(a.amount_fact?.value?.amount_text));
+    } else if (state.sortOrder === "date_desc") {
+      list.sort((a, b) => itemDate(b).localeCompare(itemDate(a)));
+    }
     let mainItems = list;
     let secondaryItems = [];
     let secondaryLabel = "";
@@ -2259,6 +2304,22 @@
 
     stage.innerHTML = `${primaryHtml}${secondaryHtml}`;
     bindStageActions(stage);
+  }
+
+  function findExistingCsvItem(r, allVaultItems) {
+    const rDate = String(r.date || "").slice(0, 10);
+    const rMerch = String(r.merchant || "").trim().toLowerCase();
+    const rAmt = String(r.amount_text || "").trim();
+    const rCur = String(r.currency || "CNY").trim();
+    return (allVaultItems || []).find((it) => {
+      if (it.status_flags?.is_csv_statement) return false;
+      const a = it.annotation || {};
+      const v = it.amount_fact?.value;
+      if (!v || v.currency !== rCur || v.amount_text !== rAmt) return false;
+      const sameVendor = (a.vendor || "").trim().toLowerCase() === rMerch;
+      const sameDate = rDate && (a.bill_date || "").slice(0, 10) === rDate;
+      return sameVendor && sameDate;
+    });
   }
 
   function renderCsvWorkspace(list, stage) {
@@ -2314,21 +2375,6 @@
     stage.innerHTML = `<div class="csv-workspace-stack">${cardsHtml}</div>`;
 
     const allVaultItems = state.workspace?.items || [];
-    const findExistingCsvItem = (r) => {
-      const rDate = String(r.date || "").slice(0, 10);
-      const rMerch = String(r.merchant || "").trim().toLowerCase();
-      const rAmt = String(r.amount_text || "").trim();
-      const rCur = String(r.currency || "CNY").trim();
-      return allVaultItems.find((it) => {
-        if (it.status_flags?.is_csv_statement) return false;
-        const a = it.annotation || {};
-        const v = it.amount_fact?.value;
-        if (!v || v.currency !== rCur || v.amount_text !== rAmt) return false;
-        const sameVendor = (a.vendor || "").trim().toLowerCase() === rMerch;
-        const sameDate = rDate && (a.bill_date || "").slice(0, 10) === rDate;
-        return sameVendor && sameDate;
-      });
-    };
 
     list.forEach((item, cIdx) => {
       const allRows = (item.candidates || [])
@@ -2378,7 +2424,7 @@
           return;
         }
         tbody.innerHTML = filtered.slice(0, uiState.limit).map((r, rIdx) => {
-          const existing = findExistingCsvItem(r);
+          const existing = findExistingCsvItem(r, allVaultItems);
           const isNonExpense = ["income", "refund", "neutral"].includes(r.direction);
           const dirLabel = { income: "收入", refund: "退款", neutral: "中性交易" }[r.direction] || "";
           const actBtn = existing
@@ -2495,10 +2541,11 @@
       `;
     }).join("");
 
+    const nameColTitle = state.collection === "subscription" ? `名称（共 ${list.length} 张账单）` : "名称";
     stage.innerHTML = `
       <div class="table-sheet">
         <table class="clean-table">
-          <thead><tr><th>名称</th><th>类型</th><th>周期</th><th class="right">金额</th><th>日期 / 保修</th><th class="right">操作</th></tr></thead>
+          <thead><tr><th>${nameColTitle}</th><th>类型</th><th>周期</th><th class="right">金额</th><th>日期 / 保修</th><th class="right">操作</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
@@ -2565,7 +2612,7 @@
     for (const item of ws.items || []) {
       const ann = item.annotation || {};
       const amtVal = item.amount_fact?.value;
-      if (!amtVal?.amount_text || !["monthly", "quarterly", "yearly", "weekly"].includes(ann.billing_cycle)) continue;
+      if (ann.asset_kind !== "subscription" || !amtVal?.amount_text || !["monthly", "quarterly", "yearly", "weekly"].includes(ann.billing_cycle)) continue;
       const key = subscriptionIdentityKey(item);
       const dStr = ann.bill_date || item.period_fact?.value?.period_start || "";
       if (dStr && /^\d{4}-\d{2}-\d{2}$/.test(dStr)) {
@@ -2897,7 +2944,7 @@
     for (const it of ws.items || []) {
       const ann = it.annotation || {};
       const amt = it.amount_fact?.value;
-      if (!amt || amt.currency !== cur || !["monthly", "yearly", "quarterly", "weekly"].includes(ann.billing_cycle)) continue;
+      if (ann.asset_kind !== "subscription" || !amt || amt.currency !== cur || !["monthly", "yearly", "quarterly", "weekly"].includes(ann.billing_cycle)) continue;
       const key = subscriptionIdentityKey(it);
       const dStr = ann.bill_date || it.period_fact?.value?.period_start || "";
       const prev = latestSubMap.get(key);
@@ -3016,8 +3063,8 @@
     pane.querySelectorAll("[data-jump-acc]").forEach((r) => {
       const jump = () => {
         const a = r.getAttribute("data-jump-acc");
-        state.accountFilter = a === "未分组" ? "" : a;
-        if ($("filter-account")) $("filter-account").value = state.accountFilter;
+        state.accountFilter = a === "未分组" ? UNGROUPED_ACCOUNT : a;
+        syncAccountDropdown(ws);
         navigateTo("assets", "all");
       };
       r.addEventListener("click", jump);
@@ -3070,7 +3117,7 @@
           </div>
         </div>
       `;
-      if ($("btn-reset-skip")) $("btn-reset-skip").addEventListener("click", () => { state.triageSkippedIds.clear(); renderTriagePane(ws); });
+      if ($("btn-reset-skip")) $("btn-reset-skip").addEventListener("click", () => { state.triageSkippedIds.clear(); syncTriageBadge(ws); renderTriagePane(ws); });
       if ($("btn-back-assets")) $("btn-back-assets").addEventListener("click", () => navigateTo("assets", "all"));
       return;
     }
@@ -3084,7 +3131,7 @@
       ? `<div class="preview-loading" style="padding:24px;text-align:center;color:var(--ink-3);font-size:13px">原件加载中…</div>`
       : `<pre id="triage-text-preview" class="code-sheet" style="margin:0">加载中…</pre>`;
 
-    const defaultCur = state.heroCurrency || "CNY";
+    const defaultCur = "CNY";
     const curs = (state.bootstrap?.currencies || ["CNY", "USD", "EUR", "GBP", "JPY", "HKD"])
       .map((c) => `<option value="${esc(c)}" ${c === defaultCur ? "selected" : ""}>${esc(c)} ${esc(CURRENCY_SYMBOLS[c] || "")}</option>`).join("");
     const initialCycle = (ann.billing_cycle && ann.billing_cycle !== "unknown") ? ann.billing_cycle : "monthly";
@@ -3161,7 +3208,7 @@
       $("tr-category").value = b.getAttribute("data-tr-cat");
       pane.querySelectorAll("[data-tr-cat]").forEach((x) => x.classList.toggle("active", x === b));
     }));
-    $("btn-triage-skip").addEventListener("click", () => { state.triageSkippedIds.add(item.source_id); renderTriagePane(ws); });
+    $("btn-triage-skip").addEventListener("click", () => { state.triageSkippedIds.add(item.source_id); syncTriageBadge(ws); renderTriagePane(ws); });
     $("form-triage").addEventListener("submit", async (e) => {
       e.preventDefault();
       const btn = $("btn-triage-save");
@@ -3186,8 +3233,7 @@
   function renderSecurityAttention(ws) {
     const wrap = $("security-attention-wrap");
     const items = ws.items || [];
-    const needs = items.filter((i) => i.status_flags.needs_manual_entry || i.status_flags.has_conflict || i.status_flags.is_credit_or_order_warning);
-    const dups = items.filter((i) => i.status_flags.has_duplicate);
+    const { needs, dups } = getSecurityAttentionBuckets(ws);
 
     const needsHtml = !needs.length ? `<p class="folio-p">目前没有待补充或金额有歧义的文件。</p>` : `<div class="stack-8">${needs.map((it) => `
       <div class="attn-row">
@@ -3259,8 +3305,11 @@
 
     const isCsv = item.status_flags && item.status_flags.is_csv_statement;
     $("dtab-csv-btn").classList.toggle("hidden", !isCsv);
+    $("csv-rows-container").dataset.csvLimit = "100";
+    const initialTab = defaultTab || (isCsv ? "csv" : item.status_flags?.needs_manual_entry ? "edit" : "summary");
+    state.activeDrawerTab = initialTab;
     renderDrawer(item);
-    switchDrawerTab(defaultTab || (isCsv ? "csv" : item.status_flags?.needs_manual_entry ? "edit" : "summary"));
+    switchDrawerTab(initialTab);
     requestAnimationFrame(() => $("btn-close-drawer")?.focus());
   }
 
@@ -3293,7 +3342,18 @@
     state.activeDrawerTab = tab;
     document.querySelectorAll(".dtab").forEach((b) => b.classList.toggle("active", b.getAttribute("data-dtab") === tab));
     ["summary", "edit", "evidence", "csv", "history", "redact"].forEach((n) => $(`dpane-${n}`).classList.toggle("hidden", n !== tab));
-    if (tab === "evidence" && state.selectedSourceId) loadEvidencePreview(state.selectedSourceId);
+    if (tab === "evidence" && state.selectedSourceId) {
+      loadEvidencePreview(state.selectedSourceId);
+    } else if (tab === "summary" && state.selectedSourceId) {
+      const box = $("dpane-summary");
+      if (box.dataset.previewLoadedSid !== state.selectedSourceId) {
+        const item = (state.workspace?.items || []).find((i) => i.source_id === state.selectedSourceId);
+        if (item) {
+          box.dataset.previewLoadedSid = item.source_id;
+          loadAuthedPreviewInto(box.querySelector("[data-ds-preview]"), item);
+        }
+      }
+    }
   }
 
   // 详情“先读后改”：大号金额、关键信息、原件与校验结果、同一订阅的历史账单
@@ -3391,7 +3451,9 @@
       if (plate) scrambleText(plate, maskLicenseKey(ann.license_key), 620);
       copyLicenseKey(ann.vendor || item.display_name, ann.license_key, keyBtn);
     });
-    if (hasRichPreview) {
+    box.dataset.previewLoadedSid = "";
+    if (hasRichPreview && state.activeDrawerTab === "summary") {
+      box.dataset.previewLoadedSid = item.source_id;
       loadAuthedPreviewInto(box.querySelector("[data-ds-preview]"), item);
     }
     const textBox = box.querySelector("[data-ds-text]");
@@ -3509,6 +3571,7 @@
       state.textViewActive = true;
     }
     textBox.classList.toggle("hidden", !state.textViewActive);
+    $("btn-toggle-text-view").textContent = state.textViewActive ? "收起纯文本" : "查看纯文本";
     textBox.textContent = "加载中…";
     try {
       const res = await api("GET", `/api/sources/${encodeURIComponent(sourceId)}/text`);
@@ -3537,12 +3600,16 @@
     const moreHtml = rows.length > limit
       ? `<div style="text-align:center;padding-top:8px"><button type="button" class="btn btn-soft btn-sm" id="btn-drawer-csv-more">加载更多（剩余 ${rows.length - limit} 条）</button></div>`
       : "";
+    const allVaultItems = state.workspace?.items || [];
     box.innerHTML = visible.map((r, idx) => {
+      const existing = findExistingCsvItem(r, allVaultItems);
       const isNonExpense = ["income", "refund", "neutral"].includes(r.direction);
       const dirLabel = { income: "收入", refund: "退款", neutral: "中性交易" }[r.direction] || "";
-      const actHtml = isNonExpense
-        ? `<span class="micro-pill slate">${esc(dirLabel)} · 不计支出</span>`
-        : `<button type="button" class="btn btn-soft btn-sm" data-csv-promote="${idx}">加入账本</button>`;
+      const actHtml = existing
+        ? `<button type="button" class="csv-added-btn" data-csv-open-existing="${esc(existing.source_id)}">${ICO.check} 已在账本</button>`
+        : isNonExpense
+          ? `<span class="micro-pill slate">${esc(dirLabel)} · 不计支出</span>`
+          : `<button type="button" class="btn btn-soft btn-sm" data-csv-promote="${idx}">加入账本</button>`;
       return `
         <div class="csv-row">
           <div>
@@ -3553,6 +3620,12 @@
         </div>
       `;
     }).join("") + moreHtml;
+    box.querySelectorAll("[data-csv-open-existing]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const found = allVaultItems.find((i) => i.source_id === btn.getAttribute("data-csv-open-existing"));
+        if (found) openDrawer(found);
+      });
+    });
     const moreBtn = $("btn-drawer-csv-more");
     if (moreBtn) {
       moreBtn.addEventListener("click", () => {
@@ -3637,11 +3710,7 @@
 
   function renderCmdList(query) {
     const q = query.trim().toLowerCase();
-    const acts = [];
-    if ((state.workspace?.vault?.demo_count || 0) > 0) {
-      acts.push({ ico: ICO.trash, label: "清除示例数据", sub: "仅删除示例，保留真实账单", run: () => $("btn-clear-demo-pack").click() });
-    }
-    acts.push(
+    const acts = [
       { ico: ICO.plus, label: "记一笔", sub: "订阅、买断、硬件或报销", run: () => openManualModal() },
       { ico: ICO.download, label: "导入本地文件", sub: "PDF、HTML、CSV 或截图", run: () => $("file-picker-input").click() },
       { ico: ICO.key, label: "查看买断与密钥", sub: "查看和复制软件密钥", run: () => navigateTo("assets", "license") },
@@ -3653,6 +3722,11 @@
       { ico: ICO.download, label: "导出 Excel 表格 (.csv)", sub: "包含分类、保修与报销状态", run: () => downloadAuthedFile("/api/export/csv", "subvault-ledger.csv") },
       { ico: ICO.sun, label: "切换外观", sub: "浅色 / 暖白 / 深色", run: () => cycleTheme() },
       { ico: ICO.eye, label: "隐藏或显示金额", sub: "快捷键 P", run: () => togglePrivacy() },
+    ];
+    if ((state.workspace?.vault?.demo_count || 0) > 0) {
+      acts.push({ ico: ICO.trash, label: "清除示例数据", sub: "仅删除示例，保留真实账单", run: () => $("btn-clear-demo-pack").click() });
+    }
+    acts.push(
       { ico: ICO.lock, label: "锁定账本", sub: "返回解锁界面", run: () => $("btn-lock-vault").click() },
       { ico: ICO.party, label: "撒个花", sub: "没什么理由，就是想庆祝一下", egg: ["撒花", "庆祝", "party", "confetti", "🎉"], run: () => launchConfetti() },
       { ico: ICO.party, label: "下一场金币雨", sub: "看看钱都去哪儿了", egg: ["金币", "下雨", "coin", "money", "rain"], run: () => launchConfetti({ coins: true, count: 70 }) },
@@ -3713,7 +3787,7 @@
     document.querySelectorAll("[data-man-acc]").forEach((x) => x.classList.toggle("active", x.getAttribute("data-man-acc") === "个人"));
     $("man-license-key").value = ""; $("man-license-key").type = "password"; $("btn-man-toggle-key").textContent = "显示";
     $("man-license-scope").value = ""; $("man-warranty-end").value = ""; $("man-reimburse-status").value = "pending";
-    const defCur = state.heroCurrency || "CNY";
+    const defCur = "CNY";
     if ([...$("man-currency").options].some((o) => o.value === defCur)) $("man-currency").value = defCur;
     $("man-bill-date").value = (typeof prefillDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(prefillDate)) ? prefillDate : localTodayStr();
     setManualAssetKind("subscription");
@@ -3876,7 +3950,7 @@
         if (!$("modal-manual").classList.contains("hidden")) { closeManualModal(); return; }
         if (state.selectedSourceId) { closeDrawer(); return; }
       }
-      if (!inInput && !anyModalOpen && !state.selectedSourceId && !$("screen-workspace").classList.contains("hidden")) {
+      if (!inInput && !anyModalOpen && !state.selectedSourceId && !e.ctrlKey && !e.metaKey && !e.altKey && !$("screen-workspace").classList.contains("hidden")) {
         if (e.key === "/") { e.preventDefault(); navigateTo("assets"); $("search-box").focus(); }
         else if (e.key.toLowerCase() === "p") togglePrivacy();
       }
@@ -4032,7 +4106,6 @@
     document.querySelectorAll("[data-nav]").forEach((btn) => btn.addEventListener("click", () => navigateTo(btn.getAttribute("data-nav"))));
     document.querySelectorAll("[data-collection]").forEach((btn) => btn.addEventListener("click", () => {
       state.collection = btn.getAttribute("data-collection");
-      if (state.collection !== "reimbursable") state.reimburseFilter = "";
       if (state.workspace) renderAssetsPane(state.workspace);
     }));
 
@@ -4088,9 +4161,21 @@
     $("btn-close-drawer").addEventListener("click", closeDrawer);
     $("drawer-backdrop").addEventListener("click", closeDrawer);
     document.querySelectorAll(".dtab").forEach((b) => b.addEventListener("click", () => switchDrawerTab(b.getAttribute("data-dtab"))));
-    $("btn-toggle-text-view").addEventListener("click", () => { state.textViewActive = !state.textViewActive; $("evidence-text-box").classList.toggle("hidden", !state.textViewActive); });
-    $("csv-search").addEventListener("input", () => { const it = (state.workspace?.items || []).find((i) => i.source_id === state.selectedSourceId); if (it) renderCsvRows(it); });
-    $("chk-csv-expense-only").addEventListener("change", () => { const it = (state.workspace?.items || []).find((i) => i.source_id === state.selectedSourceId); if (it) renderCsvRows(it); });
+    $("btn-toggle-text-view").addEventListener("click", () => {
+      state.textViewActive = !state.textViewActive;
+      $("evidence-text-box").classList.toggle("hidden", !state.textViewActive);
+      $("btn-toggle-text-view").textContent = state.textViewActive ? "收起纯文本" : "查看纯文本";
+    });
+    $("csv-search").addEventListener("input", () => {
+      $("csv-rows-container").dataset.csvLimit = "100";
+      const it = (state.workspace?.items || []).find((i) => i.source_id === state.selectedSourceId);
+      if (it) renderCsvRows(it);
+    });
+    $("chk-csv-expense-only").addEventListener("change", () => {
+      $("csv-rows-container").dataset.csvLimit = "100";
+      const it = (state.workspace?.items || []).find((i) => i.source_id === state.selectedSourceId);
+      if (it) renderCsvRows(it);
+    });
     document.querySelectorAll("[data-ed-kind]").forEach((b) => b.addEventListener("click", () => setEditAssetKind(b.getAttribute("data-ed-kind"), true)));
     ["ed-bill-date", "ed-warranty-end", "ed-amount", "ed-currency"].forEach((id) => { $(id).addEventListener("input", updateEditHardwareMetrics); $(id).addEventListener("change", updateEditHardwareMetrics); });
     $("btn-ed-toggle-key").addEventListener("click", () => { const inp = $("ed-license-key"), show = inp.type === "password"; inp.type = show ? "text" : "password"; $("btn-ed-toggle-key").textContent = show ? "隐藏" : "显示"; });
@@ -4153,8 +4238,9 @@
       try {
         const res = await api("POST", "/api/export/package", { out_dir: outDir, acknowledge_plaintext: Boolean(ack) });
         const count = res.verification?.verified_files ?? "?";
+        const reasonText = VERIFY_REASON_LABELS[res.verification?.reason] || res.verification?.reason || "请检查目录";
         resBox.className = res.verified ? "inline-banner" : "inline-banner error";
-        resBox.textContent = res.verified ? `导出并校验通过：共核验 ${count} 个文件` : `已导出到 ${outDir}，但校验发现问题：${res.verification?.reason || "请检查目录"}`;
+        resBox.textContent = res.verified ? `导出并校验通过：共核验 ${count} 个文件` : `已导出到 ${outDir}，但校验发现问题：${reasonText}`;
         resBox.classList.remove("hidden"); $("verify-dir-path").value = outDir;
       } catch (err) { resBox.className = "inline-banner error"; resBox.textContent = err.message; resBox.classList.remove("hidden"); }
     });
@@ -4165,10 +4251,11 @@
         const res = await api("POST", "/api/verify-package", { package_dir: dir });
         const count = res.report?.verified_files ?? "?";
         const defectCount = Array.isArray(res.report?.defects) ? res.report.defects.length : 0;
+        const reasonText = VERIFY_REASON_LABELS[res.report?.reason] || res.report?.reason || "发现文件缺失或被修改";
         resBox.className = res.verified ? "inline-banner" : "inline-banner error";
         resBox.textContent = res.verified
           ? `校验通过：共 ${count} 个文件完整无篡改`
-          : `校验未通过：${res.report?.reason || "发现文件缺失或被修改"}${defectCount > 0 ? `（共 ${defectCount} 处异常）` : ""}`;
+          : `校验未通过：${reasonText}${defectCount > 0 ? `（共 ${defectCount} 处异常）` : ""}`;
         resBox.classList.remove("hidden");
       } catch (err) { resBox.className = "inline-banner error"; resBox.textContent = err.message; resBox.classList.remove("hidden"); }
     });

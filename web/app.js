@@ -135,10 +135,17 @@ function setView(viewName) {
   renderAll();
 }
 
+function formatTotalsSummary(totals) {
+  if (!totals || totals.length === 0) return "$0.00";
+  if (totals.length === 1 && totals[0].currency === "USD") return `$${totals[0].total}`;
+  return totals.map((t) => `${t.currency} ${t.total}`).join(" + ");
+}
+
 function renderKpis() {
   const stats = store.getSummaryStats();
   const audit = store.getAuditReport();
   const grid = document.getElementById("kpi-grid");
+  const totalsText = formatTotalsSummary(stats.statedTotalsByCurrency);
   grid.innerHTML = `
     <div class="kpi-card kpi-accent-emerald">
       <div class="kpi-label">
@@ -161,7 +168,7 @@ function renderKpis() {
         <span>Stated Paid Facts</span>
         <span class="badge badge-slate">Unverified</span>
       </div>
-      <div class="kpi-value mono">$${esc(stats.statedUsdTotal)}</div>
+      <div class="kpi-value mono">${esc(totalsText)}</div>
       <div class="kpi-sub">${stats.paidFactCount} adopted fact(s) · ${stats.humanCorrections} human correction(s)</div>
     </div>
     <div class="kpi-card kpi-accent-amber">
@@ -350,7 +357,7 @@ function renderLedger() {
       }
 
       return `
-        <tr data-source-id="${esc(s.sourceId)}" class="${isSelected ? "selected" : ""}">
+        <tr tabindex="0" data-source-id="${esc(s.sourceId)}" class="${isSelected ? "selected" : ""}">
           <td>
             <div class="vendor-name">
               <span>${esc(s.merchant)}</span>
@@ -386,9 +393,16 @@ function renderLedger() {
   `;
 
   for (const tr of container.querySelectorAll("tbody tr")) {
-    tr.addEventListener("click", () => {
+    const selectRow = () => {
       state.selectedSourceId = tr.dataset.sourceId;
       renderLedger();
+    };
+    tr.addEventListener("click", selectRow);
+    tr.addEventListener("keydown", (e) => {
+      if ((e.key === "Enter" || e.key === " ") && e.target === tr) {
+        e.preventDefault();
+        selectRow();
+      }
     });
   }
 
@@ -583,7 +597,7 @@ function renderInspector() {
       try {
         store.correctAmount(amtFact.factId, val);
         renderAll();
-        showToast(`Recorded human correction USD ${val.trim()} on ${source.displayName} — original bytes untouched.`, false);
+        showToast(`Recorded human correction ${amtFact.value.currency || "USD"} ${val.trim()} on ${source.displayName} — original bytes untouched.`, false);
       } catch (err) {
         showToast(err.message, true);
       }
@@ -694,12 +708,12 @@ function renderAudit() {
               <div class="compare-box">
                 <div class="compare-col good">
                   <div class="compare-label">Invoice PDF (${esc(c.invoiceSource.displayName)})</div>
-                  <div class="compare-val mono">USD ${esc(c.invoiceAmount)}</div>
+                  <div class="compare-val mono">${esc(c.invoiceCurrency || "USD")} ${esc(c.invoiceAmount)}</div>
                   <div style="font-size:12px;color:var(--ink-secondary)">Adopted as <code>stated_amount_paid</code> (tax-inclusive invoice)</div>
                 </div>
                 <div class="compare-col warn">
                   <div class="compare-label">Store CSV (${esc(c.csvSource.displayName)})</div>
-                  <div class="compare-val mono">USD ${esc(c.csvAmount)}</div>
+                  <div class="compare-val mono">${esc(c.csvCurrency || "USD")} ${esc(c.csvAmount)}</div>
                   <div style="font-size:12px;color:var(--ink-secondary)">Held as un-adopted <code>csv_charged_amount</code> candidate</div>
                 </div>
               </div>
@@ -1010,34 +1024,39 @@ async function handleUploadedFiles(fileList) {
   }
   let added = 0;
   let reused = 0;
+  let failed = 0;
+  let lastErr = "";
   for (const file of files) {
-    const buf = await file.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    const lower = file.name.toLowerCase();
-    const mediaType = lower.endsWith(".html") || lower.endsWith(".htm")
-      ? "text/html;charset=utf-8"
-      : lower.endsWith(".csv")
-      ? "text/csv"
-      : lower.endsWith(".pdf")
-      ? "application/pdf"
-      : "text/plain;charset=utf-8";
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const lower = file.name.toLowerCase();
+      const mediaType = lower.endsWith(".html") || lower.endsWith(".htm")
+        ? "text/html;charset=utf-8"
+        : lower.endsWith(".csv")
+        ? "text/csv"
+        : lower.endsWith(".pdf")
+        ? "application/pdf"
+        : "text/plain;charset=utf-8";
 
-    const res = await store.ingestBinaryFile({
-      displayName: file.name,
-      externalPath: `local/${file.name}`,
-      mediaType,
-      bytes,
-      batchId: `b_upload_${state.importCounter++}`
-    });
-    state.selectedSourceId = res.source.sourceId;
-    if (res.storageReused) reused++;
-    else added++;
+      const res = await store.ingestBinaryFile({
+        displayName: file.name,
+        externalPath: `local/${file.name}`,
+        mediaType,
+        bytes,
+        batchId: `b_upload_${state.importCounter++}`
+      });
+      state.selectedSourceId = res.source.sourceId;
+      if (res.storageReused) reused++;
+      else added++;
+    } catch (err) {
+      failed++;
+      lastErr = `${file.name}: ${err?.message || "ingest failed"}`;
+    }
   }
   renderAll();
-  showToast(
-    `Processed ${fileList.length} local file(s) in-browser: ${added} new preserved object(s), ${reused} byte-identical duplicate(s) reused.`,
-    false
-  );
+  const summary = `Processed ${fileList.length} local file(s) in-browser: ${added} new preserved object(s), ${reused} byte-identical duplicate(s) reused${failed ? `, ${failed} failed (${lastErr})` : ""}.`;
+  showToast(summary, failed > 0);
 }
 
 function wireEvents() {

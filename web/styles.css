@@ -59,10 +59,6 @@ html, body {
   font-variant-numeric: tabular-nums;
 }
 
-.tabular {
-  font-variant-numeric: tabular-nums;
-}
-
 button:focus-visible,
 [tabindex]:focus-visible,
 input:focus-visible,
@@ -346,7 +342,7 @@ a:focus-visible {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  transition: all 0.15s ease;
+  transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .tab-btn.active {
@@ -930,5 +926,13 @@ a:focus-visible {
   }
   .topbar-inner {
     padding: 10px 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }

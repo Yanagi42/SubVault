@@ -712,12 +712,14 @@ export class SubVaultStore {
   correctAmount(factId, newAmountText, actorId = "act_human_reviewer") {
     const clean = String(newAmountText).trim();
     if (!isValidUsdAmount(clean)) {
-      throw new Error("Amount must be USD decimal format (e.g. 107.91)");
+      throw new Error("Amount must be decimal format (e.g. 107.91)");
     }
     const fact = this.facts.find((f) => f.factId === factId && f.factType === "stated_amount_paid");
     if (!fact) throw new Error("Amount fact not found");
+    const cur = fact.value.currency || "USD";
+    const origCur = fact.originalValue?.currency || cur;
     if (fact.value.amount_text === clean) {
-      throw new Error(`Amount is already USD ${clean}`);
+      throw new Error(`Amount is already ${cur} ${clean}`);
     }
 
     const priorValue = { ...fact.value };
@@ -746,7 +748,7 @@ export class SubVaultStore {
       type: "human_correct",
       commandId: decision.commandId,
       sourceId: fact.sourceId,
-      message: `Human correction on ${fact.factId}: USD ${priorValue.amount_text} → USD ${clean} (original bytes untouched; still states USD ${fact.originalValue.amount_text}).`
+      message: `Human correction on ${fact.factId}: ${cur} ${priorValue.amount_text} → ${cur} ${clean} (original bytes untouched; still states ${origCur} ${fact.originalValue.amount_text}).`
     });
     return { fact, decision };
   }
@@ -761,6 +763,7 @@ export class SubVaultStore {
     }
     const priorValue = { ...fact.value };
     const restored = { ...latest.priorValue };
+    const cur = restored.currency || priorValue.currency || "USD";
     fact.revision += 1;
     fact.value = restored;
 
@@ -785,7 +788,7 @@ export class SubVaultStore {
       type: "undo",
       commandId: decision.commandId,
       sourceId: fact.sourceId,
-      message: `Undid ${latest.decisionId} on ${fact.factId}: restored USD ${restored.amount_text} via compensating decision ${decision.decisionId}.`
+      message: `Undid ${latest.decisionId} on ${fact.factId}: restored ${cur} ${restored.amount_text} via compensating decision ${decision.decisionId}.`
     });
     return { fact, decision };
   }
@@ -913,17 +916,21 @@ export class SubVaultStore {
 
       for (const p of paidSources) {
         for (const c of csvSources) {
-          if (p.fact.value.amount_text !== c.cand.value.amount_text) {
+          const invCur = p.fact.value.currency || "USD";
+          const csvCur = c.cand.value.currency || "USD";
+          if (p.fact.value.amount_text !== c.cand.value.amount_text || invCur !== csvCur) {
             conflicts.push({
               id: `conflict_${orderId}`,
               orderId,
               merchant: p.source.merchant,
               accountEmail: p.source.accountEmail,
               invoiceSource: p.source,
+              invoiceCurrency: invCur,
               invoiceAmount: p.fact.value.amount_text,
               csvSource: c.source,
+              csvCurrency: csvCur,
               csvAmount: c.cand.value.amount_text,
-              note: `Invoice states Amount paid USD ${p.fact.value.amount_text} while store CSV charged cell says USD ${c.cand.value.amount_text}. SubVault refuses to pick a winner automatically.`
+              note: `Invoice states Amount paid ${invCur} ${p.fact.value.amount_text} while store CSV charged cell says ${csvCur} ${c.cand.value.amount_text}. SubVault refuses to pick a winner automatically.`
             });
           }
         }
@@ -968,7 +975,17 @@ export class SubVaultStore {
     const totalOccurrences = this.occurrences.length;
     const duplicateHits = this.occurrences.filter((o) => o.storageReused).length;
     const paidFacts = this.facts.filter((f) => f.factType === "stated_amount_paid");
-    const statedUsdTotal = paidFacts.reduce((sum, f) => sum + parseFloat(f.value.amount_text || "0"), 0);
+    const byCurrency = new Map();
+    for (const f of paidFacts) {
+      const cur = f.value.currency || "USD";
+      const val = parseFloat(f.value.amount_text || "0") || 0;
+      byCurrency.set(cur, (byCurrency.get(cur) || 0) + val);
+    }
+    const statedTotalsByCurrency = [...byCurrency.entries()].map(([currency, sum]) => ({
+      currency,
+      total: sum.toFixed(2)
+    }));
+    const statedUsdTotal = (byCurrency.get("USD") || 0).toFixed(2);
     const humanCorrections =
       this.decisions.filter((d) => d.kind === "human_correct").length +
       this.accountDecisions.filter((d) => d.kind === "human_assign_account").length;
@@ -980,7 +997,8 @@ export class SubVaultStore {
       totalOccurrences,
       duplicateHits,
       paidFactCount: paidFacts.length,
-      statedUsdTotal: statedUsdTotal.toFixed(2),
+      statedUsdTotal,
+      statedTotalsByCurrency,
       humanCorrections,
       needsHumanCall,
       conflictCount: audit.conflicts.length,
@@ -1015,12 +1033,14 @@ export class SubVaultStore {
         const perFact = facts.find((f) => f.factType === "stated_service_period");
 
         if (amtFact) {
+          const cur = amtFact.value.currency || "USD";
+          const origCur = amtFact.originalValue?.currency || cur;
           const orig = amtFact.originalValue.amount_text;
           const curr = amtFact.value.amount_text;
-          if (orig !== curr) {
-            lines.push(`  Current amount: USD ${curr} (HUMAN CORRECTED — original document still states USD ${orig}; rev ${amtFact.revision})`);
+          if (orig !== curr || origCur !== cur) {
+            lines.push(`  Current amount: ${cur} ${curr} (HUMAN CORRECTED — original document still states ${origCur} ${orig}; rev ${amtFact.revision})`);
           } else {
-            lines.push(`  Current amount: USD ${curr} (matches original document; payment_verified=false)`);
+            lines.push(`  Current amount: ${cur} ${curr} (matches original document; payment_verified=false)`);
           }
         } else {
           lines.push("  Current amount: (none adopted — see un-adopted candidates below)");
