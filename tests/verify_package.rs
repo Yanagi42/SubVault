@@ -304,4 +304,40 @@ fn verify_package_catches_snapshot_and_csv_mismatch_and_bad_paths() {
     let (code, body) = run(&["verify-package", "--package", nocsv_dir.to_str().unwrap()]);
     assert_eq!(code, 12, "{body}");
     assert_eq!(body["reason"], "missing_facts_csv");
+
+    // Duplicated identical row in facts.csv (even with updated manifest hash) -> facts_csv_mismatch
+    let dup_dir = tmp.path.join("dup-csv-pack");
+    let tmp_dup = Tmp::new("dupcsv-src");
+    let pack_dup = build_exported_format4_package(&tmp_dup);
+    fs::create_dir_all(dup_dir.join("originals")).unwrap();
+    let mut dup_manifest: Value =
+        serde_json::from_slice(&fs::read(pack_dup.join("manifest.json")).unwrap()).unwrap();
+    for entry in dup_manifest["files"].as_array_mut().unwrap() {
+        let rel = entry["path"].as_str().unwrap().to_string();
+        let dst = dup_dir.join(&rel);
+        if let Some(p) = dst.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        if rel == "facts.csv" {
+            let mut csv_text = fs::read_to_string(pack_dup.join(&rel)).unwrap();
+            let first_row = csv_text.lines().nth(1).unwrap().to_string();
+            csv_text.push_str(&first_row);
+            csv_text.push('\n');
+            fs::write(&dst, csv_text.as_bytes()).unwrap();
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(csv_text.as_bytes());
+            let hash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            entry["sha256"] = Value::String(hash);
+            entry["byte_length"] = Value::Number((csv_text.len() as u64).into());
+        } else {
+            fs::copy(pack_dup.join(&rel), dst).unwrap();
+        }
+    }
+    fs::write(
+        dup_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&dup_manifest).unwrap(),
+    )
+    .unwrap();
+    let (code, body) = run(&["verify-package", "--package", dup_dir.to_str().unwrap()]);
+    assert_eq!(code, 12, "{body}");
+    assert_eq!(body["reason"], "csv_mismatch");
 }

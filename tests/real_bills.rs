@@ -386,3 +386,207 @@ fn real_bilingual_pdf_styled_html_gbk_csv_manual_entry_and_encrypted_disk_check(
     assert!(facts_csv.contains(",USD,20.00,"), "{facts_csv}");
     assert!(facts_csv.contains(",EUR,249.00,"), "{facts_csv}");
 }
+
+#[test]
+fn format6_bilingual_merge_long_pdf_line_deep_pages_year_crossing_and_cli_flags() {
+    // 1. CLI --version / --help / no-args human UX vs legacy `version` / `help` JSON contracts
+    let ver_out = Command::new(bin()).arg("--version").output().unwrap();
+    assert_eq!(ver_out.status.code(), Some(0));
+    let ver_str = String::from_utf8_lossy(&ver_out.stdout);
+    assert!(ver_str.starts_with("subvault 0.1.0"), "{ver_str}");
+
+    let help_out = Command::new(bin()).arg("--help").output().unwrap();
+    assert_eq!(help_out.status.code(), Some(0));
+    let help_str = String::from_utf8_lossy(&help_out.stdout);
+    assert!(
+        help_str.contains("Usage:") && help_str.contains("subvault app"),
+        "{help_str}"
+    );
+
+    let (code, bogus) = run(&["bogus-cmd", "--help"]);
+    assert_eq!(code, 2, "{bogus}");
+    assert_eq!(bogus["reason"], "unknown_command");
+
+    let (code, legacy_ver) = run(&["version"]);
+    assert_eq!(code, 0, "{legacy_ver}");
+    assert_eq!(legacy_ver["user_ready"], false);
+
+    let tmp = Tmp::new("wave5-real");
+    let vault = tmp.path.join("vault");
+    let (code, init) = run(&[
+        "init",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--format",
+        "6",
+        "--protection",
+        "os-disk",
+    ]);
+    assert_eq!(code, 0, "{init}");
+
+    // 2. Bilingual HTML where strict matches ASCII period and real matches ¥ amount -> BOTH adopted
+    let mixed_html = tmp.path.join("mixed-bilingual.html");
+    fs::write(
+        &mixed_html,
+        "<!doctype html><html><body><p>Service period: 2026-01-01 through 2026-01-31</p><p>实付金额：¥98.00</p></body></html>",
+    )
+    .unwrap();
+    let (code, r_html) = run(&[
+        "html",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "cmd-mixed-html",
+        "--source",
+        mixed_html.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{r_html}");
+    let html_facts = r_html["facts"].as_array().unwrap();
+    assert_eq!(
+        html_facts.len(),
+        2,
+        "must adopt both period and amount: {r_html}"
+    );
+
+    // 3. Bilingual PDF where strict matches ASCII period and real matches ¥ amount -> BOTH adopted
+    let mixed_pdf_stream = format!(
+        "BT\n(Service period: 2026-02-01 through 2026-02-28) Tj\nT* {} Tj\nET",
+        utf16be_hex("实付金额：¥128.00"),
+    );
+    let mixed_pdf = tmp.path.join("mixed-bilingual.pdf");
+    fs::write(&mixed_pdf, minimal_pdf(mixed_pdf_stream.as_bytes())).unwrap();
+    let (code, r_pdf) = run(&[
+        "pdf",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "cmd-mixed-pdf",
+        "--source",
+        mixed_pdf.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{r_pdf}");
+    let pdf_facts = r_pdf["facts"].as_array().unwrap();
+    assert_eq!(
+        pdf_facts.len(),
+        2,
+        "must adopt both period and amount: {r_pdf}"
+    );
+
+    // 4. Format 6 PDF with >1024-byte Chinese remark line still extracts amount cleanly
+    let long_remark = format!("备注：{}", "项目明细说明文字".repeat(60));
+    assert!(long_remark.len() > 1024);
+    let long_pdf_stream = format!(
+        "BT\n{} Tj\nT* {} Tj\nET",
+        utf16be_hex(&long_remark),
+        utf16be_hex("价税合计（小写）¥256.00"),
+    );
+    let long_pdf = tmp.path.join("long-remark.pdf");
+    fs::write(&long_pdf, minimal_pdf(long_pdf_stream.as_bytes())).unwrap();
+    let (code, r_long) = run(&[
+        "pdf",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "cmd-long-pdf",
+        "--source",
+        long_pdf.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{r_long}");
+    assert_eq!(r_long["extraction"], "matched", "{r_long}");
+    assert_eq!(r_long["facts"].as_array().unwrap().len(), 1, "{r_long}");
+
+    // 5. Deeply nested /Pages tree PDF (>150 levels) must not stack-overflow
+    let mut deep_pdf =
+        Vec::from(&b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"[..]);
+    let depth = 160u32;
+    for i in 2..=depth {
+        deep_pdf.extend_from_slice(
+            format!(
+                "{i} 0 obj\n<< /Type /Pages /Kids [{} 0 R] /Count 0 >>\nendobj\n",
+                i + 1
+            )
+            .as_bytes(),
+        );
+    }
+    deep_pdf.extend_from_slice(
+        format!("{} 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n", depth + 1)
+            .as_bytes(),
+    );
+    let deep_pdf_path = tmp.path.join("deep-pages.pdf");
+    fs::write(&deep_pdf_path, &deep_pdf).unwrap();
+    let (code, r_deep) = run(&[
+        "pdf",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "cmd-deep-pdf",
+        "--source",
+        deep_pdf_path.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{r_deep}");
+
+    // 6. Year-crossing period `Dec 15 - Jan 15, 2026` resolves to 2025-12-15..2026-01-15
+    let ycross_html = tmp.path.join("year-cross.html");
+    fs::write(
+        &ycross_html,
+        "<html><body><p>Billing period: Dec 15 - Jan 15, 2026</p><p>Amount paid: $15.00</p></body></html>",
+    )
+    .unwrap();
+    let (code, r_yc) = run(&[
+        "html",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "cmd-year-cross",
+        "--source",
+        ycross_html.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{r_yc}");
+    let yc_sid = r_yc["source_id"].as_str().unwrap();
+    let (code, yc_facts) = run(&[
+        "facts",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--source-id",
+        yc_sid,
+    ]);
+    assert_eq!(code, 0, "{yc_facts}");
+    let per_fact = yc_facts["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["fact_type"] == "stated_service_period")
+        .expect("year-crossing period fact");
+    assert_eq!(per_fact["value"]["period_start"], "2025-12-15");
+    assert_eq!(per_fact["value"]["period_end"], "2026-01-15");
+
+    // 7. 1-row CSV with unparseable `10/01/2026` date must not poison source_annotations.bill_date
+    let us_csv_path = tmp.path.join("us-date.csv");
+    fs::write(
+        &us_csv_path,
+        "Date,Merchant,Amount (USD),Direction\n10/01/2026,Acme,20.00,expense\n",
+    )
+    .unwrap();
+    let (code, r_us) = run(&[
+        "csv",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--command-id",
+        "cmd-us-csv",
+        "--source",
+        us_csv_path.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{r_us}");
+    let us_sid = r_us["source_id"].as_str().unwrap();
+    let (code, r_us_ann) = run(&[
+        "annotate",
+        "--vault",
+        vault.to_str().unwrap(),
+        "--source-id",
+        us_sid,
+        "--category",
+        "云服务",
+    ]);
+    assert_eq!(code, 0, "{r_us_ann}");
+    assert!(r_us_ann["annotation"]["bill_date"].is_null(), "{r_us_ann}");
+}

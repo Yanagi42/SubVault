@@ -480,6 +480,27 @@ pub fn list_occurrences_with_cipher(
         .collect()
 }
 
+pub fn first_display_name_for_source_with_cipher(
+    conn: &Connection,
+    source_id: &str,
+    cipher: &VaultCipher,
+) -> rusqlite::Result<Option<String>> {
+    let found: Option<(String, String)> = conn
+        .query_row(
+            "SELECT occurrence_id, display_name FROM occurrences WHERE source_id = ?1 ORDER BY recorded_at, occurrence_id LIMIT 1",
+            [source_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match found {
+        None => Ok(None),
+        Some((occurrence_id, stored)) => cipher
+            .decrypt_field("occurrences", &occurrence_id, "display_name", &stored)
+            .map(Some)
+            .map_err(|err| cipher_tamper_sql_err(err.to_string())),
+    }
+}
+
 pub fn list_commands_with_cipher(
     conn: &Connection,
     cipher: &VaultCipher,

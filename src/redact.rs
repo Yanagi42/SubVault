@@ -9,20 +9,20 @@
 //! binary dictionaries, XMP metadata, and embedded streams are never emitted.
 //! Stdout JSON reports counts and output line numbers only — never raw PII.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
-use crate::crypto::{AuthInput, CryptoError, ProtectionMode};
+use crate::crypto::{AuthInput, ProtectionMode};
 use crate::facts;
-use crate::ids::{hex_encode, is_prefixed_id};
+use crate::ids::is_prefixed_id;
 use crate::model::{
-    apply_format_honesty, cipher_tamper_fail, honesty, io_fail, unseen_db, Fail, Report,
-    EXIT_INTEGRITY, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED, EXIT_USAGE,
+    apply_format_honesty, honesty, io_fail, unseen_db, Fail, Report, EXIT_INTEGRITY, EXIT_OK,
+    EXIT_RECOVERY, EXIT_REJECTED, EXIT_USAGE,
 };
 use crate::pdf_parse;
 use crate::store;
@@ -481,7 +481,6 @@ pub fn redact_template(req: RedactRequest) -> Report {
 }
 
 /// Redacts a vaulted source entirely in memory without creating plaintext files in `%TEMP%`/`/tmp`.
-#[allow(dead_code)]
 pub(crate) fn redact_vault_source_in_memory(
     vault: &Path,
     source_id: &str,
@@ -492,6 +491,104 @@ pub(crate) fn redact_vault_source_in_memory(
         Ok(report) => report,
         Err(fail) => fail.into_report(),
     }
+}
+
+struct RedactedPayload {
+    kind: InputKind,
+    final_output: String,
+    shifted_lines: Vec<usize>,
+    counts: RedactionCounts,
+}
+
+fn redact_loaded(loaded: &LoadedInput, redact_terms: Vec<String>) -> Result<RedactedPayload, Fail> {
+    let kind = detect_kind(&loaded.bytes, loaded.media_type.as_deref());
+    let mut redactor = Redactor::new(redact_terms);
+    let (body_text, redacted_lines) = match kind {
+        InputKind::Pdf => redact_pdf(&loaded.bytes, &mut redactor)?,
+        InputKind::Html => {
+            let allow_non_utf8 = loaded.vault_format.is_none_or(|v| v >= 6);
+            let (text, _) = super::html::decode_html_bytes(&loaded.bytes, allow_non_utf8)
+                .ok_or_else(|| {
+                    Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
+                        .extra("read_only", json!(true))
+                        .extra("output_written", json!(false))
+                })?;
+            redact_html(&text, &mut redactor)
+        }
+        InputKind::Text => {
+            let is_csv = loaded
+                .media_type
+                .as_deref()
+                .is_some_and(|m| m.to_ascii_lowercase().starts_with("text/csv"));
+            let text: Cow<'_, str> = match std::str::from_utf8(&loaded.bytes) {
+                Ok(s) => Cow::Borrowed(s),
+                Err(_) if is_csv => {
+                    let (decoded, _) = crate::real_extract::decode_csv_bytes(&loaded.bytes);
+                    Cow::Owned(decoded)
+                }
+                Err(_) => {
+                    return Err(Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
+                        .extra("read_only", json!(true))
+                        .extra("output_written", json!(false)));
+                }
+            };
+            redact_plain_text(&text, &mut redactor)
+        }
+    };
+    let (header, header_lines) = format_header(kind);
+    let final_output = format!("{header}{body_text}");
+    let shifted_lines: Vec<usize> = redacted_lines
+        .into_iter()
+        .map(|ln| ln + header_lines)
+        .collect();
+    Ok(RedactedPayload {
+        kind,
+        final_output,
+        shifted_lines,
+        counts: redactor.counts,
+    })
+}
+
+fn redaction_report_body(
+    loaded: &LoadedInput,
+    payload: &RedactedPayload,
+) -> serde_json::Map<String, Value> {
+    let total_redactions = payload.counts.total_redactions();
+    let mut body = honesty("Redacted");
+    body.insert("slice".into(), json!("M4-real"));
+    body.insert("read_only".into(), json!(true));
+    body.insert("new_effect".into(), json!(false));
+    body.insert("input_mode".into(), json!(loaded.input_mode));
+    body.insert("input_kind".into(), json!(payload.kind.as_str()));
+    body.insert("redaction_rules".into(), json!(REDACTION_RULES_VERSION));
+    body.insert("manual_review_required".into(), json!(true));
+    body.insert(
+        "counts".into(),
+        json!({
+            "custom_terms": payload.counts.custom_terms,
+            "header_fields": payload.counts.header_fields,
+            "emails": payload.counts.emails,
+            "urls_and_ips": payload.counts.urls_and_ips,
+            "identifiers": payload.counts.identifiers,
+            "amounts": payload.counts.amounts,
+            "dates": payload.counts.dates,
+            "stripped_scripts": payload.counts.stripped_scripts,
+            "stripped_styles": payload.counts.stripped_styles,
+            "stripped_comments": payload.counts.stripped_comments,
+            "total_redactions": total_redactions,
+        }),
+    );
+    body.insert("redacted_lines".into(), json!(payload.shifted_lines));
+    if let Some(ref sid) = loaded.source_id {
+        body.insert("source_id".into(), json!(sid));
+    }
+    if let Some(version) = loaded.vault_format {
+        body.insert("vault_format".into(), json!(version));
+        apply_format_honesty(&mut body, version, loaded.protection);
+    } else {
+        body.insert("synthetic_only".into(), json!(false));
+    }
+    body
 }
 
 fn redact_vault_source_in_memory_inner(
@@ -509,73 +606,13 @@ fn redact_vault_source_in_memory_inner(
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
     }
     let loaded = load_vault_source(vault, source_id, auth)?;
-    let kind = detect_kind(&loaded.bytes, loaded.media_type.as_deref());
-    let mut redactor = Redactor::new(redact_terms);
-    let (body_text, redacted_lines) = match kind {
-        InputKind::Pdf => redact_pdf(&loaded.bytes, &mut redactor)?,
-        InputKind::Html => {
-            let allow_non_utf8 = loaded.vault_format.is_none_or(|v| v >= 6);
-            let (text, _) = super::html::decode_html_bytes(&loaded.bytes, allow_non_utf8)
-                .ok_or_else(|| {
-                    Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
-                        .extra("read_only", json!(true))
-                        .extra("output_written", json!(false))
-                })?;
-            redact_html(&text, &mut redactor)
-        }
-        InputKind::Text => {
-            let text = std::str::from_utf8(&loaded.bytes).map_err(|_| {
-                Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
-                    .extra("read_only", json!(true))
-                    .extra("output_written", json!(false))
-            })?;
-            redact_plain_text(text, &mut redactor)
-        }
-    };
-    let (header, header_lines) = format_header(kind);
-    let final_output = format!("{header}{body_text}");
-    let shifted_lines: Vec<usize> = redacted_lines
-        .into_iter()
-        .map(|ln| ln + header_lines)
-        .collect();
-
-    let total_redactions = redactor.counts.total_redactions();
-    let mut body = honesty("Redacted");
-    body.insert("slice".into(), json!("M4-real"));
-    body.insert("read_only".into(), json!(true));
-    body.insert("new_effect".into(), json!(false));
-    body.insert("input_mode".into(), json!(loaded.input_mode));
-    body.insert("input_kind".into(), json!(kind.as_str()));
-    body.insert("redacted_text".into(), json!(final_output));
-    body.insert("redaction_rules".into(), json!(REDACTION_RULES_VERSION));
-    body.insert("manual_review_required".into(), json!(true));
-    body.insert("total_redactions".into(), json!(total_redactions));
+    let payload = redact_loaded(&loaded, redact_terms)?;
+    let mut body = redaction_report_body(&loaded, &payload);
     body.insert(
-        "counts".into(),
-        json!({
-            "custom_terms": redactor.counts.custom_terms,
-            "header_fields": redactor.counts.header_fields,
-            "emails": redactor.counts.emails,
-            "urls_and_ips": redactor.counts.urls_and_ips,
-            "identifiers": redactor.counts.identifiers,
-            "amounts": redactor.counts.amounts,
-            "dates": redactor.counts.dates,
-            "stripped_scripts": redactor.counts.stripped_scripts,
-            "stripped_styles": redactor.counts.stripped_styles,
-            "stripped_comments": redactor.counts.stripped_comments,
-            "total_redactions": total_redactions,
-        }),
+        "total_redactions".into(),
+        json!(payload.counts.total_redactions()),
     );
-    body.insert("redacted_lines".into(), json!(shifted_lines));
-    if let Some(sid) = loaded.source_id {
-        body.insert("source_id".into(), json!(sid));
-    }
-    if let Some(version) = loaded.vault_format {
-        body.insert("vault_format".into(), json!(version));
-        apply_format_honesty(&mut body, version, loaded.protection);
-    } else {
-        body.insert("synthetic_only".into(), json!(false));
-    }
+    body.insert("redacted_text".into(), json!(payload.final_output));
     Ok(Report {
         code: EXIT_OK,
         body: Value::Object(body),
@@ -608,76 +645,12 @@ fn redact_inner(req: RedactRequest) -> Result<Report, Fail> {
         }
     };
 
-    let kind = detect_kind(&loaded.bytes, loaded.media_type.as_deref());
-    let mut redactor = Redactor::new(req.redact_terms);
-    let (body_text, redacted_lines) = match kind {
-        InputKind::Pdf => redact_pdf(&loaded.bytes, &mut redactor)?,
-        InputKind::Html => {
-            let allow_non_utf8 = loaded.vault_format.is_none_or(|v| v >= 6);
-            let (text, _) = super::html::decode_html_bytes(&loaded.bytes, allow_non_utf8)
-                .ok_or_else(|| {
-                    Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
-                        .extra("read_only", json!(true))
-                        .extra("output_written", json!(false))
-                })?;
-            redact_html(&text, &mut redactor)
-        }
-        InputKind::Text => {
-            let text = std::str::from_utf8(&loaded.bytes).map_err(|_| {
-                Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
-                    .extra("read_only", json!(true))
-                    .extra("output_written", json!(false))
-            })?;
-            redact_plain_text(text, &mut redactor)
-        }
-    };
+    let payload = redact_loaded(&loaded, req.redact_terms)?;
+    write_new(&req.out, payload.final_output.as_bytes())?;
 
-    let (header, header_lines) = format_header(kind);
-    let final_output = format!("{header}{body_text}");
-    let shifted_lines: Vec<usize> = redacted_lines
-        .into_iter()
-        .map(|ln| ln + header_lines)
-        .collect();
-
-    write_new(&req.out, final_output.as_bytes())?;
-
-    let mut body = honesty("Redacted");
-    body.insert("slice".into(), json!("M4-real"));
-    body.insert("read_only".into(), json!(true));
-    body.insert("new_effect".into(), json!(false));
-    body.insert("input_mode".into(), json!(loaded.input_mode));
-    body.insert("input_kind".into(), json!(kind.as_str()));
+    let mut body = redaction_report_body(&loaded, &payload);
     body.insert("output".into(), json!(req.out.display().to_string()));
     body.insert("output_written".into(), json!(true));
-    body.insert("redaction_rules".into(), json!(REDACTION_RULES_VERSION));
-    body.insert("manual_review_required".into(), json!(true));
-    body.insert(
-        "counts".into(),
-        json!({
-            "custom_terms": redactor.counts.custom_terms,
-            "header_fields": redactor.counts.header_fields,
-            "emails": redactor.counts.emails,
-            "urls_and_ips": redactor.counts.urls_and_ips,
-            "identifiers": redactor.counts.identifiers,
-            "amounts": redactor.counts.amounts,
-            "dates": redactor.counts.dates,
-            "stripped_scripts": redactor.counts.stripped_scripts,
-            "stripped_styles": redactor.counts.stripped_styles,
-            "stripped_comments": redactor.counts.stripped_comments,
-            "total_redactions": redactor.counts.total_redactions(),
-        }),
-    );
-    body.insert("redacted_lines".into(), json!(shifted_lines));
-    if let Some(sid) = loaded.source_id {
-        body.insert("source_id".into(), json!(sid));
-    }
-    if let Some(version) = loaded.vault_format {
-        body.insert("vault_format".into(), json!(version));
-        apply_format_honesty(&mut body, version, loaded.protection);
-    } else {
-        body.insert("synthetic_only".into(), json!(false));
-    }
-
     Ok(Report {
         code: EXIT_OK,
         body: Value::Object(body),
@@ -744,13 +717,22 @@ fn load_external_source(path: &Path) -> Result<LoadedInput, Fail> {
     if meta.len() > MAX_REDACT_BYTES {
         return Err(reject("over_input_budget").extra("limit", json!(MAX_REDACT_BYTES)));
     }
-    let mut file = File::open(path).map_err(|err| io_fail(err, "redact_read"))?;
+    let file = File::open(path).map_err(|err| io_fail(err, "redact_read"))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    file.take(MAX_REDACT_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|err| io_fail(err, "redact_read"))?;
+    if bytes.len() as u64 > MAX_REDACT_BYTES {
+        return Err(reject("over_input_budget").extra("limit", json!(MAX_REDACT_BYTES)));
+    }
+    let media_type = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.eq_ignore_ascii_case("csv"))
+        .map(|_| "text/csv".to_string());
     Ok(LoadedInput {
         bytes,
-        media_type: None,
+        media_type,
         input_mode: "external_file",
         source_id: None,
         vault_format: None,
@@ -769,7 +751,7 @@ fn load_vault_source(vault: &Path, source_id: &str, auth: &AuthInput) -> Result<
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_row_missing")
                 .extra("new_effect", json!(false))
         })?;
-    let obj_facts = facts::object_facts_with_cipher(
+    let (obj_facts, payload) = facts::read_and_verify_object(
         vault,
         &object.object_id,
         Some(&object.relpath),
@@ -778,29 +760,12 @@ fn load_vault_source(vault: &Path, source_id: &str, auth: &AuthInput) -> Result<
         &cipher,
     );
     super::hosted_facts_ok(&obj_facts)?;
-    let Some(relpath) = obj_facts.canonical_relpath else {
-        return Err(
-            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_id_rejected")
-                .extra("new_effect", json!(false)),
-        );
-    };
-    let bytes = match cipher.decrypt_object_to_vec(&object.object_id, &vault.join(relpath)) {
-        Ok(bytes) => bytes,
-        Err(CryptoError::Io(err)) => {
-            return Err(
-                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "object_unreadable")
-                    .extra("os_error", json!(err.to_string()))
-                    .extra("new_effect", json!(false)),
-            );
-        }
-        Err(err) => return Err(cipher_tamper_fail(err, "redact_read_object")),
-    };
-    if sha256_bytes(&bytes) != source.content_sha256 || bytes.len() as i64 != source.byte_length {
+    let Some(bytes) = payload else {
         return Err(
             Fail::new(EXIT_RECOVERY, "RecoveryRequired", "hash_mismatch")
                 .extra("new_effect", json!(false)),
         );
-    }
+    };
     Ok(LoadedInput {
         bytes,
         media_type: Some(source.media_type),
@@ -2688,12 +2653,6 @@ fn reject(reason: &'static str) -> Fail {
         .extra("read_only", json!(true))
         .extra("new_effect", json!(false))
         .extra("output_written", json!(false))
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex_encode(&hasher.finalize())
 }
 
 #[cfg(test)]

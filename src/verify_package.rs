@@ -515,7 +515,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex_encode(&hasher.finalize())
 }
 
-fn facts_match_csv(records: &Value, csv_text: &str) -> bool {
+pub(crate) fn facts_match_csv(records: &Value, csv_text: &str) -> bool {
     let Some(facts) = records.get("facts").and_then(Value::as_array) else {
         return false;
     };
@@ -566,7 +566,7 @@ fn facts_match_csv(records: &Value, csv_text: &str) -> bool {
         let Ok(rev) = row[revision].parse::<i64>() else {
             return false;
         };
-        csv_keys.insert(format!(
+        if !csv_keys.insert(format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row[fact_id],
             row[source_id],
@@ -579,7 +579,9 @@ fn facts_match_csv(records: &Value, csv_text: &str) -> bool {
             row[start],
             row[end],
             row[latest]
-        ));
+        )) {
+            return false;
+        }
     }
 
     let mut rec_keys = BTreeSet::new();
@@ -596,14 +598,16 @@ fn facts_match_csv(records: &Value, csv_text: &str) -> bool {
             return false;
         };
         let latest_id = decs.last().and_then(Value::as_str).unwrap_or("");
-        rec_keys.insert(format!(
+        if !rec_keys.insert(format!(
             "{fid}\t{sid}\t{cid}\t{ftype}\t{rev}\t{}\t{}\t{}\t{}\t{}\t{latest_id}",
             val_field(val, "statement"),
             val_field(val, "currency"),
             val_field(val, "amount_text"),
             val_field(val, "period_start"),
             val_field(val, "period_end"),
-        ));
+        )) {
+            return false;
+        }
     }
 
     csv_keys == rec_keys

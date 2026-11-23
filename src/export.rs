@@ -11,7 +11,7 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::crypto::{AuthInput, CryptoError, ProtectionMode, VaultCipher};
+use crate::crypto::{AuthInput, ProtectionMode, VaultCipher};
 use crate::facts;
 use crate::fsutil::{self, sha256_file};
 use crate::ids::{self, canonical_object_relpath};
@@ -64,6 +64,20 @@ pub(crate) fn export_package_in_memory(
         return Err(recovery(defect_reason(&loaded.defects))
             .extra("missing", Value::Array(loaded.defects.clone())));
     }
+    let (_, _, files) = assemble_package_files(&loaded, acknowledge_plaintext)?;
+    Ok(files
+        .into_iter()
+        .map(|f| MemoryPackageFile {
+            path: f.path,
+            bytes: f.bytes,
+        })
+        .collect())
+}
+
+fn assemble_package_files(
+    loaded: &Loaded,
+    acknowledge_plaintext: bool,
+) -> Result<(String, &'static str, Vec<Written>), Fail> {
     let completeness = if loaded.defects.is_empty() {
         "complete"
     } else {
@@ -114,13 +128,7 @@ pub(crate) fn export_package_in_memory(
         bytes: manifest_bytes,
         object_id: None,
     });
-    Ok(files
-        .into_iter()
-        .map(|f| MemoryPackageFile {
-            path: f.path,
-            bytes: f.bytes,
-        })
-        .collect())
+    Ok((snapshot_id, completeness, files))
 }
 
 fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
@@ -168,56 +176,9 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
         return Err(scratch.fail(fail));
     }
 
-    let completeness = if loaded.defects.is_empty() {
-        "complete"
-    } else {
-        "partial"
-    };
-    let records_bytes = serde_json::to_vec_pretty(&loaded.records)
-        .map_err(|_| scratch.fail(recovery("export_encode")))?;
-    let snapshot_id = sha256_bytes(&records_bytes);
-    let mut files: Vec<Written> = Vec::new();
-    files.push(Written {
-        path: "records.json".into(),
-        bytes: records_bytes,
-        object_id: None,
-    });
-    if let Some(csv) = loaded.csv.as_ref() {
-        files.push(Written {
-            path: "facts.csv".into(),
-            bytes: csv.clone(),
-            object_id: None,
-        });
-    }
-    for copy in &loaded.copies {
-        let hashed = sha256_bytes(&copy.bytes);
-        if hashed != copy.content_sha256 || copy.bytes.len() as i64 != copy.byte_length {
-            return Err(scratch.fail(recovery("export_verify_failed")));
-        }
-        files.push(Written {
-            path: copy.package_path.clone(),
-            bytes: copy.bytes.clone(),
-            object_id: Some(copy.object_id.clone()),
-        });
-    }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    let manifest = manifest_value(
-        &snapshot_id,
-        completeness,
-        loaded.vault_format,
-        loaded.protection,
-        req.acknowledge_plaintext,
-        &files,
-        &loaded.defects,
-        &loaded.counts,
-    );
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-        .map_err(|_| scratch.fail(recovery("export_encode")))?;
-    files.push(Written {
-        path: "manifest.json".into(),
-        bytes: manifest_bytes,
-        object_id: None,
-    });
+    let (snapshot_id, completeness, files) =
+        assemble_package_files(&loaded, req.acknowledge_plaintext)
+            .map_err(|fail| scratch.fail(fail))?;
     for file in &files {
         let path = scratch.temp.join(&file.path);
         write_new(&path, &file.bytes)
@@ -995,7 +956,7 @@ enum ObjectCopy {
 }
 
 fn classify_object(root: &Path, row: &ObjectRow, cipher: &VaultCipher) -> ObjectCopy {
-    let facts = facts::object_facts_with_cipher(
+    let (facts, payload) = facts::read_and_verify_object(
         root,
         &row.object_id,
         Some(&row.relpath),
@@ -1038,32 +999,11 @@ fn classify_object(root: &Path, row: &ObjectRow, cipher: &VaultCipher) -> Object
             reason: "length_mismatch",
         };
     }
-    let Some(relpath) = facts.canonical_relpath else {
-        return ObjectCopy::Block(
-            recovery("object_id_rejected").extra("object_id", json!(row.object_id)),
-        );
-    };
-    let bytes = match cipher.decrypt_object_to_vec(&row.object_id, &root.join(relpath)) {
-        Ok(bytes) => bytes,
-        Err(CryptoError::Io(err)) => {
-            return ObjectCopy::Block(
-                recovery("object_unreadable")
-                    .extra("object_id", json!(row.object_id))
-                    .extra("os_error", json!(err.to_string())),
-            );
-        }
-        Err(err) => {
-            return ObjectCopy::Block(
-                cipher_tamper_fail(err, "export_read_object")
-                    .extra("object_id", json!(row.object_id)),
-            );
-        }
-    };
-    if sha256_bytes(&bytes) != row.content_sha256 || bytes.len() as i64 != row.byte_length {
+    let Some(bytes) = payload else {
         return ObjectCopy::Block(
             recovery("export_verify_failed").extra("object_id", json!(row.object_id)),
         );
-    }
+    };
     ObjectCopy::Ready {
         relpath_differs: facts.relpath_differs,
         package_path,

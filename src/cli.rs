@@ -147,6 +147,9 @@ pub fn execute(args: Vec<String>) -> Report {
         Err(fail) => return fail.into_report(),
     };
     if flags.help {
+        if !is_known_command(&command) {
+            return usage("unknown_command");
+        }
         return engine::help_report();
     }
     if command == "review" && (flags.stop_at.is_some() || flags.inject.is_some()) {
@@ -559,7 +562,7 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
                 index += 1;
                 continue;
             }
-            "--no-browser" => {
+            "--no-browser" | "--no-open" => {
                 flags.no_browser = true;
                 index += 1;
                 continue;
@@ -716,6 +719,39 @@ fn hooks_from(flags: &Flags) -> Result<Hooks, Fail> {
         inject_point,
         witness: flags.witness.clone(),
     })
+}
+
+fn is_known_command(command: &str) -> bool {
+    matches!(
+        command,
+        "help"
+            | "version"
+            | "init"
+            | "rotate-passphrase"
+            | "app"
+            | "open"
+            | "verify"
+            | "recover"
+            | "hold"
+            | "import"
+            | "read"
+            | "marker"
+            | "html"
+            | "pdf"
+            | "csv"
+            | "annotate"
+            | "record-fact"
+            | "fragment"
+            | "candidates"
+            | "facts"
+            | "review"
+            | "verify-package"
+            | "redact"
+            | "export"
+            | "correct"
+            | "undo"
+            | "cancel"
+    )
 }
 
 fn usage(reason: &str) -> Report {

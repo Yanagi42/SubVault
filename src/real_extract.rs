@@ -14,8 +14,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
-use crate::pdf_parse;
-
 pub const REAL_RULES_VERSION: &str = "real-bilingual-1";
 pub const REAL_HTML_RULES_VERSION: &str = "real-html-bilingual-1";
 pub const REAL_CSV_RULES_VERSION: &str = "real-csv-bilingual-1";
@@ -182,21 +180,7 @@ pub struct RealLine {
     pub locator: Value,
 }
 
-pub fn extract_real_pdf(bytes: &[u8]) -> RealBillExtraction {
-    let pages = match pdf_parse::extract_pages_for_redaction(bytes) {
-        Ok(pages) => pages,
-        Err(reason) => {
-            return RealBillExtraction {
-                status: "unsupported",
-                reason: Some(reason),
-                page_count: 0,
-                candidates: Vec::new(),
-                adopt_amount_idx: None,
-                adopt_period_idx: None,
-                hints: ExtractedHints::default(),
-            };
-        }
-    };
+pub fn extract_real_pdf_from_pages(pages: Vec<(usize, Vec<String>)>) -> RealBillExtraction {
     let page_count = pages.len();
     let mut lines = Vec::new();
     for (page_num, page_lines) in pages {
@@ -1484,8 +1468,15 @@ pub fn match_period_line(text: &str) -> Option<(String, String)> {
                         return Some((start, end));
                     }
                 } else if let Some(year) = end.get(0..4).and_then(|y| y.parse::<u32>().ok()) {
-                    // Handle `Jan 15 - Feb 15, 2026` where start omits year
+                    // Handle `Jan 15 - Feb 15, 2026` and year-crossing `Dec 15 - Jan 15, 2026`
                     if let Some(start) = parse_month_day_with_year(left.trim(), year) {
+                        if start <= end {
+                            return Some((start, end));
+                        }
+                    }
+                    if let Some(start) =
+                        parse_month_day_with_year(left.trim(), year.saturating_sub(1))
+                    {
                         if start <= end {
                             return Some((start, end));
                         }
@@ -1669,7 +1660,7 @@ fn format_ymd(y: u32, m: u32, d: u32) -> Option<String> {
     if !(1990..=2100).contains(&y) || !(1..=12).contains(&m) || d == 0 {
         return None;
     }
-    let is_leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let is_leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let max_day = match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -2692,8 +2683,8 @@ pub fn parse_csv_statement(raw: &[u8]) -> CsvExtraction {
         if !tx.description.is_empty() {
             hints.plan_name = Some(tx.description.clone());
         }
-        if !tx.date.is_empty() {
-            hints.bill_date = Some(tx.date.clone());
+        if let Some(iso_date) = parse_date_token(&tx.date) {
+            hints.bill_date = Some(iso_date);
         }
         hints.account_label = tx.account_hint.clone();
     } else {

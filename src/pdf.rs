@@ -179,11 +179,19 @@ fn read_pdf(path: &Path) -> Result<Vec<u8>, Fail> {
             .extra("preservation", json!(NOT_PRESERVED))
             .extra("new_effect", json!(false)));
     }
-    let mut file = File::open(path)
+    let file = File::open(path)
         .map_err(|err| io_fail(err, "pdf_read").extra("preservation", json!(NOT_PRESERVED)))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    file.take(MAX_PDF_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|err| io_fail(err, "pdf_read").extra("preservation", json!(NOT_PRESERVED)))?;
+    if bytes.len() as u64 > MAX_PDF_BYTES {
+        return Err(Fail::new(EXIT_REJECTED, "Rejected", "over_input_budget")
+            .extra("bytes_read", json!(bytes.len()))
+            .extra("limit", json!(MAX_PDF_BYTES))
+            .extra("preservation", json!(NOT_PRESERVED))
+            .extra("new_effect", json!(false)));
+    }
     if !pdf_parse::has_valid_pdf_envelope(&bytes) {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "invalid_pdf_header")
             .extra("bytes_read", json!(bytes.len()))
@@ -548,8 +556,8 @@ fn replay(
     };
     map.insert("new_effect".into(), json!(false));
     map.insert("command_id".into(), json!(req.command_id));
-    match fs::read(&req.source) {
-        Ok(bytes) if sha256_bytes(&bytes) == hash => {
+    match crate::fsutil::sha256_file(&req.source) {
+        Ok((actual_hash, _)) if actual_hash == hash => {
             map.insert("payload_matches".into(), json!(true));
             map.insert("external_reread".into(), json!(true));
         }
@@ -573,16 +581,62 @@ fn extract_for_session(
     bytes: &[u8],
     vault_format: i64,
 ) -> (PdfExtraction, crate::real_extract::ExtractedHints) {
-    let strict = pdf_parse::extract(bytes);
     if vault_format < 6 {
-        return (strict, crate::real_extract::ExtractedHints::default());
+        return (
+            pdf_parse::extract(bytes),
+            crate::real_extract::ExtractedHints::default(),
+        );
     }
-    let real = crate::real_extract::extract_real_pdf(bytes);
+    let (mut strict, pages_res) = pdf_parse::extract_strict_and_pages(bytes);
+    let real = match pages_res {
+        Ok(pages) => crate::real_extract::extract_real_pdf_from_pages(pages),
+        Err(reason) => crate::real_extract::RealBillExtraction {
+            status: "unsupported",
+            reason: Some(reason),
+            page_count: 0,
+            candidates: Vec::new(),
+            adopt_amount_idx: None,
+            adopt_period_idx: None,
+            hints: crate::real_extract::ExtractedHints::default(),
+        },
+    };
     let hints = real.hints;
-    if strict.adopt_amount_idx.is_some()
-        || strict.adopt_period_idx.is_some()
-        || strict.status == "conflict"
-    {
+    if strict.status == "conflict" {
+        return (strict, hints);
+    }
+    let strict_has_amt = strict.adopt_amount_idx.is_some();
+    let strict_has_per = strict.adopt_period_idx.is_some();
+    if strict_has_amt || strict_has_per {
+        if !strict_has_amt {
+            if let Some(idx) = real.adopt_amount_idx {
+                let c = &real.candidates[idx];
+                strict.adopt_amount_idx = Some(strict.candidates.len());
+                strict.candidates.push(pdf_parse::PdfCandidate {
+                    kind: c.kind.clone(),
+                    usable: true,
+                    excerpt: c.excerpt.clone(),
+                    value: c.value.clone(),
+                    locator: c.locator.clone(),
+                });
+                strict.status = "matched";
+                strict.reason = None;
+            }
+        }
+        if !strict_has_per {
+            if let Some(idx) = real.adopt_period_idx {
+                let c = &real.candidates[idx];
+                strict.adopt_period_idx = Some(strict.candidates.len());
+                strict.candidates.push(pdf_parse::PdfCandidate {
+                    kind: c.kind.clone(),
+                    usable: true,
+                    excerpt: c.excerpt.clone(),
+                    value: c.value.clone(),
+                    locator: c.locator.clone(),
+                });
+                strict.status = "matched";
+                strict.reason = None;
+            }
+        }
         return (strict, hints);
     }
     if real.adopt_amount_idx.is_some()

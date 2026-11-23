@@ -31,6 +31,7 @@ pub const MEDIA_TYPE: &str = "text/html;charset=utf-8";
 pub const ROLE: &str = "user_provided_html";
 pub const OFFSET_UNIT: &str = "unicode_scalar_in_original_html_utf8";
 pub const MAX_HTML_BYTES: u64 = 65_536;
+const MAX_HTML_DEPTH: usize = 128;
 const PARSER: &str = "tl";
 const PARSER_VERSION: &str = "0.7.8";
 const ENTITY_DECODER: &str = "html-escape";
@@ -200,11 +201,19 @@ fn read_html(
             .extra("preservation", json!(NOT_PRESERVED))
             .extra("new_effect", json!(false)));
     }
-    let mut file = fs::File::open(path)
+    let file = fs::File::open(path)
         .map_err(|err| io_fail(err, "html_read").extra("preservation", json!(NOT_PRESERVED)))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
         .map_err(|err| io_fail(err, "html_read").extra("preservation", json!(NOT_PRESERVED)))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Fail::new(EXIT_REJECTED, "Rejected", "over_input_budget")
+            .extra("bytes_read", json!(bytes.len()))
+            .extra("limit", json!(max_bytes))
+            .extra("preservation", json!(NOT_PRESERVED))
+            .extra("new_effect", json!(false)));
+    }
     let Some((decoded, is_plain_utf8)) = decode_html_bytes(&bytes, allow_non_utf8) else {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
             .extra("bytes_read", json!(bytes.len()))
@@ -221,7 +230,7 @@ pub(crate) fn decode_html_bytes(bytes: &[u8], allow_non_utf8: bool) -> Option<(S
     }
     // Format 6+: UTF-16LE / UTF-16BE BOM
     if bytes.starts_with(&[0xFF, 0xFE]) {
-        if bytes.len() < 4 || bytes.len() % 2 != 0 {
+        if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
             return None;
         }
         let (decoded, _, had_errors) = encoding_rs::UTF_16LE.decode(bytes);
@@ -231,7 +240,7 @@ pub(crate) fn decode_html_bytes(bytes: &[u8], allow_non_utf8: bool) -> Option<(S
         return Some((decoded.trim_start_matches('\u{feff}').to_string(), false));
     }
     if bytes.starts_with(&[0xFE, 0xFF]) {
-        if bytes.len() < 4 || bytes.len() % 2 != 0 {
+        if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
             return None;
         }
         let (decoded, _, had_errors) = encoding_rs::UTF_16BE.decode(bytes);
@@ -641,8 +650,8 @@ fn replay(
     };
     map.insert("new_effect".into(), json!(false));
     map.insert("command_id".into(), json!(req.command_id));
-    match fs::read(&req.source) {
-        Ok(bytes) if sha256_bytes(&bytes) == hash => {
+    match crate::fsutil::sha256_file(&req.source) {
+        Ok((actual_hash, _)) if actual_hash == hash => {
             map.insert("payload_matches".into(), json!(true));
             map.insert("external_reread".into(), json!(true));
         }
@@ -1125,6 +1134,67 @@ fn prepared(status: &'static str, reason: Option<String>, hits: Vec<Hit>) -> Pre
     }
 }
 
+fn real_candidate_to_hit(
+    cand: crate::real_extract::RealCandidate,
+    usable: bool,
+    is_conflict: bool,
+) -> Hit {
+    let kind: &'static str = match cand.kind.as_str() {
+        "stated_amount_paid" => "stated_amount_paid",
+        "stated_service_period" => "stated_service_period",
+        "credit_note_total" => "credit_note_total",
+        "unjudged_order_total" => "unjudged_order_total",
+        "unresolved_total" => "unresolved_total",
+        "account_email" => "account_email",
+        "masked_account_email" => "masked_account_email",
+        _ => "other_candidate",
+    };
+    let currency = cand
+        .value
+        .get("currency")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let amount_text = cand
+        .value
+        .get("amount_text")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let period_start = cand
+        .value
+        .get("period_start")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let period_end = cand
+        .value
+        .get("period_end")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let reason = if usable {
+        None
+    } else if is_conflict {
+        Some("conflicting_candidates")
+    } else {
+        Some("not_adopted")
+    };
+    Hit {
+        kind,
+        display: cand.excerpt.clone(),
+        usable,
+        reason,
+        currency,
+        amount_text,
+        period_start,
+        period_end,
+        byte_start: 0,
+        byte_end: 0,
+        scalar_start: 0,
+        scalar_end: 0,
+        excerpt: cand.excerpt,
+        element: "real_html".to_string(),
+        display_version: Some(crate::real_extract::REAL_HTML_RULES_VERSION),
+    }
+}
+
 fn extract_for_session(
     source: &str,
     vault_format: i64,
@@ -1139,9 +1209,37 @@ fn extract_for_session(
     let real = crate::real_extract::extract_real_html(source);
     let hints = real.hints;
     let strict = if is_plain_utf8 {
-        let strict = extract(source);
-        let strict_has_usable = strict.hits.iter().any(|h| h.usable);
-        if strict_has_usable || strict.status == "conflict" {
+        let mut strict = extract(source);
+        if strict.status == "conflict" {
+            return (strict, hints);
+        }
+        let strict_has_amt = strict
+            .hits
+            .iter()
+            .any(|h| h.usable && h.kind == "stated_amount_paid");
+        let strict_has_per = strict
+            .hits
+            .iter()
+            .any(|h| h.usable && h.kind == "stated_service_period");
+        if strict_has_amt || strict_has_per {
+            if !strict_has_amt {
+                if let Some(idx) = real.adopt_amount_idx {
+                    strict.hits.push(real_candidate_to_hit(
+                        real.candidates[idx].clone(),
+                        true,
+                        false,
+                    ));
+                }
+            }
+            if !strict_has_per {
+                if let Some(idx) = real.adopt_period_idx {
+                    strict.hits.push(real_candidate_to_hit(
+                        real.candidates[idx].clone(),
+                        true,
+                        false,
+                    ));
+                }
+            }
             return (strict, hints);
         }
         Some(strict)
@@ -1153,64 +1251,17 @@ fn extract_for_session(
         || real.status == "conflict"
         || !real.candidates.is_empty()
     {
-        let mut hits = Vec::new();
-        for (idx, cand) in real.candidates.into_iter().enumerate() {
-            let kind: &'static str = match cand.kind.as_str() {
-                "stated_amount_paid" => "stated_amount_paid",
-                "stated_service_period" => "stated_service_period",
-                "credit_note_total" => "credit_note_total",
-                "unjudged_order_total" => "unjudged_order_total",
-                "unresolved_total" => "unresolved_total",
-                "account_email" => "account_email",
-                "masked_account_email" => "masked_account_email",
-                _ => "other_candidate",
-            };
-            let usable = Some(idx) == real.adopt_amount_idx || Some(idx) == real.adopt_period_idx;
-            let currency = cand
-                .value
-                .get("currency")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let amount_text = cand
-                .value
-                .get("amount_text")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let period_start = cand
-                .value
-                .get("period_start")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let period_end = cand
-                .value
-                .get("period_end")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let reason = if usable {
-                None
-            } else if real.status == "conflict" {
-                Some("conflicting_candidates")
-            } else {
-                Some("not_adopted")
-            };
-            hits.push(Hit {
-                kind,
-                display: cand.excerpt.clone(),
-                usable,
-                reason,
-                currency,
-                amount_text,
-                period_start,
-                period_end,
-                byte_start: 0,
-                byte_end: 0,
-                scalar_start: 0,
-                scalar_end: 0,
-                excerpt: cand.excerpt,
-                element: "real_html".to_string(),
-                display_version: Some(crate::real_extract::REAL_HTML_RULES_VERSION),
-            });
-        }
+        let is_conflict = real.status == "conflict";
+        let hits = real
+            .candidates
+            .into_iter()
+            .enumerate()
+            .map(|(idx, cand)| {
+                let usable =
+                    Some(idx) == real.adopt_amount_idx || Some(idx) == real.adopt_period_idx;
+                real_candidate_to_hit(cand, usable, is_conflict)
+            })
+            .collect();
         return (
             prepared(real.status, real.reason.map(str::to_string), hits),
             hints,
@@ -1235,7 +1286,7 @@ fn extract(source: &str) -> Prepared {
         return prepared("unsupported", Some(reason.into()), Vec::new());
     }
     let mut scan = Scan::default();
-    walk(dom.children(), parser, source, &mut scan);
+    walk(dom.children(), parser, source, &mut scan, 0);
     if scan.span_broken {
         return prepared("unparsed", Some("span_not_verifiable".into()), Vec::new());
     }
@@ -1266,17 +1317,35 @@ struct Scan {
 
 fn find_style(handles: &[tl::NodeHandle], parser: &tl::Parser) -> Option<&'static str> {
     let mut found = None;
-    fn visit(handles: &[tl::NodeHandle], parser: &tl::Parser, found: &mut Option<&'static str>) {
+    fn visit(
+        handles: &[tl::NodeHandle],
+        parser: &tl::Parser,
+        found: &mut Option<&'static str>,
+        depth: usize,
+    ) {
+        if found.is_some() {
+            return;
+        }
+        if depth >= MAX_HTML_DEPTH {
+            *found = Some("html_too_deep");
+            return;
+        }
         for handle in handles {
+            if found.is_some() {
+                return;
+            }
             let Some(tl::Node::Tag(tag)) = handle.get(parser) else {
                 continue;
             };
             note_style(tag, found);
+            if found.is_some() {
+                return;
+            }
             let children: Vec<tl::NodeHandle> = tag.children().top().iter().copied().collect();
-            visit(&children, parser, found);
+            visit(&children, parser, found, depth + 1);
         }
     }
-    visit(handles, parser, &mut found);
+    visit(handles, parser, &mut found, 0);
     found
 }
 
@@ -1305,7 +1374,17 @@ fn note_style(tag: &tl::HTMLTag, found: &mut Option<&'static str>) {
     }
 }
 
-fn walk(handles: &[tl::NodeHandle], parser: &tl::Parser, source: &str, scan: &mut Scan) {
+fn walk(
+    handles: &[tl::NodeHandle],
+    parser: &tl::Parser,
+    source: &str,
+    scan: &mut Scan,
+    depth: usize,
+) {
+    if depth >= MAX_HTML_DEPTH {
+        scan.span_broken = true;
+        return;
+    }
     for handle in handles {
         let Some(node) = handle.get(parser) else {
             scan.span_broken = true;
@@ -1318,12 +1397,16 @@ fn walk(handles: &[tl::NodeHandle], parser: &tl::Parser, source: &str, scan: &mu
                     scan.outside = true;
                 }
             }
-            tl::Node::Tag(tag) => walk_tag(tag, parser, source, scan),
+            tl::Node::Tag(tag) => walk_tag(tag, parser, source, scan, depth + 1),
         }
     }
 }
 
-fn walk_tag(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Scan) {
+fn walk_tag(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Scan, depth: usize) {
+    if depth >= MAX_HTML_DEPTH {
+        scan.span_broken = true;
+        return;
+    }
     let name = tag_name(tag);
     let children: Vec<tl::NodeHandle> = tag.children().top().iter().copied().collect();
     if matches!(name.as_str(), "head" | "script") || has_attr(tag, "hidden") {
@@ -1331,13 +1414,13 @@ fn walk_tag(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Sca
     }
     match name.as_str() {
         "html" | "body" | "ul" | "ol" | "table" | "thead" | "tbody" | "tfoot" => {
-            walk(&children, parser, source, scan)
+            walk(&children, parser, source, scan, depth + 1)
         }
-        "tr" => record_row(tag, parser, source, scan),
+        "tr" => record_row(tag, parser, source, scan, depth + 1),
         "p" | "div" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" | "td"
         | "th" => {
             match element_span(tag, parser, source) {
-                Some(span) => record_block(tag, parser, &name, span, scan),
+                Some(span) => record_block(tag, parser, &name, span, scan, depth + 1),
                 None => scan.span_broken = true,
             }
             for handle in &children {
@@ -1350,12 +1433,12 @@ fn walk_tag(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Sca
                     || child_name == "head"
                     || child_name == "script"
                 {
-                    walk_tag(child, parser, source, scan);
+                    walk_tag(child, parser, source, scan, depth + 1);
                 }
             }
         }
         "b" | "strong" | "i" | "em" | "span" | "br" => {
-            if !fold(&collect_inline(tag, parser, scan)).is_empty() {
+            if !fold(&collect_inline(tag, parser, scan, depth + 1)).is_empty() {
                 scan.outside = true;
             }
         }
@@ -1406,8 +1489,9 @@ fn record_block(
     name: &str,
     span: OwnedSpan,
     scan: &mut Scan,
+    depth: usize,
 ) {
-    let text = collect_inline(tag, parser, scan);
+    let text = collect_inline(tag, parser, scan, depth + 1);
     for line in fold(&text) {
         let (kind, amount, start, end) = match body::stated_line(&line) {
             StatedLine::Amount(amount) => ("stated_amount_paid", Some(amount), None, None),
@@ -1436,7 +1520,11 @@ fn record_block(
     }
 }
 
-fn collect_inline(tag: &tl::HTMLTag, parser: &tl::Parser, scan: &mut Scan) -> String {
+fn collect_inline(tag: &tl::HTMLTag, parser: &tl::Parser, scan: &mut Scan, depth: usize) -> String {
+    if depth >= MAX_HTML_DEPTH {
+        scan.span_broken = true;
+        return String::new();
+    }
     let mut text = String::new();
     for handle in tag.children().top().iter() {
         let Some(node) = handle.get(parser) else {
@@ -1451,7 +1539,7 @@ fn collect_inline(tag: &tl::HTMLTag, parser: &tl::Parser, scan: &mut Scan) -> St
                 match name.as_str() {
                     "br" => text.push('\n'),
                     "b" | "strong" | "i" | "em" | "span" => {
-                        text.push_str(&collect_inline(child, parser, scan));
+                        text.push_str(&collect_inline(child, parser, scan, depth + 1));
                     }
                     name if is_block(name) || is_container(name) => {}
                     _ => {
@@ -1577,7 +1665,11 @@ struct RowCell {
     span: OwnedSpan,
 }
 
-fn record_row(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Scan) {
+fn record_row(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Scan, depth: usize) {
+    if depth >= MAX_HTML_DEPTH {
+        scan.span_broken = true;
+        return;
+    }
     let mut cells = Vec::new();
     for handle in tag.children().top().iter() {
         let Some(node) = handle.get(parser) else {
@@ -1591,7 +1683,9 @@ fn record_row(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut S
                     scan.outside = true;
                 }
             }
-            tl::Node::Tag(child) => note_row_child(child, parser, source, scan, &mut cells),
+            tl::Node::Tag(child) => {
+                note_row_child(child, parser, source, scan, &mut cells, depth + 1)
+            }
         }
     }
     pair_amount(&cells, source, scan);
@@ -1604,6 +1698,7 @@ fn note_row_child(
     source: &str,
     scan: &mut Scan,
     cells: &mut Vec<RowCell>,
+    depth: usize,
 ) {
     let name = tag_name(child);
     if matches!(name.as_str(), "head" | "script") || has_attr(child, "hidden") {
@@ -1612,21 +1707,21 @@ fn note_row_child(
     if name == "td" || name == "th" {
         match element_span(child, parser, source) {
             Some(span) => {
-                let lines = fold(&collect_inline(child, parser, scan));
+                let lines = fold(&collect_inline(child, parser, scan, depth + 1));
                 record_stated_lines(&name, &span, &lines, scan);
                 cells.push(RowCell { lines, span });
             }
             None => scan.span_broken = true,
         }
-        walk_nested(child, parser, source, scan);
+        walk_nested(child, parser, source, scan, depth + 1);
         return;
     }
     if is_block(&name) || is_container(&name) {
-        walk_tag(child, parser, source, scan);
+        walk_tag(child, parser, source, scan, depth + 1);
         return;
     }
     if matches!(name.as_str(), "b" | "strong" | "i" | "em" | "span" | "br") {
-        if !fold(&collect_inline(child, parser, scan)).is_empty() {
+        if !fold(&collect_inline(child, parser, scan, depth + 1)).is_empty() {
             scan.outside = true;
         }
         return;
@@ -1636,14 +1731,24 @@ fn note_row_child(
     }
 }
 
-fn walk_nested(tag: &tl::HTMLTag, parser: &tl::Parser, source: &str, scan: &mut Scan) {
+fn walk_nested(
+    tag: &tl::HTMLTag,
+    parser: &tl::Parser,
+    source: &str,
+    scan: &mut Scan,
+    depth: usize,
+) {
+    if depth >= MAX_HTML_DEPTH {
+        scan.span_broken = true;
+        return;
+    }
     for handle in tag.children().top().iter() {
         let Some(tl::Node::Tag(child)) = handle.get(parser) else {
             continue;
         };
         let name = tag_name(child);
         if is_block(&name) || is_container(&name) || name == "head" || name == "script" {
-            walk_tag(child, parser, source, scan);
+            walk_tag(child, parser, source, scan, depth + 1);
         }
     }
 }

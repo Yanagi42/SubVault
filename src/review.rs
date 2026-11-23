@@ -7,16 +7,14 @@
 //! original, or a decision.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::crypto::{AuthInput, ProtectionMode, VaultCipher};
-use crate::ids::hex_encode;
 use crate::model::{
     apply_format_honesty, cipher_tamper_fail, honesty, unseen_db, Fail, Report, EXIT_INTEGRITY,
     EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED,
@@ -235,14 +233,14 @@ fn same_package_range(package: &Path, sources: &[SourceLine], facts: &Value) -> 
     let Some(packed_facts) = packed_fact_keys(records.get("facts")) else {
         return false;
     };
-    let Some(csv_facts) = csv_fact_keys(&csv) else {
+    if !crate::verify_package::facts_match_csv(&records, &csv) {
         return false;
-    };
+    }
     let live_sources = sources.iter().map(source_key).collect::<BTreeSet<_>>();
     let Some(live_facts) = live_fact_keys(facts) else {
         return false;
     };
-    packed_sources == live_sources && packed_facts == live_facts && csv_facts == live_facts
+    packed_sources == live_sources && packed_facts == live_facts
 }
 
 fn source_key(source: &SourceLine) -> String {
@@ -320,47 +318,6 @@ fn packed_fact_keys(facts: Option<&Value>) -> Option<BTreeSet<String>> {
     Some(keys)
 }
 
-fn csv_fact_keys(text: &str) -> Option<BTreeSet<String>> {
-    let rows = csv_rows(text)?;
-    let header = rows.first()?;
-    let index = |name: &str| header.iter().position(|cell| cell == name);
-    let fact_id = index("fact_id")?;
-    let source_id = index("source_id")?;
-    let candidate_id = index("candidate_id")?;
-    let fact_type = index("fact_type")?;
-    let revision = index("revision")?;
-    let statement = index("statement")?;
-    let currency = index("currency")?;
-    let amount = index("amount_text")?;
-    let start = index("period_start")?;
-    let end = index("period_end")?;
-    let latest = index("latest_decision_id")?;
-    let width = header.len();
-    let mut keys = BTreeSet::new();
-    for row in rows.iter().skip(1) {
-        if row.iter().all(|cell| cell.is_empty()) {
-            continue;
-        }
-        if row.len() != width {
-            return None;
-        }
-        keys.insert(fact_key(
-            &row[fact_id],
-            &row[source_id],
-            &row[candidate_id],
-            &row[fact_type],
-            row[revision].parse().ok()?,
-            row[statement].clone(),
-            row[currency].clone(),
-            row[amount].clone(),
-            row[start].clone(),
-            row[end].clone(),
-            &row[latest],
-        ));
-    }
-    Some(keys)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn fact_key(
     fact_id: &str,
@@ -386,47 +343,6 @@ fn field(value: &Value, key: &str) -> String {
         Some(Value::Number(number)) => number.to_string(),
         _ => String::new(),
     }
-}
-
-fn csv_rows(text: &str) -> Option<Vec<Vec<String>>> {
-    let mut rows = Vec::new();
-    let mut row = Vec::new();
-    let mut cell = String::new();
-    let mut quoted = false;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if quoted {
-            if ch == '"' {
-                if chars.peek() == Some(&'"') {
-                    chars.next();
-                    cell.push('"');
-                } else {
-                    quoted = false;
-                }
-            } else {
-                cell.push(ch);
-            }
-            continue;
-        }
-        match ch {
-            '"' if cell.is_empty() => quoted = true,
-            ',' => row.push(std::mem::take(&mut cell)),
-            '\n' => {
-                row.push(std::mem::take(&mut cell));
-                rows.push(std::mem::take(&mut row));
-            }
-            '\r' => {}
-            _ => cell.push(ch),
-        }
-    }
-    if quoted {
-        return None;
-    }
-    if !cell.is_empty() || !row.is_empty() {
-        row.push(cell);
-        rows.push(row);
-    }
-    Some(rows)
 }
 
 fn verified_originals(package: &Path, sources: &[SourceLine]) -> Vec<(String, String)> {
@@ -459,21 +375,10 @@ fn original_matches(path: &Path, hash: &str, byte_length: i64) -> bool {
     if !meta.file_type().is_file() {
         return false;
     }
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return false;
+    match crate::fsutil::sha256_file(path) {
+        Ok((actual_hash, len)) => len as i64 == byte_length && actual_hash == hash,
+        Err(_) => false,
     }
-    bytes.len() as i64 == byte_length && sha256_bytes(&bytes) == hash
-}
-
-fn sha256_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex_encode(&hasher.finalize())
 }
 
 fn push_conclusion(

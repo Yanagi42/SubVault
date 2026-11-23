@@ -1014,6 +1014,344 @@ fn workbench_wave2_validation_csv_guard_dedup_monthly_and_price_drift_isolation(
     server.stop();
 }
 
+#[test]
+fn workbench_wave5_hardening_regression_guards() {
+    std::env::set_var("SUBVAULT_NO_RECENT", "1");
+    let tmp = Tmp::new("wave5");
+    let server = WorkbenchServer::start(WorkbenchOptions {
+        port: 0,
+        open_browser: false,
+        initial_vault: None,
+    })
+    .unwrap();
+    let addr = server.addr();
+    let token = server.token().to_string();
+
+    let vault_dir = tmp.path.join("wave5-vault");
+    let (st, init_res) = api_json(
+        addr,
+        "POST",
+        "/api/vault/init",
+        &token,
+        Some(json!({
+            "path": vault_dir.display().to_string(),
+            "protection": "os-disk"
+        })),
+    );
+    assert_eq!(st, 200, "{init_res}");
+
+    // 1. path_is_inside_vault must block `..` traversal AND never pre-create dirs inside vault
+    let sneaky_target = vault_dir
+        .join("..")
+        .join("wave5-vault")
+        .join("sneaky-sub")
+        .join("pkg");
+    let (st, sneaky_res) = api_json(
+        addr,
+        "POST",
+        "/api/export/package",
+        &token,
+        Some(json!({
+            "out_dir": sneaky_target.display().to_string(),
+            "acknowledge_plaintext": true
+        })),
+    );
+    assert_eq!(st, 400, "{sneaky_res}");
+    assert_eq!(sneaky_res["error"], "output_inside_vault");
+    assert!(
+        !vault_dir.join("sneaky-sub").exists(),
+        ".. traversal must not create directories inside vault"
+    );
+
+    // 2. Long Chinese UTF-8 filename (>70 CJK chars = >210 UTF-8 bytes) preserves `.html` extension & imports cleanly
+    let long_zh_name = format!("{}.html", "电子发票报销凭证".repeat(12));
+    assert!(long_zh_name.len() > 200);
+    let simple_html = "<html><body><p>收款方：金山办公</p><p>实付金额：¥98.00</p></body></html>";
+    let (st, imp_long) = api_json(
+        addr,
+        "POST",
+        "/api/import",
+        &token,
+        Some(json!({
+            "filename": long_zh_name,
+            "content_base64": B64.encode(simple_html.as_bytes())
+        })),
+    );
+    assert_eq!(st, 200, "{imp_long}");
+    let sanitized = imp_long["filename"].as_str().unwrap();
+    assert!(sanitized.len() <= 200, "byte len {} > 200", sanitized.len());
+    assert!(sanitized.ends_with(".html"), "extension lost: {sanitized}");
+    let zh_sid = imp_long["result"]["source_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 3. api_source_save omitting `currency` preserves existing CNY currency; undoing then correcting restores statement
+    let (st, saved_keep_cur) = api_json(
+        addr,
+        "POST",
+        "/api/sources/save",
+        &token,
+        Some(json!({
+            "source_id": zh_sid,
+            "amount_text": "108.00"
+        })),
+    );
+    assert_eq!(st, 200, "{saved_keep_cur}");
+    let zh_item = saved_keep_cur["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["source_id"] == zh_sid)
+        .unwrap();
+    assert_eq!(zh_item["amount_fact"]["value"]["currency"], "CNY");
+    assert_eq!(zh_item["amount_fact"]["value"]["amount_text"], "108.00");
+
+    // Undo latest decision (rev 2 -> rev 1) then undo initial decision (rev 1 -> unknown), then re-save amount
+    let dec2 = zh_item["amount_fact"]["decisions"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, u1) = api_json(
+        addr,
+        "POST",
+        "/api/facts/undo",
+        &token,
+        Some(json!({ "decision_id": dec2, "expected_revision": 2 })),
+    );
+    assert_eq!(st, 200, "{u1}");
+    let zh_item_u1 = u1["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["source_id"] == zh_sid)
+        .unwrap();
+    let dec3 = zh_item_u1["amount_fact"]["decisions"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Re-enter on a fresh source whose initial decision is undone -> statement transitions from unknown to user_entered
+    let _ = dec3;
+    let fresh_html = "<html><body><p>实付金额：¥50.00</p></body></html>";
+    let (st, imp_fresh) = api_json(
+        addr,
+        "POST",
+        "/api/import",
+        &token,
+        Some(json!({
+            "filename": "undo-reset.html",
+            "content_base64": B64.encode(fresh_html.as_bytes())
+        })),
+    );
+    assert_eq!(st, 200, "{imp_fresh}");
+    let fresh_sid = imp_fresh["result"]["source_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, ws_f) = api_json(addr, "GET", "/api/workspace", &token, None);
+    assert_eq!(st, 200);
+    let f_item = ws_f["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["source_id"] == fresh_sid)
+        .unwrap();
+    let init_dec = f_item["amount_fact"]["decisions"][0]["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, ws_undone) = api_json(
+        addr,
+        "POST",
+        "/api/facts/undo",
+        &token,
+        Some(json!({ "decision_id": init_dec, "expected_revision": 1 })),
+    );
+    assert_eq!(st, 200, "{ws_undone}");
+    let (st, ws_reentered) = api_json(
+        addr,
+        "POST",
+        "/api/sources/save",
+        &token,
+        Some(json!({
+            "source_id": fresh_sid,
+            "amount_text": "55.00"
+        })),
+    );
+    assert_eq!(st, 200, "{ws_reentered}");
+    let re_item = ws_reentered["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["source_id"] == fresh_sid)
+        .unwrap();
+    assert_eq!(re_item["amount_fact"]["value"]["statement"], "user_entered");
+    assert_eq!(re_item["amount_fact"]["value"]["currency"], "CNY");
+    assert_eq!(re_item["amount_fact"]["value"]["amount_text"], "55.00");
+
+    // 4. api_manual_entry rejects invalid date/partial period UPFRONT leaving ZERO orphan sources
+    let count_before = ws_reentered["vault"]["source_count"].as_u64().unwrap();
+    let (st, bad_man) = api_json(
+        addr,
+        "POST",
+        "/api/manual-entry",
+        &token,
+        Some(json!({
+            "vendor": "OrphanTest",
+            "currency": "CNY",
+            "amount_text": "12.00",
+            "bill_date": "2026-02-31"
+        })),
+    );
+    assert_eq!(st, 400, "{bad_man}");
+    assert_eq!(bad_man["error"], "bad_bill_date");
+    let (st, bad_per) = api_json(
+        addr,
+        "POST",
+        "/api/manual-entry",
+        &token,
+        Some(json!({
+            "vendor": "OrphanTest2",
+            "currency": "CNY",
+            "amount_text": "12.00",
+            "period_start": "2026-05-01"
+        })),
+    );
+    assert_eq!(st, 400, "{bad_per}");
+    assert_eq!(bad_per["error"], "period_requires_both_bounds");
+    let (st, ws_check) = api_json(addr, "GET", "/api/workspace", &token, None);
+    assert_eq!(st, 200);
+    assert_eq!(
+        ws_check["vault"]["source_count"].as_u64().unwrap(),
+        count_before,
+        "failed manual entries must not leave orphan sources"
+    );
+
+    // 5. GB18030 HTML inline preview decodes to UTF-8 while ?download=1 stays byte-exact
+    let gbk_html_text = "<html><body><h1>中文账单</h1><p>实付金额：¥66.00</p></body></html>";
+    let (gbk_html_bytes, _, _) = encoding_rs::GB18030.encode(gbk_html_text);
+    let (st, imp_gbk) = api_json(
+        addr,
+        "POST",
+        "/api/import",
+        &token,
+        Some(json!({
+            "filename": "gbk-bill.html",
+            "content_base64": B64.encode(gbk_html_bytes.as_ref())
+        })),
+    );
+    assert_eq!(st, 200, "{imp_gbk}");
+    let gbk_sid = imp_gbk["result"]["source_id"].as_str().unwrap().to_string();
+    let (st, _, inline_raw) = http_call(
+        addr,
+        "GET",
+        &format!("/api/sources/{gbk_sid}/raw"),
+        Some(&token),
+        None,
+        None,
+    );
+    assert_eq!(st, 200);
+    assert!(String::from_utf8(inline_raw)
+        .expect("inline HTML preview must be UTF-8")
+        .contains("中文账单"));
+    let (st, _, dl_raw) = http_call(
+        addr,
+        "GET",
+        &format!("/api/sources/{gbk_sid}/raw?download=1"),
+        Some(&token),
+        None,
+        None,
+    );
+    assert_eq!(st, 200);
+    assert_eq!(dl_raw, gbk_html_bytes.as_ref());
+
+    // 6. Deeply nested HTML (250 nested <div>s) must not stack-overflow
+    let deep_html = format!(
+        "<html><body>{}<p>Amount paid: $19.99</p>{}</body></html>",
+        "<div>".repeat(250),
+        "</div>".repeat(250)
+    );
+    let (st, imp_deep) = api_json(
+        addr,
+        "POST",
+        "/api/import",
+        &token,
+        Some(json!({
+            "filename": "deep-nested.html",
+            "content_base64": B64.encode(deep_html.as_bytes())
+        })),
+    );
+    assert_eq!(st, 200, "{imp_deep}");
+
+    // 7. GBK Alipay CSV can be redacted in memory AND US MM/DD/YYYY row promotes without orphan failure
+    let gbk_csv_text = "支付宝交易记录明细查询\n账号:[secret.user@example.com]\n交易时间,交易对方,商品说明,收/支,金额,交易状态\n10/01/2026,AcmeCloud,Pro Plan,支出,88.00,交易成功\n";
+    let (gbk_csv_bytes, _, _) = encoding_rs::GB18030.encode(gbk_csv_text);
+    let (st, imp_csv) = api_json(
+        addr,
+        "POST",
+        "/api/import",
+        &token,
+        Some(json!({
+            "filename": "alipay-gbk.csv",
+            "content_base64": B64.encode(gbk_csv_bytes.as_ref())
+        })),
+    );
+    assert_eq!(st, 200, "{imp_csv}");
+    let csv_sid = imp_csv["result"]["source_id"].as_str().unwrap().to_string();
+
+    let (st, red_csv) = api_json(
+        addr,
+        "POST",
+        "/api/sources/redact",
+        &token,
+        Some(json!({ "source_id": csv_sid })),
+    );
+    assert_eq!(st, 200, "{red_csv}");
+    let red_csv_text = red_csv["redacted_text"].as_str().unwrap();
+    assert!(
+        !red_csv_text.contains("secret.user@example.com"),
+        "{red_csv_text}"
+    );
+    assert!(
+        red_csv_text.contains("支付宝交易记录明细查询"),
+        "{red_csv_text}"
+    );
+    assert!(
+        red_csv_text.contains("[REDACTED_FIELD_") || red_csv_text.contains("[REDACTED_EMAIL_"),
+        "{red_csv_text}"
+    );
+
+    let (st, prom_us) = api_json(
+        addr,
+        "POST",
+        "/api/csv/promote",
+        &token,
+        Some(json!({
+            "parent_source_id": csv_sid,
+            "row_number": 4,
+            "merchant": "AcmeCloud",
+            "description": "Pro Plan",
+            "date": "10/01/2026",
+            "currency": "CNY",
+            "amount_text": "88.00",
+            "billing_cycle": "monthly",
+            "direction": "expense",
+            "raw_line": "10/01/2026,AcmeCloud,Pro Plan,支出,88.00,交易成功"
+        })),
+    );
+    assert_eq!(st, 200, "{prom_us}");
+
+    server.stop();
+}
+
 fn extract_store_zip(bytes: &[u8], out_dir: &std::path::Path) {
     let mut pos = 0usize;
     while pos + 30 <= bytes.len() {

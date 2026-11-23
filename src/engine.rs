@@ -60,6 +60,7 @@ pub use decide::{
 pub(crate) use export::export_package_in_memory;
 pub use export::{export_copy, ExportRequest};
 pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
+pub(crate) use html::decode_html_bytes;
 pub use html::{submit_html, HtmlRequest};
 pub use pdf::{submit_pdf, PdfRequest};
 pub(crate) use redact::redact_vault_source_in_memory;
@@ -133,7 +134,6 @@ pub struct Hooks {
 
 struct HookRun {
     hooks: Hooks,
-    stop_reached: bool,
     inject_reached: bool,
 }
 
@@ -141,18 +141,12 @@ impl HookRun {
     fn new(hooks: Hooks) -> Self {
         Self {
             hooks,
-            stop_reached: false,
             inject_reached: false,
         }
     }
 
     fn stop(&mut self, point: &str, details: Map<String, Value>) -> Result<(), Fail> {
-        let requested = self.hooks.stop_at.as_deref() == Some(point);
-        stop_checkpoint(&self.hooks, point, details)?;
-        if requested {
-            self.stop_reached = true;
-        }
-        Ok(())
+        stop_checkpoint(&self.hooks, point, details)
     }
 
     /// Writes the witness when this point was requested. Does not decide the
@@ -253,7 +247,6 @@ struct Session {
     conn: Connection,
     _lock: VaultLock,
     magic: i64,
-    #[allow(dead_code)]
     vault_format: i64,
     protection: Option<ProtectionMode>,
     cipher: VaultCipher,
@@ -1599,7 +1592,6 @@ fn annotate_inner(req: AnnotateRequest) -> Result<Report, Fail> {
     })
 }
 
-#[allow(dead_code)]
 pub(crate) struct UnlockedVault {
     pub vault_id: String,
     pub vault_format: i64,
@@ -1607,7 +1599,6 @@ pub(crate) struct UnlockedVault {
     pub cipher: VaultCipher,
 }
 
-#[allow(dead_code)]
 pub(crate) fn unlock_vault_session(path: &Path, auth: &AuthInput) -> Result<UnlockedVault, Fail> {
     let session = open_real_session(path, auth)?;
     let vault_id = store::meta(&session.conn, "vault_id")
@@ -1621,17 +1612,274 @@ pub(crate) fn unlock_vault_session(path: &Path, auth: &AuthInput) -> Result<Unlo
     })
 }
 
-#[allow(dead_code)]
-pub(crate) fn list_annotations(
-    path: &Path,
-    auth: &AuthInput,
-) -> Result<Vec<store::SourceAnnotation>, Fail> {
-    let session = open_session_with_auth(path, auth)?;
-    store::list_annotations_with_cipher(&session.conn, &session.cipher)
-        .map_err(|err| unseen_db(err, "list_annotations"))
+pub(crate) struct WorkspaceRawData {
+    pub sources: Vec<Value>,
+    pub occurrences: Vec<Value>,
+    pub facts: Vec<Value>,
+    pub candidates: Vec<Value>,
+    pub annotations: Vec<store::SourceAnnotation>,
+    pub alerts: Vec<Value>,
 }
 
-#[allow(dead_code)]
+/// Single-connection read-only loader for the local workbench snapshot.
+/// Opens the vault once, batches facts/decisions/candidates, and avoids redundant
+/// full-disk decryption/hashing on routine UI refreshes (`verify_objects = false`).
+pub(crate) fn read_workspace_data(
+    path: &Path,
+    auth: &AuthInput,
+    verify_objects: bool,
+) -> Result<WorkspaceRawData, Fail> {
+    let (conn, version, protection, cipher) = open_readonly_unlocked(path, auth)?;
+    let source_rows = store::list_sources_with_cipher(&conn, &cipher)
+        .map_err(|err| unseen_db(err, "list_sources"))?;
+    let object_rows = store::list_objects_with_cipher(&conn, &cipher)
+        .map_err(|err| unseen_db(err, "list_objects"))?;
+    let occurrence_rows = store::list_occurrences_with_cipher(&conn, &cipher)
+        .map_err(|err| unseen_db(err, "list_occurrences"))?;
+    let annotations = store::list_annotations_with_cipher(&conn, &cipher)
+        .map_err(|err| unseen_db(err, "list_annotations"))?;
+
+    let obj_relpaths: std::collections::BTreeMap<&str, &str> = object_rows
+        .iter()
+        .map(|o| (o.object_id.as_str(), o.relpath.as_str()))
+        .collect();
+
+    let mut alerts: Vec<Value> = Vec::new();
+    let mut checked_objects: std::collections::BTreeMap<String, Option<bool>> =
+        std::collections::BTreeMap::new();
+    let mut sources = Vec::with_capacity(source_rows.len());
+
+    for src in &source_rows {
+        let intact_opt = if let Some(&cached) = checked_objects.get(&src.object_id) {
+            cached
+        } else if verify_objects {
+            let f = facts::object_facts_with_cipher(
+                path,
+                &src.object_id,
+                obj_relpaths.get(src.object_id.as_str()).copied(),
+                &src.content_sha256,
+                src.byte_length,
+                &cipher,
+            );
+            let res = if let Some(message) = &f.io_error {
+                alerts.push(json!({
+                    "code": "object_unreadable",
+                    "source_id": src.source_id,
+                    "object_id": src.object_id,
+                    "during": "hash_object",
+                    "os_error": message,
+                }));
+                None
+            } else if f.id_rejected {
+                alerts.push(json!({"code": "object_id_rejected", "source_id": src.source_id, "object_id": src.object_id}));
+                Some(false)
+            } else if f.missing {
+                alerts.push(json!({"code": "object_missing", "source_id": src.source_id, "object_id": src.object_id}));
+                Some(false)
+            } else if f.auth_error.is_some() {
+                alerts.push(json!({"code": "ciphertext_auth_failed", "source_id": src.source_id, "object_id": src.object_id, "detail": f.auth_error}));
+                Some(false)
+            } else if !f.hash_matches || !f.length_matches {
+                alerts.push(json!({"code": "hash_mismatch", "source_id": src.source_id, "object_id": src.object_id}));
+                Some(false)
+            } else {
+                Some(true)
+            };
+            checked_objects.insert(src.object_id.clone(), res);
+            res
+        } else {
+            let res = match canonical_object_relpath(&src.object_id) {
+                None => {
+                    alerts.push(json!({"code": "object_id_rejected", "source_id": src.source_id, "object_id": src.object_id}));
+                    Some(false)
+                }
+                Some(relpath) => match fs::metadata(path.join(&relpath)) {
+                    Ok(meta) if meta.is_file() => Some(true),
+                    Ok(_) => {
+                        alerts.push(json!({"code": "object_missing", "source_id": src.source_id, "object_id": src.object_id}));
+                        Some(false)
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        alerts.push(json!({"code": "object_missing", "source_id": src.source_id, "object_id": src.object_id}));
+                        Some(false)
+                    }
+                    Err(err) => {
+                        alerts.push(json!({
+                            "code": "object_unreadable",
+                            "source_id": src.source_id,
+                            "object_id": src.object_id,
+                            "os_error": err.to_string(),
+                        }));
+                        None
+                    }
+                },
+            };
+            checked_objects.insert(src.object_id.clone(), res);
+            res
+        };
+
+        let intact_val = match intact_opt {
+            Some(b) => json!(b),
+            None => Value::Null,
+        };
+        sources.push(json!({
+            "source_id": src.source_id,
+            "object_id": src.object_id,
+            "content_sha256": src.content_sha256,
+            "byte_length": src.byte_length,
+            "media_type": src.media_type,
+            "user_marker": src.user_marker,
+            "object_intact": intact_val,
+        }));
+    }
+
+    let occurrences: Vec<Value> = occurrence_rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "occurrence_id": row.occurrence_id,
+                "source_id": row.source_id,
+                "command_id": row.command_id,
+                "batch_id": row.batch_id,
+                "display_name": row.display_name,
+                "external_path": row.external_path,
+                "storage_reused": row.storage_reused,
+                "recorded_at": row.recorded_at,
+            })
+        })
+        .collect();
+
+    let facts = match decide::read_facts(&conn, version, None, None, &cipher, protection) {
+        Ok((_, body)) => body["facts"].as_array().cloned().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    let mut candidates = Vec::new();
+    if store::table_exists(&conn, "candidates").unwrap_or(false) {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.candidate_id, c.run_id, c.attempt_id, c.ordinal, c.kind, c.usable, \
+                 c.excerpt, c.value_json, c.locator_json, c.adopted, sv.source_id, sv.object_id, \
+                 sv.content_sha256, sv.role, sv.eml, r.status, sv.source_version_id \
+                 FROM candidates c \
+                 JOIN source_versions sv ON sv.source_version_id = c.source_version_id \
+                 JOIN extraction_runs r ON r.run_id = c.run_id \
+                 ORDER BY sv.source_id, c.ordinal",
+            )
+            .map_err(|err| unseen_db(err, "candidates"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, String>(16)?,
+                ))
+            })
+            .map_err(|err| unseen_db(err, "candidates"))?;
+        for row in rows {
+            let row = row.map_err(|err| unseen_db(err, "candidates"))?;
+            if checked_objects.get(&row.11).copied().flatten() == Some(false) {
+                continue;
+            }
+            let plain_sv_hash = cipher
+                .decrypt_field("source_versions", &row.16, "content_sha256", &row.12)
+                .map_err(|err| {
+                    crate::model::cipher_tamper_fail(err, "candidates")
+                        .extra("source_version_id", json!(row.16))
+                })?;
+            let plain_excerpt = cipher
+                .decrypt_field("candidates", &row.0, "excerpt", &row.6)
+                .map_err(|err| {
+                    crate::model::cipher_tamper_fail(err, "candidates")
+                        .extra("candidate_id", json!(row.0))
+                })?;
+            let plain_value_str = cipher
+                .decrypt_field("candidates", &row.0, "value_json", &row.7)
+                .map_err(|err| {
+                    crate::model::cipher_tamper_fail(err, "candidates")
+                        .extra("candidate_id", json!(row.0))
+                })?;
+            let plain_locator_str = cipher
+                .decrypt_field("candidates", &row.0, "locator_json", &row.8)
+                .map_err(|err| {
+                    crate::model::cipher_tamper_fail(err, "candidates")
+                        .extra("candidate_id", json!(row.0))
+                })?;
+            let Ok(value) = serde_json::from_str::<Value>(&plain_value_str) else {
+                continue;
+            };
+            let Ok(locator) = serde_json::from_str::<Value>(&plain_locator_str) else {
+                continue;
+            };
+            let mut item = json!({
+                "candidate_id": row.0,
+                "run_id": row.1,
+                "attempt_id": row.2,
+                "ordinal": row.3,
+                "kind": row.4,
+                "usable": row.5 == 1,
+                "excerpt": plain_excerpt,
+                "value": value,
+                "locator": locator,
+                "adopted": row.9 == 1,
+                "source_id": row.10,
+                "object_id": row.11,
+                "content_sha256": plain_sv_hash,
+                "role": row.13,
+                "eml": if row.14 == 0 { Value::Null } else { json!(true) },
+                "run_status": row.15,
+            });
+            if let Some(display) = item
+                .get("locator")
+                .and_then(|loc| loc.get("display_excerpt"))
+                .cloned()
+            {
+                if let Some(map) = item.as_object_mut() {
+                    map.insert("display_excerpt".into(), display);
+                }
+            }
+            candidates.push(item);
+        }
+    }
+
+    Ok(WorkspaceRawData {
+        sources,
+        occurrences,
+        facts,
+        candidates,
+        annotations,
+        alerts,
+    })
+}
+
+pub(crate) fn source_sha256(
+    path: &Path,
+    source_id: &str,
+    auth: &AuthInput,
+) -> Result<Option<String>, Fail> {
+    if !is_prefixed_id(source_id, "src_") {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
+    }
+    let (conn, _, _, cipher) = open_readonly_unlocked(path, auth)?;
+    let source = store::source_by_id_with_cipher(&conn, source_id, &cipher)
+        .map_err(|err| unseen_db(err, "source_lookup"))?;
+    Ok(source.map(|s| s.content_sha256))
+}
+
 pub(crate) fn read_source_bytes(
     path: &Path,
     source_id: &str,
@@ -1640,8 +1888,8 @@ pub(crate) fn read_source_bytes(
     if !is_prefixed_id(source_id, "src_") {
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
     }
-    let session = open_session_with_auth(path, auth)?;
-    let source = store::source_by_id_with_cipher(&session.conn, source_id, &session.cipher)
+    let (conn, _, _, cipher) = open_readonly_unlocked(path, auth)?;
+    let source = store::source_by_id_with_cipher(&conn, source_id, &cipher)
         .map_err(|err| unseen_db(err, "source_lookup"))?
         .ok_or_else(|| Fail::new(EXIT_REJECTED, "Rejected", "unknown_source"))?;
     let Some(relpath) = canonical_object_relpath(&source.object_id) else {
@@ -1651,9 +1899,8 @@ pub(crate) fn read_source_bytes(
             "object_id_rejected",
         ));
     };
-    let obj_path = session.root.join(&relpath);
-    let bytes = session
-        .cipher
+    let obj_path = path.join(&relpath);
+    let bytes = cipher
         .decrypt_object_to_vec(&source.object_id, &obj_path)
         .map_err(|err| match err {
             CryptoError::Io(io_err) => io_fail(io_err, "read_object"),
@@ -1668,18 +1915,14 @@ pub(crate) fn read_source_bytes(
             "hash_mismatch",
         ));
     }
-    let display_name = store::list_occurrences_with_cipher(&session.conn, &session.cipher)
-        .ok()
-        .and_then(|occs| {
-            occs.into_iter()
-                .find(|o| o.source_id == source.source_id)
-                .map(|o| o.display_name)
-        })
-        .unwrap_or_else(|| format!("{}.bin", source.source_id));
+    let display_name =
+        store::first_display_name_for_source_with_cipher(&conn, &source.source_id, &cipher)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| format!("{}.bin", source.source_id));
     Ok((bytes, source.media_type, display_name))
 }
 
-#[allow(dead_code)]
 pub(crate) fn delete_sources(
     path: &Path,
     source_ids: &[String],

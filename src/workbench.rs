@@ -1421,7 +1421,7 @@ fn api_import_demo_pack(state: &ServerState) -> HttpResponse {
         }
 
         drop(tmp_guard);
-        match build_workspace_snapshot(active) {
+        match build_workspace_snapshot(active, false) {
             Ok(snap) => HttpResponse::json(200, snap),
             Err(resp) => resp,
         }
@@ -1503,6 +1503,71 @@ fn api_manual_entry(req: &HttpRequest, state: &ServerState) -> HttpResponse {
     let Some(norm_cur) = crate::real_extract::normalize_currency(currency_raw) else {
         return HttpResponse::error(400, "bad_currency", "不支持该币种");
     };
+    if !matches!(
+        billing_cycle,
+        "monthly" | "yearly" | "quarterly" | "weekly" | "one_time" | "unknown"
+    ) {
+        return HttpResponse::error(400, "bad_billing_cycle", "计费周期选项无效");
+    }
+    if !matches!(
+        asset_kind.as_str(),
+        "subscription" | "license" | "hardware" | "reimbursable" | "general"
+    ) {
+        return HttpResponse::error(400, "bad_asset_kind", "资产类型选项无效");
+    }
+    if let Some(ref reimb) = reimburse_status {
+        if !matches!(
+            reimb.as_str(),
+            "none" | "pending" | "submitted" | "reimbursed"
+        ) {
+            return HttpResponse::error(400, "bad_reimburse_status", "报销状态选项无效");
+        }
+    }
+    let norm_bill_date = if bill_date.is_empty() {
+        None
+    } else {
+        let Some(d) = crate::real_extract::parse_date_token(bill_date) else {
+            return HttpResponse::error(
+                400,
+                "bad_bill_date",
+                "账单日期格式无效，请使用 YYYY-MM-DD",
+            );
+        };
+        Some(d)
+    };
+    let norm_warranty_end = match warranty_end {
+        None => None,
+        Some(ref raw) => {
+            let Some(d) = crate::real_extract::parse_date_token(raw) else {
+                return HttpResponse::error(
+                    400,
+                    "bad_warranty_end",
+                    "保修截止日期格式无效，请使用 YYYY-MM-DD",
+                );
+            };
+            Some(d)
+        }
+    };
+    let (norm_pstart, norm_pend) = match (period_start, period_end) {
+        (Some(ps), Some(pe)) => {
+            if parse_iso_days(&ps).is_none() || parse_iso_days(&pe).is_none() || ps > pe {
+                return HttpResponse::error(
+                    400,
+                    "bad_period",
+                    "服务周期日期无效或开始日期晚于结束日期",
+                );
+            }
+            (Some(ps), Some(pe))
+        }
+        (None, None) => (None, None),
+        _ => {
+            return HttpResponse::error(
+                400,
+                "period_requires_both_bounds",
+                "服务周期需同时填写开始日期与结束日期",
+            );
+        }
+    };
 
     with_active(state, |active| {
         let auth = active.auth();
@@ -1513,11 +1578,7 @@ fn api_manual_entry(req: &HttpRequest, state: &ServerState) -> HttpResponse {
         let display_name = sanitize_filename(&format!(
             "自录-{}-{}.txt",
             vendor,
-            if bill_date.is_empty() {
-                "记录"
-            } else {
-                bill_date
-            }
+            norm_bill_date.as_deref().unwrap_or("记录")
         ));
         let tmp_guard = match PrivateTempDir::create("man") {
             Ok(d) => d,
@@ -1549,8 +1610,8 @@ fn api_manual_entry(req: &HttpRequest, state: &ServerState) -> HttpResponse {
             source_id: source_id.clone(),
             currency: Some(norm_cur.to_string()),
             amount_text: Some(norm_amt),
-            period_start,
-            period_end,
+            period_start: norm_pstart,
+            period_end: norm_pend,
             actor_id: WORKBENCH_ACTOR_ID.into(),
             auth: auth.clone(),
         });
@@ -1578,18 +1639,14 @@ fn api_manual_entry(req: &HttpRequest, state: &ServerState) -> HttpResponse {
             } else {
                 Some(category.to_string())
             },
-            bill_date: if bill_date.is_empty() {
-                None
-            } else {
-                Some(bill_date.to_string())
-            },
+            bill_date: norm_bill_date,
             notes: if notes.is_empty() {
                 Some("用户手动直录（暂无商家原件）".into())
             } else {
                 Some(notes.to_string())
             },
             asset_kind: Some(asset_kind),
-            warranty_end,
+            warranty_end: norm_warranty_end,
             license_key,
             license_scope,
             reimburse_status,
@@ -1599,7 +1656,7 @@ fn api_manual_entry(req: &HttpRequest, state: &ServerState) -> HttpResponse {
             return map_engine_error(&ann);
         }
 
-        match build_workspace_snapshot(active) {
+        match build_workspace_snapshot(active, false) {
             Ok(mut snap) => {
                 if let Some(obj) = snap.as_object_mut() {
                     obj.insert("created_source_id".into(), json!(source_id));
@@ -1793,18 +1850,7 @@ fn png_chunk(chunk_type: &[u8; 4], data: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(chunk_type);
     out.extend_from_slice(data);
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in chunk_type.iter().chain(data.iter()) {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xEDB8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    out.extend_from_slice(&(!crc).to_be_bytes());
+    out.extend_from_slice(&crc32_slices(&[chunk_type, data]).to_be_bytes());
 }
 
 fn build_demo_receipt_png(date_iso: &str) -> Vec<u8> {
@@ -2096,7 +2142,12 @@ fn api_vault_unlock(req: &HttpRequest, state: &ServerState) -> HttpResponse {
     );
     remember_recent_vault(&vault_path);
 
-    api_workspace(state)
+    with_active(state, |active| {
+        match build_workspace_snapshot(active, true) {
+            Ok(snapshot) => HttpResponse::json(200, snapshot),
+            Err(resp) => resp,
+        }
+    })
 }
 
 fn api_vault_lock(state: &ServerState) -> HttpResponse {
@@ -2158,44 +2209,33 @@ fn api_rotate_passphrase(req: &HttpRequest, state: &ServerState) -> HttpResponse
 }
 
 fn api_workspace(state: &ServerState) -> HttpResponse {
-    with_active(state, |active| match build_workspace_snapshot(active) {
-        Ok(snapshot) => HttpResponse::json(200, snapshot),
-        Err(resp) => resp,
+    with_active(state, |active| {
+        match build_workspace_snapshot(active, false) {
+            Ok(snapshot) => HttpResponse::json(200, snapshot),
+            Err(resp) => resp,
+        }
     })
 }
 
-fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse> {
+fn build_workspace_snapshot(
+    active: &ActiveVault,
+    verify_objects: bool,
+) -> Result<Value, HttpResponse> {
     let auth = active.auth();
-    let open_rep = engine::open_vault(&active.path, auth.clone());
-    if open_rep.code != EXIT_OK && open_rep.code != 3 {
-        return Err(map_engine_error(&open_rep));
-    }
-    let facts_rep = engine::query_facts(&active.path, None, None, auth.clone());
-    let cands_rep = engine::query_candidates(&active.path, None, auth.clone());
-    let annotations = engine::list_annotations(&active.path, &auth)
+    let raw = engine::read_workspace_data(&active.path, &auth, verify_objects)
         .map_err(|f| map_engine_error(&f.into_report()))?;
 
-    let ann_map: BTreeMap<String, crate::store::SourceAnnotation> = annotations
+    let ann_map: BTreeMap<String, crate::store::SourceAnnotation> = raw
+        .annotations
         .into_iter()
         .map(|a| (a.source_id.clone(), a))
         .collect();
 
-    let sources = open_rep.body["sources"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let occurrences = open_rep.body["occurrences"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let facts = facts_rep.body["facts"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let candidates = cands_rep.body["candidates"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let sources = raw.sources;
+    let occurrences = raw.occurrences;
+    let facts = raw.facts;
+    let candidates = raw.candidates;
+    let alerts = raw.alerts;
 
     let mut occ_by_source: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for occ in occurrences {
@@ -2978,7 +3018,7 @@ fn build_workspace_snapshot(active: &ActiveVault) -> Result<Value, HttpResponse>
             "needs_entry_count": needs_entry_count,
             "csv_statement_count": csv_statement_count,
             "demo_count": demo_count,
-            "alerts": open_rep.body["alerts"],
+            "alerts": alerts,
         },
         "summary_by_currency": summary_by_currency,
         "asset_counts": {
@@ -3151,20 +3191,28 @@ fn api_csv_promote(req: &HttpRequest, state: &ServerState) -> HttpResponse {
     let Some(norm_cur) = crate::real_extract::normalize_currency(currency) else {
         return HttpResponse::error(400, "bad_currency", "该流水行币种不受支持");
     };
+    if !matches!(
+        billing_cycle,
+        "monthly" | "yearly" | "quarterly" | "weekly" | "one_time" | "unknown"
+    ) {
+        return HttpResponse::error(400, "bad_billing_cycle", "计费周期选项无效");
+    }
+    let norm_bill_date = if date.is_empty() {
+        None
+    } else {
+        crate::real_extract::parse_date_token(date)
+    };
 
     with_active(state, |active| {
         let auth = active.auth();
-        // Verify parent source exists and cite its SHA-256 verbatim
-        let open_rep = engine::open_vault(&active.path, auth.clone());
-        let parent_sha = open_rep.body["sources"]
-            .as_array()
-            .and_then(|arr| arr.iter().find(|s| s["source_id"] == parent_source_id))
-            .and_then(|s| s["content_sha256"].as_str())
-            .unwrap_or("")
-            .to_string();
-        if parent_sha.is_empty() {
-            return HttpResponse::error(404, "parent_not_found", "未找到对应的 CSV 源文件");
-        }
+        // Verify parent source exists and cite its SHA-256 verbatim (single-row lookup, no full open_vault)
+        let parent_sha = match engine::source_sha256(&active.path, parent_source_id, &auth) {
+            Ok(Some(sha)) => sha,
+            Ok(None) => {
+                return HttpResponse::error(404, "parent_not_found", "未找到对应的 CSV 源文件")
+            }
+            Err(fail) => return map_engine_error(&fail.into_report()),
+        };
 
         let receipt_text = format!(
             "SubVault CSV Row Evidence\nParent CSV Source: {parent_source_id}\nParent CSV SHA-256: {parent_sha}\nCSV Row: {row_number}\nDate: {date}\nMerchant: {merchant}\nDescription: {description}\nCurrency: {norm_cur}\nAmount: {norm_amt}\nRaw CSV Line: {raw_line}\n"
@@ -3236,11 +3284,7 @@ fn api_csv_promote(req: &HttpRequest, state: &ServerState) -> HttpResponse {
                 account_label,
                 billing_cycle: Some(billing_cycle.to_string()),
                 category,
-                bill_date: if date.is_empty() {
-                    None
-                } else {
-                    Some(date.to_string())
-                },
+                bill_date: norm_bill_date,
                 notes: Some(format!(
                     "源自 CSV 流水第 {row_number} 行（{parent_source_id}）"
                 )),
@@ -3313,10 +3357,10 @@ fn api_source_save(req: &HttpRequest, state: &ServerState) -> HttpResponse {
         };
         let norm_cur = match incoming_cur {
             Some(raw_cur) => match crate::real_extract::normalize_currency(raw_cur) {
-                Some(c) => c,
+                Some(c) => Some(c),
                 None => return HttpResponse::error(400, "bad_currency", "不支持的币种代码"),
             },
-            None => "USD",
+            None => None,
         };
         Some((norm_cur, norm_amt))
     } else {
@@ -3419,10 +3463,11 @@ fn api_source_save(req: &HttpRequest, state: &ServerState) -> HttpResponse {
             .iter()
             .find(|f| f["fact_type"] == "stated_service_period");
 
-        if let Some((norm_cur, norm_amt)) = validated_amount {
+        if let Some((opt_cur, norm_amt)) = validated_amount {
             if let Some(fact) = existing_amt_fact {
                 let cur_amt = fact["value"]["amount_text"].as_str().unwrap_or("");
                 let cur_code = fact["value"]["currency"].as_str().unwrap_or("USD");
+                let norm_cur = opt_cur.unwrap_or(cur_code);
                 if cur_amt != norm_amt || cur_code != norm_cur {
                     let fact_id = fact["fact_id"].as_str().unwrap_or("").to_string();
                     let rev = fact["revision"].as_i64().unwrap_or(1).to_string();
@@ -3443,6 +3488,7 @@ fn api_source_save(req: &HttpRequest, state: &ServerState) -> HttpResponse {
                     }
                 }
             } else {
+                let norm_cur = opt_cur.unwrap_or("USD");
                 let cmd_id = ids::random_id("manf_").unwrap_or_else(|_| "manf_1".into());
                 let rec = engine::record_manual_fact(engine::ManualFactRequest {
                     vault: active.path.clone(),
@@ -3486,7 +3532,7 @@ fn api_source_save(req: &HttpRequest, state: &ServerState) -> HttpResponse {
             }
         }
 
-        match build_workspace_snapshot(active) {
+        match build_workspace_snapshot(active, false) {
             Ok(snap) => HttpResponse::json(200, snap),
             Err(resp) => resp,
         }
@@ -3535,7 +3581,7 @@ fn api_source_reimburse(req: &HttpRequest, state: &ServerState) -> HttpResponse 
         if rep.code != EXIT_OK {
             return map_engine_error(&rep);
         }
-        match build_workspace_snapshot(active) {
+        match build_workspace_snapshot(active, false) {
             Ok(snap) => HttpResponse::json(200, snap),
             Err(resp) => resp,
         }
@@ -3544,30 +3590,45 @@ fn api_source_reimburse(req: &HttpRequest, state: &ServerState) -> HttpResponse 
 
 fn api_clear_demo_pack(state: &ServerState) -> HttpResponse {
     with_active(state, |active| {
-        let snap = match build_workspace_snapshot(active) {
-            Ok(s) => s,
-            Err(resp) => return resp,
+        let auth = active.auth();
+        let raw = match engine::read_workspace_data(&active.path, &auth, false) {
+            Ok(r) => r,
+            Err(fail) => return map_engine_error(&fail.into_report()),
         };
-        let demo_ids: Vec<String> = snap["items"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter(|it| it["is_demo"] == json!(true))
-                    .filter_map(|it| it["source_id"].as_str().map(str::to_string))
-                    .collect()
+        let mut occ_by_src: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+        for occ in &raw.occurrences {
+            if let Some(sid) = occ["source_id"].as_str() {
+                occ_by_src.entry(sid).or_default().push(occ.clone());
+            }
+        }
+        let demo_ids: Vec<String> = raw
+            .sources
+            .iter()
+            .filter_map(|s| {
+                let sid = s["source_id"].as_str()?;
+                let occs = occ_by_src.get(sid).map(Vec::as_slice).unwrap_or(&[]);
+                let display_name = occs
+                    .first()
+                    .and_then(|o| o["display_name"].as_str())
+                    .unwrap_or("");
+                if is_demo_source(display_name, occs) {
+                    Some(sid.to_string())
+                } else {
+                    None
+                }
             })
-            .unwrap_or_default();
+            .collect();
 
         let removed = if demo_ids.is_empty() {
             0
         } else {
-            match engine::delete_sources(&active.path, &demo_ids, &active.auth()) {
+            match engine::delete_sources(&active.path, &demo_ids, &auth) {
                 Ok(n) => n,
                 Err(fail) => return map_engine_error(&fail.into_report()),
             }
         };
 
-        match build_workspace_snapshot(active) {
+        match build_workspace_snapshot(active, false) {
             Ok(mut updated) => {
                 if let Some(obj) = updated.as_object_mut() {
                     obj.insert("removed_count".into(), json!(removed));
@@ -3593,7 +3654,7 @@ fn api_source_delete(req: &HttpRequest, state: &ServerState) -> HttpResponse {
             Ok(n) => n,
             Err(fail) => return map_engine_error(&fail.into_report()),
         };
-        match build_workspace_snapshot(active) {
+        match build_workspace_snapshot(active, false) {
             Ok(mut updated) => {
                 if let Some(obj) = updated.as_object_mut() {
                     obj.insert("removed_count".into(), json!(removed));
@@ -3638,7 +3699,7 @@ fn api_fact_undo(req: &HttpRequest, state: &ServerState) -> HttpResponse {
         if rep.code != EXIT_OK {
             return map_engine_error(&rep);
         }
-        match build_workspace_snapshot(active) {
+        match build_workspace_snapshot(active, false) {
             Ok(snap) => HttpResponse::json(200, snap),
             Err(resp) => resp,
         }
@@ -3741,7 +3802,17 @@ fn api_source_raw(req: &HttpRequest, state: &ServerState, source_id: &str) -> Ht
                         ),
                     }
                 };
-                let mut resp = HttpResponse::ok_bytes(&content_type, bytes);
+                let body_bytes = if !download
+                    && content_type == "text/html; charset=utf-8"
+                    && std::str::from_utf8(&bytes).is_err()
+                {
+                    engine::decode_html_bytes(&bytes, true)
+                        .map(|(decoded, _)| decoded.into_bytes())
+                        .unwrap_or(bytes)
+                } else {
+                    bytes
+                };
+                let mut resp = HttpResponse::ok_bytes(&content_type, body_bytes);
                 if let Some(policy) = csp {
                     resp = resp.with_header("Content-Security-Policy", policy);
                 }
@@ -3884,7 +3955,7 @@ fn api_export_csv(state: &ServerState) -> HttpResponse {
 }
 
 fn build_excel_csv_bytes(active: &ActiveVault) -> Result<Vec<u8>, HttpResponse> {
-    let snap = build_workspace_snapshot(active)?;
+    let snap = build_workspace_snapshot(active, false)?;
     // Note: Raw license_key is deliberately omitted from plain Excel CSV exports for security.
     let mut out = String::from("\u{FEFF}资产类型,商家/服务,项目/套餐,归属账号,计费周期,分类,币种,金额,账单日期,服务开始,服务结束,保修截止,报销状态,授权范围,原件文件名,重复导入次数,原件SHA256,备注\n");
     if let Some(items) = snap["items"].as_array() {
@@ -3946,15 +4017,36 @@ fn build_excel_csv_bytes(active: &ActiveVault) -> Result<Vec<u8>, HttpResponse> 
     Ok(out.into_bytes())
 }
 
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push(comp.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn path_is_inside_vault(vault: &Path, target: &Path) -> bool {
-    let vault_abs = fs::canonicalize(vault).unwrap_or_else(|_| vault.to_path_buf());
-    let mut probe = if target.is_absolute() {
+    let vault_abs = fs::canonicalize(vault).unwrap_or_else(|_| lexical_normalize(vault));
+    let vault_id = crate::platform::directory_id(vault).ok();
+    let raw_abs = if target.is_absolute() {
         target.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(target)
     };
+    let mut probe = lexical_normalize(&raw_abs);
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
     while !probe.exists() {
         let Some(name) = probe.file_name() else {
@@ -3965,6 +4057,18 @@ fn path_is_inside_vault(vault: &Path, target: &Path) -> bool {
             break;
         };
         probe = parent.to_path_buf();
+    }
+    if let Some(vid) = vault_id {
+        let mut anc = probe.as_path();
+        loop {
+            if crate::platform::directory_id(anc).ok() == Some(vid) {
+                return true;
+            }
+            match anc.parent() {
+                Some(p) if p != anc => anc = p,
+                _ => break,
+            }
+        }
     }
     let mut resolved = fs::canonicalize(&probe).unwrap_or(probe);
     for seg in suffix.into_iter().rev() {
@@ -4111,16 +4215,22 @@ fn api_verify_package(req: &HttpRequest) -> HttpResponse {
 
 // --- Pure-Rust Minimal Store ZIP Builder (CRC32, zero extra crates) ---
 
-fn crc32(data: &[u8]) -> u32 {
+fn crc32_slices(slices: &[&[u8]]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+    for slice in slices {
+        for &byte in *slice {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
         }
     }
     !crc
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    crc32_slices(&[data])
 }
 
 fn build_store_zip(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, HttpResponse> {
@@ -4226,8 +4336,27 @@ fn map_engine_error(report: &Report) -> HttpResponse {
         "requires_format_6" => (400, "该文件夹是旧版测试账本，请新建正式本地账本使用"),
         "invalid_pdf_header" => (400, "该文件不是有效的 PDF 文件"),
         "invalid_utf8" => (400, "该 HTML/文本文件不是有效的 UTF-8 编码"),
+        "empty_pdf" | "empty_html" | "empty_csv" | "empty_fragment" => {
+            (400, "文件内容为空，无法导入")
+        }
+        "bad_display_name" => (400, "文件名包含不支持的字符或长度超限"),
+        "bad_bill_date" => (400, "账单日期格式无效，请使用 YYYY-MM-DD"),
+        "bad_warranty_end" => (400, "保修截止日期格式无效，请使用 YYYY-MM-DD"),
+        "bad_billing_cycle" => (400, "计费周期选项无效"),
+        "bad_asset_kind" => (400, "资产类型选项无效"),
+        "bad_reimburse_status" => (400, "报销状态选项无效"),
+        "period_rejected" | "period_requires_both_bounds" => {
+            (400, "服务周期日期无效或缺少开始/结束日期")
+        }
+        "amount_text_rejected" => (400, "金额格式不正确，例如 29.99 或 98"),
+        "bad_currency" => (400, "不支持该币种代码"),
+        "unknown_source" => (404, "未找到对应的账单记录"),
+        "network_filesystem" => (400, "不支持在网络共享盘上直接打开账本，请先复制到本机磁盘"),
         "over_input_budget" => (413, "文件体积超出单文件安全上限"),
         "revision_conflict" | "successor_conflict" => (409, "该记录刚刚已被修改，请刷新后重试"),
+        "object_missing" | "hash_mismatch" => {
+            (500, "检测到账本原件缺失或哈希校验不通过，请核查磁盘备份")
+        }
         "ciphertext_auth_failed" => (500, "检测到账本文件被篡改或损坏，已拒绝读取以保护安全"),
         _ => (400, "操作未能完成"),
     };
@@ -4242,7 +4371,19 @@ fn map_engine_error(report: &Report) -> HttpResponse {
     )
 }
 
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn sanitize_filename(raw: &str) -> String {
+    const MAX_FILENAME_BYTES: usize = 190;
     let base = Path::new(raw)
         .file_name()
         .and_then(|n| n.to_str())
@@ -4252,17 +4393,42 @@ fn sanitize_filename(raw: &str) -> String {
         .filter(|&c| {
             !c.is_control() && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
         })
-        .take(160)
         .collect();
     let trimmed = cleaned.trim_end_matches(['.', ' ']);
-    if trimmed.is_empty()
-        || trimmed == "."
-        || trimmed == ".."
-        || ids::is_windows_reserved_name(trimmed)
+    let bounded = if trimmed.len() <= MAX_FILENAME_BYTES {
+        trimmed.to_string()
+    } else if let Some(dot) = trimmed.rfind('.') {
+        let ext = &trimmed[dot..];
+        let ext_ok = dot > 0
+            && ext.len() >= 2
+            && ext.len() <= 16
+            && ext[1..].bytes().all(|b| b.is_ascii_alphanumeric());
+        if ext_ok {
+            let max_stem = MAX_FILENAME_BYTES.saturating_sub(ext.len());
+            let stem = truncate_utf8_bytes(&trimmed[..dot], max_stem).trim_end_matches(['.', ' ']);
+            if stem.is_empty() {
+                format!("bill{ext}")
+            } else {
+                format!("{stem}{ext}")
+            }
+        } else {
+            truncate_utf8_bytes(trimmed, MAX_FILENAME_BYTES)
+                .trim_end_matches(['.', ' '])
+                .to_string()
+        }
+    } else {
+        truncate_utf8_bytes(trimmed, MAX_FILENAME_BYTES)
+            .trim_end_matches(['.', ' '])
+            .to_string()
+    };
+    if bounded.is_empty()
+        || bounded == "."
+        || bounded == ".."
+        || ids::is_windows_reserved_name(&bounded)
     {
         "bill.bin".to_string()
     } else {
-        trimmed.to_string()
+        bounded
     }
 }
 

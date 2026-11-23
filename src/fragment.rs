@@ -1505,11 +1505,13 @@ pub(super) fn read_candidates(
             );
             let ok = hosted_facts_ok(&facts).is_ok();
             if !ok {
-                damaged = facts.missing
-                    || facts.auth_error.is_some()
-                    || !facts.hash_matches
-                    || !facts.length_matches
-                    || facts.id_rejected;
+                if facts.io_error.is_none() {
+                    damaged |= facts.missing
+                        || facts.auth_error.is_some()
+                        || !facts.hash_matches
+                        || !facts.length_matches
+                        || facts.id_rejected;
+                }
                 alerts.push(json!({
                     "code": if facts.io_error.is_some() {
                         "object_unreadable"
@@ -2344,8 +2346,8 @@ fn classify_external(path: &Path) -> External {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => External::Missing,
         Err(err) => External::Unreadable(err.to_string()),
         Ok(meta) if !meta.file_type().is_file() => External::Unreadable("not a file".into()),
-        Ok(_) => match fs::read(path) {
-            Ok(bytes) => External::Hash(sha256_bytes(&bytes)),
+        Ok(_) => match crate::fsutil::sha256_file(path) {
+            Ok((hash, _)) => External::Hash(hash),
             Err(err) => External::Unreadable(err.to_string()),
         },
     }

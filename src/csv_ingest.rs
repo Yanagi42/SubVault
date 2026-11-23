@@ -177,11 +177,19 @@ fn read_csv(path: &Path) -> Result<Vec<u8>, Fail> {
             .extra("preservation", json!(NOT_PRESERVED))
             .extra("new_effect", json!(false)));
     }
-    let mut file = File::open(path)
+    let file = File::open(path)
         .map_err(|err| io_fail(err, "csv_read").extra("preservation", json!(NOT_PRESERVED)))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    file.take(MAX_CSV_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|err| io_fail(err, "csv_read").extra("preservation", json!(NOT_PRESERVED)))?;
+    if bytes.len() as u64 > MAX_CSV_BYTES {
+        return Err(Fail::new(EXIT_REJECTED, "Rejected", "over_input_budget")
+            .extra("bytes_read", json!(bytes.len()))
+            .extra("limit", json!(MAX_CSV_BYTES))
+            .extra("preservation", json!(NOT_PRESERVED))
+            .extra("new_effect", json!(false)));
+    }
     Ok(bytes)
 }
 
@@ -464,8 +472,8 @@ fn replay(
     };
     map.insert("new_effect".into(), json!(false));
     map.insert("command_id".into(), json!(req.command_id));
-    match fs::read(&req.source) {
-        Ok(bytes) if sha256_bytes(&bytes) == hash => {
+    match crate::fsutil::sha256_file(&req.source) {
+        Ok((actual_hash, _)) if actual_hash == hash => {
             map.insert("payload_matches".into(), json!(true));
             map.insert("external_reread".into(), json!(true));
         }

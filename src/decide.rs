@@ -319,9 +319,150 @@ pub(super) fn read_facts(
             ))
         })
         .map_err(|err| unseen_db(err, "facts"))?;
-    let mut facts = Vec::new();
+    let mut raw_facts = Vec::new();
     for row in rows {
-        let row = row.map_err(|err| unseen_db(err, "facts"))?;
+        raw_facts.push(row.map_err(|err| unseen_db(err, "facts"))?);
+    }
+    drop(stmt);
+
+    // Batch-load all anchored candidates and decision histories in 2 queries instead of 2N.
+    let mut anchors: std::collections::BTreeMap<String, (String, Value)> =
+        std::collections::BTreeMap::new();
+    {
+        let mut c_stmt = conn
+            .prepare(
+                "SELECT DISTINCT c.candidate_id, c.excerpt, c.locator_json, c.kind, sv.source_id \
+                 FROM facts f \
+                 JOIN candidates c ON c.candidate_id = f.candidate_id \
+                 JOIN source_versions sv ON sv.source_version_id = c.source_version_id \
+                 WHERE (?1 IS NULL OR f.source_id = ?1) AND (?2 IS NULL OR f.fact_id = ?2)",
+            )
+            .map_err(|err| unseen_db(err, "fact_anchor"))?;
+        let c_rows = c_stmt
+            .query_map(params![source_id, fact_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|err| unseen_db(err, "fact_anchor"))?;
+        for c_row in c_rows {
+            let (cand_id, stored_excerpt, stored_locator_json, kind, anchored_source) =
+                c_row.map_err(|err| unseen_db(err, "fact_anchor"))?;
+            let excerpt = cipher
+                .decrypt_field("candidates", &cand_id, "excerpt", &stored_excerpt)
+                .map_err(|err| {
+                    cipher_tamper_fail(err, "fact_anchor").extra("candidate_id", json!(cand_id))
+                })?;
+            let locator_json = cipher
+                .decrypt_field("candidates", &cand_id, "locator_json", &stored_locator_json)
+                .map_err(|err| {
+                    cipher_tamper_fail(err, "fact_anchor").extra("candidate_id", json!(cand_id))
+                })?;
+            let locator: Value = serde_json::from_str(&locator_json).map_err(|_| {
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "locator_unreadable")
+                    .extra("candidate_id", json!(cand_id))
+                    .extra("new_effect", json!(false))
+            })?;
+            let mut anchor = json!({
+                "candidate_id": cand_id,
+                "kind": kind,
+                "excerpt": excerpt,
+                "locator": locator
+            });
+            if let Some(display) = anchor
+                .get("locator")
+                .and_then(|item| item.get("display_excerpt"))
+                .cloned()
+            {
+                if let Some(map) = anchor.as_object_mut() {
+                    map.insert("display_excerpt".into(), display);
+                }
+            }
+            if let Some(version) = anchor
+                .get("locator")
+                .and_then(|item| item.get("display_version"))
+                .filter(|item| item.is_string())
+                .cloned()
+            {
+                if let Some(map) = anchor.as_object_mut() {
+                    map.insert("display_version".into(), version);
+                }
+            }
+            anchors.insert(cand_id, (anchored_source, anchor));
+        }
+    }
+
+    let mut decisions_by_fact: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
+    {
+        let mut d_stmt = conn
+            .prepare(
+                "SELECT d.fact_id, d.decision_id, d.command_id, d.candidate_id, d.slot, d.kind, \
+                 d.actor_kind, d.actor_id, d.recorded_at, d.rule_version, d.prior_value_json, \
+                 d.new_value_json, d.target_decision_id \
+                 FROM decisions d \
+                 JOIN facts f ON f.fact_id = d.fact_id \
+                 WHERE (?1 IS NULL OR f.source_id = ?1) AND (?2 IS NULL OR f.fact_id = ?2) \
+                 ORDER BY d.rowid",
+            )
+            .map_err(|err| unseen_db(err, "decisions"))?;
+        let d_rows = d_stmt
+            .query_map(params![source_id, fact_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                ))
+            })
+            .map_err(|err| unseen_db(err, "decisions"))?;
+        for d_row in d_rows {
+            let row = d_row.map_err(|err| unseen_db(err, "decisions"))?;
+            let plain_prior = cipher
+                .decrypt_opt_field("decisions", &row.1, "prior_value_json", row.10.as_deref())
+                .map_err(|err| {
+                    cipher_tamper_fail(err, "decisions").extra("decision_id", json!(row.1))
+                })?;
+            let plain_new = cipher
+                .decrypt_field("decisions", &row.1, "new_value_json", &row.11)
+                .map_err(|err| {
+                    cipher_tamper_fail(err, "decisions").extra("decision_id", json!(row.1))
+                })?;
+            let prior =
+                parse_optional_object(plain_prior.as_deref(), "prior_value_unreadable", &row.1)?;
+            let new_value = parse_object(&plain_new, "new_value_unreadable", &row.1)?;
+            decisions_by_fact.entry(row.0).or_default().push(json!({
+                "decision_id": row.1,
+                "command_id": row.2,
+                "candidate_id": row.3,
+                "slot": row.4,
+                "kind": row.5,
+                "actor_kind": row.6,
+                "actor_id": row.7,
+                "recorded_at": row.8,
+                "rule_version": row.9,
+                "prior_value": prior,
+                "new_value": new_value,
+                "target_decision_id": row.12
+            }));
+        }
+    }
+
+    let mut facts = Vec::with_capacity(raw_facts.len());
+    for row in raw_facts {
         let plain_value_json = cipher
             .decrypt_field("facts", &row.0, "value_json", &row.6)
             .map_err(|err| cipher_tamper_fail(err, "fact_value").extra("fact_id", json!(row.0)))?;
@@ -337,8 +478,21 @@ pub(super) fn read_facts(
                     .extra("new_effect", json!(false)),
             );
         }
-        let locator = candidate_anchor(conn, &row.4, &row.1, cipher)?;
-        let decisions = decision_history(conn, &row.0, cipher)?;
+        let Some((anchored_source, locator)) = anchors.get(&row.4) else {
+            return Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_anchor_missing")
+                    .extra("candidate_id", json!(row.4))
+                    .extra("new_effect", json!(false)),
+            );
+        };
+        if anchored_source != &row.1 {
+            return Err(
+                Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_anchor_mismatch")
+                    .extra("candidate_id", json!(row.4))
+                    .extra("new_effect", json!(false)),
+            );
+        }
+        let decisions = decisions_by_fact.remove(&row.0).unwrap_or_default();
         facts.push(json!({
             "fact_id": row.0,
             "source_id": row.1,
@@ -354,7 +508,7 @@ pub(super) fn read_facts(
             "purchase_id": Value::Null,
             "account_id": Value::Null,
             "payment_verified": false,
-            "locator": locator,
+            "locator": locator.clone(),
             "decisions": decisions
         }));
     }
@@ -373,151 +527,6 @@ pub(super) fn read_facts(
     body.insert("facts".into(), Value::Array(facts));
     apply_format_honesty(&mut body, version, protection);
     Ok((EXIT_OK, Value::Object(body)))
-}
-
-fn candidate_anchor(
-    conn: &Connection,
-    candidate_id: &str,
-    source_id: &str,
-    cipher: &VaultCipher,
-) -> Result<Value, Fail> {
-    let found = conn
-        .query_row(
-            "SELECT c.excerpt, c.locator_json, c.kind, sv.source_id FROM candidates c JOIN source_versions sv ON sv.source_version_id = c.source_version_id WHERE c.candidate_id = ?1",
-            [candidate_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|err| unseen_db(err, "fact_anchor"))?;
-    let Some((stored_excerpt, stored_locator_json, kind, anchored_source)) = found else {
-        return Err(
-            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_anchor_missing")
-                .extra("candidate_id", json!(candidate_id))
-                .extra("new_effect", json!(false)),
-        );
-    };
-    if anchored_source != source_id {
-        return Err(
-            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "fact_anchor_mismatch")
-                .extra("candidate_id", json!(candidate_id))
-                .extra("new_effect", json!(false)),
-        );
-    }
-    let excerpt = cipher
-        .decrypt_field("candidates", candidate_id, "excerpt", &stored_excerpt)
-        .map_err(|err| {
-            cipher_tamper_fail(err, "fact_anchor").extra("candidate_id", json!(candidate_id))
-        })?;
-    let locator_json = cipher
-        .decrypt_field(
-            "candidates",
-            candidate_id,
-            "locator_json",
-            &stored_locator_json,
-        )
-        .map_err(|err| {
-            cipher_tamper_fail(err, "fact_anchor").extra("candidate_id", json!(candidate_id))
-        })?;
-    let locator: Value = serde_json::from_str(&locator_json).map_err(|_| {
-        Fail::new(EXIT_RECOVERY, "RecoveryRequired", "locator_unreadable")
-            .extra("candidate_id", json!(candidate_id))
-            .extra("new_effect", json!(false))
-    })?;
-    let mut anchor = json!({
-        "candidate_id": candidate_id,
-        "kind": kind,
-        "excerpt": excerpt,
-        "locator": locator
-    });
-    if let Some(display) = anchor
-        .get("locator")
-        .and_then(|item| item.get("display_excerpt"))
-        .cloned()
-    {
-        if let Some(map) = anchor.as_object_mut() {
-            map.insert("display_excerpt".into(), display);
-        }
-    }
-    if let Some(version) = anchor
-        .get("locator")
-        .and_then(|item| item.get("display_version"))
-        .filter(|item| item.is_string())
-        .cloned()
-    {
-        if let Some(map) = anchor.as_object_mut() {
-            map.insert("display_version".into(), version);
-        }
-    }
-    Ok(anchor)
-}
-
-fn decision_history(
-    conn: &Connection,
-    fact_id: &str,
-    cipher: &VaultCipher,
-) -> Result<Vec<Value>, Fail> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT decision_id, command_id, candidate_id, slot, kind, actor_kind, actor_id, recorded_at, rule_version, prior_value_json, new_value_json, target_decision_id FROM decisions WHERE fact_id = ?1 ORDER BY rowid",
-        )
-        .map_err(|err| unseen_db(err, "decisions"))?;
-    let rows = stmt
-        .query_map([fact_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, String>(10)?,
-                row.get::<_, Option<String>>(11)?,
-            ))
-        })
-        .map_err(|err| unseen_db(err, "decisions"))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let row = row.map_err(|err| unseen_db(err, "decisions"))?;
-        let plain_prior = cipher
-            .decrypt_opt_field("decisions", &row.0, "prior_value_json", row.9.as_deref())
-            .map_err(|err| {
-                cipher_tamper_fail(err, "decisions").extra("decision_id", json!(row.0))
-            })?;
-        let plain_new = cipher
-            .decrypt_field("decisions", &row.0, "new_value_json", &row.10)
-            .map_err(|err| {
-                cipher_tamper_fail(err, "decisions").extra("decision_id", json!(row.0))
-            })?;
-        let prior =
-            parse_optional_object(plain_prior.as_deref(), "prior_value_unreadable", &row.0)?;
-        let new_value = parse_object(&plain_new, "new_value_unreadable", &row.0)?;
-        out.push(json!({
-            "decision_id": row.0,
-            "command_id": row.1,
-            "candidate_id": row.2,
-            "slot": row.3,
-            "kind": row.4,
-            "actor_kind": row.5,
-            "actor_id": row.6,
-            "recorded_at": row.7,
-            "rule_version": row.8,
-            "prior_value": prior,
-            "new_value": new_value,
-            "target_decision_id": row.11
-        }));
-    }
-    Ok(out)
 }
 
 fn parse_object(text: &str, reason: &'static str, decision_id: &str) -> Result<Value, Fail> {
@@ -1129,6 +1138,9 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
         return Err(rejected("command_race"));
     }
     let mut value = fact.value.clone();
+    if value.get("statement").and_then(Value::as_str) == Some("unknown") {
+        value.insert("statement".into(), json!("user_entered"));
+    }
     value.insert("currency".into(), json!(effective_currency));
     value.insert("amount_text".into(), json!(normalized_amount));
     let new_json = Value::Object(value).to_string();

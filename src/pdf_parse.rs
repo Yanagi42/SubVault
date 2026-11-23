@@ -23,6 +23,7 @@ const MAX_STREAM_DECOMPRESSED: usize = 1024 * 1024;
 const MAX_TOTAL_DECOMPRESSED: usize = 4 * 1024 * 1024;
 const MAX_PAGES: usize = 256;
 const MAX_LINE_BYTES: usize = 1024;
+const MAX_RELAXED_LINE_BYTES: usize = 4096;
 const MAX_CANDIDATES: usize = 64;
 const MAX_XOBJECT_DEPTH: usize = 8;
 const MAX_GS_DEPTH: usize = 128;
@@ -100,7 +101,7 @@ pub fn has_valid_pdf_envelope(bytes: &[u8]) -> bool {
 pub fn extract_pages_for_redaction(
     bytes: &[u8],
 ) -> Result<Vec<(usize, Vec<String>)>, &'static str> {
-    let pages = extract_all_pages(bytes).map_err(|(reason, _)| reason)?;
+    let pages = extract_all_pages(bytes, true).map_err(|(reason, _)| reason)?;
     Ok(pages
         .into_iter()
         .map(|page| (page.page_num, page.lines))
@@ -108,16 +109,47 @@ pub fn extract_pages_for_redaction(
 }
 
 pub fn extract(bytes: &[u8]) -> PdfExtraction {
-    let pages = match extract_all_pages(bytes) {
+    let pages = match extract_all_pages(bytes, false) {
         Ok(pages) => pages,
         Err((reason, page_count)) => return unsupported(reason, page_count),
     };
+    classify_extracted_pages(&pages)
+}
+
+pub(crate) type PdfPageLines = Vec<(usize, Vec<String>)>;
+
+/// Parses and decompresses a PDF once, returning both the strict Format 5 extraction
+/// and the page lines (with relaxed line-length capping) for Format 6 real extraction.
+pub(crate) fn extract_strict_and_pages(
+    bytes: &[u8],
+) -> (PdfExtraction, Result<PdfPageLines, &'static str>) {
+    match extract_all_pages(bytes, true) {
+        Err((reason, page_count)) => (unsupported(reason, page_count), Err(reason)),
+        Ok(pages) => {
+            let strict = if pages
+                .iter()
+                .any(|p| p.lines.iter().any(|l| l.len() > MAX_LINE_BYTES))
+            {
+                unsupported("line_over_budget", pages.len())
+            } else {
+                classify_extracted_pages(&pages)
+            };
+            let plain_pages = pages
+                .into_iter()
+                .map(|page| (page.page_num, page.lines))
+                .collect();
+            (strict, Ok(plain_pages))
+        }
+    }
+}
+
+fn classify_extracted_pages(pages: &[ExtractedPage]) -> PdfExtraction {
     let page_count = pages.len();
     let mut lines = Vec::new();
 
     for page in pages {
         let mut page_stream_offset = 0usize;
-        for (idx, text) in page.lines.into_iter().enumerate() {
+        for (idx, text) in page.lines.iter().enumerate() {
             let byte_start = page_stream_offset;
             let byte_end = byte_start + text.len();
             page_stream_offset = byte_end + 1;
@@ -125,7 +157,7 @@ pub fn extract(bytes: &[u8]) -> PdfExtraction {
                 page: page.page_num,
                 line_no: idx + 1,
                 stream_object: page.stream_object,
-                text,
+                text: text.clone(),
                 byte_start,
                 byte_end,
             });
@@ -135,7 +167,10 @@ pub fn extract(bytes: &[u8]) -> PdfExtraction {
     classify_lines(&lines, page_count)
 }
 
-fn extract_all_pages(bytes: &[u8]) -> Result<Vec<ExtractedPage>, (&'static str, usize)> {
+fn extract_all_pages(
+    bytes: &[u8],
+    truncate_long_lines: bool,
+) -> Result<Vec<ExtractedPage>, (&'static str, usize)> {
     if !has_valid_pdf_envelope(bytes) {
         return Err(("invalid_pdf_header", 0));
     }
@@ -212,10 +247,18 @@ fn extract_all_pages(bytes: &[u8]) -> Result<Vec<ExtractedPage>, (&'static str, 
             if trimmed.is_empty() {
                 continue;
             }
-            if trimmed.len() > MAX_LINE_BYTES {
+            if !truncate_long_lines && trimmed.len() > MAX_LINE_BYTES {
                 return Err(("line_over_budget", page_count));
             }
-            page_lines.push(trimmed.to_string());
+            if trimmed.len() > MAX_RELAXED_LINE_BYTES {
+                let mut end = MAX_RELAXED_LINE_BYTES;
+                while end > 0 && !trimmed.is_char_boundary(end) {
+                    end -= 1;
+                }
+                page_lines.push(trimmed[..end].trim_end().to_string());
+            } else {
+                page_lines.push(trimmed.to_string());
+            }
         }
 
         out.push(ExtractedPage {
@@ -1053,7 +1096,7 @@ fn walk_page_tree(
     visited: &mut BTreeSet<u32>,
     out: &mut Vec<PageSpec>,
 ) {
-    if !visited.insert(node_num) || out.len() > MAX_PAGES {
+    if !visited.insert(node_num) || out.len() > MAX_PAGES || ancestors.len() >= MAX_REF_DEPTH {
         return;
     }
     let Some(obj) = objects.get(&node_num) else {
@@ -1268,7 +1311,7 @@ fn apply_predictor(
             return Err("flate_decode_failed");
         }
         let row_bytes = colors.checked_mul(columns).ok_or("flate_decode_failed")?;
-        if row_bytes == 0 || data.len() % row_bytes != 0 {
+        if row_bytes == 0 || !data.len().is_multiple_of(row_bytes) {
             return Err("flate_decode_failed");
         }
         let mut out = data.to_vec();
@@ -1297,7 +1340,7 @@ fn apply_predictor(
     if data.is_empty() {
         return Ok(Vec::new());
     }
-    if data.len() % stride != 0 {
+    if !data.len().is_multiple_of(stride) {
         return Err("flate_decode_failed");
     }
 
@@ -1563,8 +1606,8 @@ impl ToUnicodeCmap {
         let mut out = String::new();
 
         if has_2 && !has_1 {
-            for chunk in raw.chunks_exact(2) {
-                let code = u16::from_be_bytes([chunk[0], chunk[1]]);
+            for chunk in raw.as_chunks::<2>().0 {
+                let code = u16::from_be_bytes(*chunk);
                 if let Some(s) = self.lookup_2(code) {
                     out.push_str(&s);
                 }
@@ -1631,8 +1674,10 @@ fn parse_utf16be_units(bytes: &[u8]) -> Vec<u16> {
         return vec![u16::from(bytes[0])];
     }
     bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes(*c))
         .collect()
 }
 
@@ -1997,8 +2042,10 @@ impl FontInfo {
         }
         if raw.len() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF {
             let units: Vec<u16> = raw[2..]
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_be_bytes(*c))
                 .collect();
             return String::from_utf16_lossy(&units);
         }
@@ -2021,8 +2068,10 @@ fn decode_text_with_font(raw: &[u8], font: Option<&FontInfo>) -> String {
     }
     if raw.len() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF {
         let units: Vec<u16> = raw[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes(*c))
             .collect();
         return String::from_utf16_lossy(&units);
     }
