@@ -114,7 +114,7 @@ case "$MODE" in
 HTML
 
     echo "==> 1. SubVault binary version:"
-    "$HERE/bin/subvault" version
+    "$HERE/bin/subvault" --version
     echo ""
     echo "==> 2. Initializing isolated Format 5 vault (PDF + HTML) at $VAULT..."
     "$HERE/bin/subvault" init --vault "$VAULT" --format 5

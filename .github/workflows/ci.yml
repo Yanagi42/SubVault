@@ -120,17 +120,17 @@ jobs:
         run: node scripts/test-web.mjs
 
   msrv-check:
-    name: MSRV 1.83 Compile Check (Linux)
+    name: MSRV 1.88 Compile Check (Linux)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.83 toolchain
-        uses: dtolnay/rust-toolchain@1.83.0
+      - name: Install Rust 1.88 toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Check library and binaries against Rust 1.83
+      - name: Check library and binaries against Rust 1.88
         run: cargo check --lib --bins --locked

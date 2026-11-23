@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/Yanagi42/SubVault/actions/workflows/ci.yml/badge.svg)](https://github.com/Yanagi42/SubVault/actions/workflows/ci.yml)
 [![Deploy Demo](https://github.com/Yanagi42/SubVault/actions/workflows/pages.yml/badge.svg)](https://github.com/Yanagi42/SubVault/actions/workflows/pages.yml)
-![Rust 1.83+](https://img.shields.io/badge/rust-1.83%2B-orange)
+![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)
 ![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![Local-First](https://img.shields.io/badge/storage-SQLite%20WAL%20%2B%20SHA--256%20%2B%20XChaCha20--Poly1305-047857)
 
@@ -12,7 +12,7 @@
 
 - **Live Static Web Demo (GitHub Pages):** **[https://yanagi42.github.io/SubVault/](https://yanagi42.github.io/SubVault/)** — preloaded synthetic corpus, SHA-256 duplicate detection, inline `correct`/`undo`, native CLI export verifier (`Open Native Export`), and `.zip` offline exit download
 - **Portable Bundles & Release Notes:** **[Releases](https://github.com/Yanagi42/SubVault/releases)** · [Release Notes (`RELEASE_NOTES.md`)](./RELEASE_NOTES.md) · [Changelog (`CHANGELOG.md`)](./CHANGELOG.md)
-- **Roadmap, Security & Contributing:** [Roadmap (`docs/ROADMAP.md`)](./docs/ROADMAP.md) · [Technical Spec (中文)](./docs/SPEC-zh.md) · [Security Policy (`SECURITY.md`)](./SECURITY.md) · [Contributing (`CONTRIBUTING.md`)](./CONTRIBUTING.md)
+- **Roadmap, Security & Contributing:** [Roadmap (`docs/ROADMAP.md`)](./docs/ROADMAP.md) · [Format 1–4 Preservation Spec (中文)](./docs/SPEC-zh.md) · [Security Policy (`SECURITY.md`)](./SECURITY.md) · [Contributing (`CONTRIBUTING.md`)](./CONTRIBUTING.md)
 
 > **UI Language Note:** The `subvault-app` graphical workbench UI is currently written in **Simplified Chinese** and parses both **English and Chinese** real-world invoices, receipts, and Alipay/WeChat CSV statements. The `subvault` CLI and static `web/` demo are in English.
 
@@ -139,7 +139,7 @@ cd subvault-v0.1.0-linux-x86_64
 
 ### 4. Build & Test from Source
 
-**Prerequisites:** Rust `1.83+`, Python `3`, Node.js `20+` (for Web Demo & interop tests), and on Linux `sqlite3` + `gcc`.
+**Prerequisites:** Rust `1.88+`, Python `3`, Node.js `20+` (for Web Demo & interop tests), and on Linux `sqlite3` + `gcc`.
 
 **Linux:**
 ```bash
@@ -152,6 +152,7 @@ node --check app/app.js && node scripts/test-web.mjs
 **Windows (`pwsh`):**
 ```powershell
 python synthetic/generate_corpus.py --check
+$env:SUBVAULT_GIT_SHA = (git rev-parse HEAD)
 cargo build --release --locked
 cargo test --locked --lib --test windows_native --test format6_crypto --test redact --test real_bills --test workbench_e2e --test pdf_bill --test verify_package --test review_sheet --test review_snapshot -- --test-threads=1
 node --check app/app.js; node scripts/test-web.mjs
@@ -212,13 +213,13 @@ node --check app/app.js; node scripts/test-web.mjs
 | Path | Purpose |
 | --- | --- |
 | `src/` | Rust preservation engine, SQLite WAL store, Format 6 envelope crypto (`Argon2id` + `HKDF-SHA256` + `XChaCha20-Poly1305`), pure-Rust PDF/HTML/CSV/text extractors, append-only decision chain, offline exit exporter, standalone `verify-package`, review sheet renderer, `redact` sanitizer, and loopback `subvault-app` HTTP server |
-| `app/` | Embedded local graphical workbench frontend (`index.html`, `styles.css`, `app.js`, `icon.svg`) served exclusively on `127.0.0.1` by `subvault-app` |
+| `app/` | Embedded local graphical workbench frontend (`index.html`, `styles.css`, `app.js`) served exclusively on `127.0.0.1` by `subvault-app` |
 | `tests/` | 26 integration and backward-compatibility suites (Format 1–6 isolation, AEAD zero-plaintext & tamper proofs, bilingual real bills, workbench E2E security & workflow, PII redaction, PDF/HTML extraction, crash/fault hooks, Linux `renameat2(RENAME_NOREPLACE)`, and Windows `LockFileEx`/`FileIdInfo`/junctions) |
 | `web/` | Zero-dependency, subpath-safe pure-static Web Demo (`index.html`, `app.js`, `engine.js`, `demo-data.js`, `pdf.js`, `zip.js`, `styles.css`) |
 | `synthetic/` | Deterministic T0 corpus generator and byte/logical test fixtures |
 | `scripts/` | Portable release packagers (`package-release.sh`, `package-release-windows.ps1`), Web Demo & CLI-interop test runner (`test-web.mjs`), screenshot capture helper (`capture-screenshots.py`), and T1 evidence script |
 | `.github/` | Linux + Windows CI (`ci.yml`), manual GitHub Pages deploy (`pages.yml`), release workflow (`release.yml`), and issue templates |
-| `docs/` | High-DPI workbench & Web Demo screenshots (`docs/screenshots/`), release roadmap (`docs/ROADMAP.md`), and full Chinese technical specification (`docs/SPEC-zh.md`) |
+| `docs/` | High-DPI workbench & Web Demo screenshots (`docs/screenshots/`), release roadmap (`docs/ROADMAP.md`), and frozen Format 1–4 Linux preservation spec (`docs/SPEC-zh.md`) |
 
 ---
 
@@ -226,10 +227,10 @@ node --check app/app.js; node scripts/test-web.mjs
 
 - **Real-Data Format 6 & At-Rest Encryption (`src/crypto.rs`, `src/store.rs`):** Dedicated non-synthetic Format 6 (`SUBVAULT_VAULT` banner, `synthetic_only=false`, `real_data_import=available`) isolated from synthetic Formats 1–5. Supports `--protection passphrase` (`Argon2id` + `HKDF-SHA256` + `XChaCha20-Poly1305` across `objects/`, `staging/`, `journal/`, and sensitive SQLite cells, `PRAGMA secure_delete = ON`, keyed `HMAC-SHA256` dedup, offline `SVRK-...` recovery keys, `rotate-passphrase`, `EXIT_AUTH = 22`) or `--protection os-disk`.
 - **Single-Binary Local Workbench (`subvault-app` / `subvault app`):** Loopback `127.0.0.1` only, 256-bit session token via `X-SubVault-Token`, strict `Host`/`Origin`/`Sec-Fetch-Site` and CSP guards, serialized per-vault locking, in-memory `Zeroizing` DEK, zero temporary plaintext on `.zip` exports, and Excel CSV formula neutralization.
-- **Cross-Platform Preservation:** Verified on **Windows 11 NTFS (`x86_64-pc-windows-msvc`)** (`CreateFileW` + `LockFileEx`, 128-bit `FileIdInfo`, atomic `FileRenameInfo` no-replace, UNC/network-share refusal; 83 unit & integration tests passing natively on Windows) and **Linux (`x86_64-unknown-linux-gnu`)** (`flock`, `renameat2(RENAME_NOREPLACE)`, parent fd `fsync`, full 26 integration suites in CI).
+- **Cross-Platform Preservation:** Verified on **Windows 11 NTFS (`x86_64-pc-windows-msvc`)** (`CreateFileW` + `LockFileEx`, 128-bit `FileIdInfo`, atomic `FileRenameInfo` no-replace, UNC/network-share refusal; 85 unit & integration tests passing natively on Windows) and **Linux (`x86_64-unknown-linux-gnu`)** (`flock`, `renameat2(RENAME_NOREPLACE)`, parent fd `fsync`, full 26 integration suites in CI).
 - **Explicit Non-Goals in `v0.1.0`:** No bank/card API syncing, no email OAuth scraping, no OCR on scanned images (preserved intact for Quick Triage manual entry), no cloud sync, and no guessed subscription renewal states beyond what source documents actually record.
 
-For the exhaustive contract of exit codes (`0`–`22`), crash/recovery semantics, and Format 1–6 invariants, see [`docs/SPEC-zh.md`](./docs/SPEC-zh.md).
+For the frozen Format 1–4 Linux preservation core contract (exit codes `0`–`21` and crash/recovery semantics), see [`docs/SPEC-zh.md`](./docs/SPEC-zh.md); Format 5–6 (PDF, AEAD encryption, `EXIT_AUTH = 22`, Windows, and `subvault-app`) are summarized in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 ---
 

@@ -4,10 +4,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
-out="${SUBVAULT_EVIDENCE_OUT:-/opt/cursor/artifacts/subvault-t0-t1}"
-if [[ "$out" == "/opt/cursor/artifacts/subvault-t0-t1" ]] && [[ ! -w /opt/cursor ]] && [[ ! -w /opt ]]; then
-  out="$root/target/t1-evidence-bundle"
-fi
+out="${SUBVAULT_EVIDENCE_OUT:-$root/target/t1-evidence-bundle}"
 rm -rf "$out"
 mkdir -p "$out/licenses"
 

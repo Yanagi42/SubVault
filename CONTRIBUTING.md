@@ -10,12 +10,13 @@ Thank you for helping improve SubVault. Every contribution must preserve SubVaul
 ## Local Development Setup
 
 ### Prerequisites
-- Rust `1.83+` (with `rustfmt` and `clippy`)
+- Rust `1.88+` (with `rustfmt` and `clippy`)
 - Python 3 (for verifying the deterministic T0 synthetic corpus)
-- Node.js 18+ (for Web Demo and CLI↔Web interoperability tests)
+- Node.js 20+ (for Web Demo and CLI↔Web interoperability tests)
 
 ### Running Checks
 
+**Linux:**
 ```bash
 # 1. Verify synthetic corpus byte expectations
 python3 synthetic/generate_corpus.py --check
@@ -27,11 +28,19 @@ cargo clippy --lib --bins --locked -- -D warnings
 # 3. Full Rust unit & integration test suite
 cargo test --locked -- --test-threads=1
 
-# 4. Web Demo & Rust CLI <-> Web interoperability checks
-node scripts/test-web.mjs
+# 4. Workbench syntax, Web Demo & Rust CLI <-> Web interoperability checks
+node --check app/app.js && node scripts/test-web.mjs
 ```
 
-On Windows PowerShell, use `python` instead of `python3`.
+**Windows (`pwsh`):**
+```powershell
+python synthetic/generate_corpus.py --check
+cargo fmt --check
+cargo clippy --lib --bins --locked -- -D warnings
+cargo test --locked --lib --test windows_native --test format6_crypto --test redact --test real_bills --test workbench_e2e --test pdf_bill --test verify_package --test review_sheet --test review_snapshot -- --test-threads=1
+node --check app/app.js; node scripts/test-web.mjs
+```
+*(The remaining legacy Format 1–4 integration suites exercise Linux-specific `flock`/`renameat2`/`SIGSTOP` hooks and run in Linux CI.)*
 
 ## Licensing
 

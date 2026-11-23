@@ -1,5 +1,7 @@
 # SubVault T0 / T1
 
+> **文档范围说明：** 本文档记录冻结的格式 1–4（T0–T4）Linux 原件保全基线合同（退出码 `0`–`21`）。格式 5–6（PDF 解析、Format 6 加密、`EXIT_AUTH = 22`、原生 Windows 支持与 `subvault-app` 本地工作台）见 [`README.md`](../README.md) 与 [`docs/ROADMAP.md`](./ROADMAP.md)。
+
 这是可丢弃的合成验证，不是可试用产品。保护方式和主要输入都还没有选定。这里的明文库只用于测试，安全设计没有完成。
 
 格式 4 是单独的合成库，只在新建时写入。已有的格式 1、2、3 不会被迁移、改写或转换成格式 4。把旧库的 `user_version` 改成 4 仍然是不认识的较新版本，程序不会把它当成格式 4。这不是生产环境的兼容承诺。
@@ -111,7 +113,7 @@ cargo test --offline --test public_behavior -- --test-threads=1
 scripts/run-t1-evidence.sh
 ```
 
-证据脚本把环境、测试输出、JSONL、二进制哈希、许可证文本和可选的小 tmpfs 实验写到 `/opt/cursor/artifacts/subvault-t0-t1/`。测试耗时只是该次运行的起止时间，不是用户版本的性能结论。
+证据脚本把环境、测试输出、JSONL、二进制哈希、许可证文本和可选的小 tmpfs 实验写到 `SUBVAULT_EVIDENCE_OUT`（默认 `target/t1-evidence-bundle/`）。测试耗时只是该次运行的起止时间，不是用户版本的性能结论。
 
 行为测试依赖 `sha256sum`、`sqlite3`、`python3`、`cp`、`kill` 和 `gcc`。`sqlite3` 只用来篡改已经写成文档的库格式。`gcc` 只编译测试里的短读探针。短读探针、`--inject` 和真实的目录权限错误是三件不同的事：探针强制一次 1 字节读取，注入在回执里标 `injected: true`，journal 目录 `0555` 是真实的 `EACCES`，不是满盘，也不是注入。提交后的导入回执仍是 `Committed`；目录保持不可写时，随后的打开是退出码 3 的告警。`vault.db` 被设成 `000` 时打开是退出码 21 的 `vault_unreadable`，不是未保全，也不是就绪。
 

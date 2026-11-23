@@ -75,15 +75,17 @@ foreach ($Doc in @("RELEASE_NOTES.md", "SECURITY.md", "LICENSE", "LICENSE-MIT", 
     }
 }
 
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $BuiltUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-@"
+$VersionText = @"
 version=v$Version
 target=windows-x86_64
 git_sha=$GitSha
 built_utc=$BuiltUtc
-"@ | Set-Content -Path (Join-Path $StageDir "VERSION.txt") -Encoding UTF8
+"@
+[System.IO.File]::WriteAllText((Join-Path $StageDir "VERSION.txt"), ($VersionText + "`n"), $Utf8NoBom)
 
-@'
+$RunDemoScript = @'
 param(
     [ValidateSet("cli", "web")]
     [string]$Mode = "cli",
@@ -108,7 +110,7 @@ try {
     $ExportDir = Join-Path $Work "offline-exit-pack"
     $ReviewOut = Join-Path $Work "review.txt"
 
-    @"
+    $BillHtml = @"
 <!doctype html>
 <html>
 <body>
@@ -119,10 +121,11 @@ try {
   </table>
 </body>
 </html>
-"@ | Set-Content -Path $Bill -Encoding UTF8
+"@
+    [System.IO.File]::WriteAllText($Bill, ($BillHtml + "`n"), [System.Text.UTF8Encoding]::new($false))
 
     Write-Host "==> 1. SubVault binary version:"
-    & $Bin version
+    & $Bin --version
     Write-Host ""
     Write-Host "==> 2. Initializing isolated Format 5 vault (PDF + HTML) at $Vault..."
     & $Bin init --vault $Vault --format 5
@@ -150,7 +153,8 @@ try {
 } finally {
     if (Test-Path $Work) { Remove-Item -Recurse -Force $Work }
 }
-'@ | Set-Content -Path (Join-Path $StageDir "run-demo.ps1") -Encoding UTF8
+'@
+[System.IO.File]::WriteAllText((Join-Path $StageDir "run-demo.ps1"), ($RunDemoScript + "`n"), $Utf8NoBom)
 
 Write-Host "==> 3/4 Creating portable zip archive: $ZipPath"
 if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
