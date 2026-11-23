@@ -151,10 +151,12 @@ assert.equal(dupPdfRes.storageReused, true, "renamed binary PDF copy must dedupl
 assert.equal(pdfStore.objects.size, 1);
 
 // 8. Bidirectional Rust CLI <-> Web Demo interop verification (when native binary exists)
+const exe = process.platform === "win32" ? ".exe" : "";
 const nativeBin = [
-  path.join(root, "target/release/subvault"),
-  path.join(root, "target/debug/subvault")
+  path.join(root, `target/release/subvault${exe}`),
+  path.join(root, `target/debug/subvault${exe}`)
 ].find((p) => fs.existsSync(p));
+const pythonBin = process.platform === "win32" ? "python" : "python3";
 
 if (nativeBin) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "subvault-interop-"));
@@ -165,7 +167,7 @@ if (nativeBin) {
     const unzipDir = path.join(tmpDir, "web-unzipped");
     fs.writeFileSync(zipPath, zipBytes);
     fs.mkdirSync(unzipDir);
-    execFileSync("python3", ["-m", "zipfile", "-e", zipPath, unzipDir]);
+    execFileSync(pythonBin, ["-m", "zipfile", "-e", zipPath, unzipDir]);
     const verifyOut = JSON.parse(
       execFileSync(nativeBin, ["verify-package", "--package", unzipDir], { encoding: "utf8" })
     );

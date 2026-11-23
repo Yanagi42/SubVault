@@ -277,9 +277,11 @@ function renderLedger() {
   }
 
   const audit = store.getAuditReport();
-  const conflictIds = new Set(
-    audit.conflicts.flatMap((c) => [c.invoiceSource.sourceId, c.csvSource.sourceId])
-  );
+  const conflictBySource = new Map();
+  for (const c of audit.conflicts) {
+    conflictBySource.set(c.invoiceSource.sourceId, c);
+    conflictBySource.set(c.csvSource.sourceId, c);
+  }
 
   if (rows.length === 0) {
     container.innerHTML = `<div class="empty-state"><h3>No matching sources</h3><p>Try clearing your search query or switching filter pills.</p></div>`;
@@ -294,16 +296,18 @@ function renderLedger() {
       const amtFact = facts.find((f) => f.factType === "stated_amount_paid");
       const perFact = facts.find((f) => f.factType === "stated_service_period");
       const isSelected = s.sourceId === state.selectedSourceId;
-      const isConflict = conflictIds.has(s.sourceId);
+      const conflictItem = conflictBySource.get(s.sourceId) || null;
       const isMasked = s.accountEmail.includes("*");
 
       let amountHtml = `<span style="color:var(--ink-muted)">—</span>`;
       if (amtFact) {
-        const corrected = amtFact.value.amount_text !== amtFact.originalValue.amount_text;
+        const cur = amtFact.value.currency || "USD";
+        const origCur = amtFact.originalValue?.currency || cur;
+        const corrected = amtFact.value.amount_text !== amtFact.originalValue.amount_text || cur !== origCur;
         amountHtml = `
-          <div class="amount-main mono">USD ${esc(amtFact.value.amount_text)}</div>
+          <div class="amount-main mono">${esc(cur)} ${esc(amtFact.value.amount_text)}</div>
           <div class="amount-note ${corrected ? "corrected" : ""}">
-            ${corrected ? `Edited · orig ${esc(amtFact.originalValue.amount_text)}` : "Source-stated"}
+            ${corrected ? `Edited · orig ${esc(origCur)} ${esc(amtFact.originalValue.amount_text)}` : "Source-stated"}
           </div>
         `;
       } else {
@@ -311,8 +315,9 @@ function renderLedger() {
           (c) => c.kind === "credit_note_total" || c.kind === "unjudged_order_total" || c.kind === "csv_charged_amount"
         );
         if (totalCand) {
+          const cur = totalCand.value.currency || "USD";
           amountHtml = `
-            <div class="amount-main mono" style="color:var(--amber)">USD ${esc(totalCand.value.amount_text)}</div>
+            <div class="amount-main mono" style="color:var(--amber)">${esc(cur)} ${esc(totalCand.value.amount_text)}</div>
             <div class="amount-note">${esc(totalCand.kind.replace(/_/g, " "))}</div>
           `;
         }
@@ -324,15 +329,15 @@ function renderLedger() {
       } else if (s.metadata?.usableThrough) {
         scopeHtml = `<div class="mono" style="font-size:12px">Usable thru ${esc(s.metadata.usableThrough)}</div><div class="amount-note">Auto-renewal cancelled</div>`;
       } else if (s.metadata?.licenseScope) {
-        scopeHtml = `<div style="font-size:12px">Perpetual · up to 2 devices</div><div class="amount-note">No subscription term</div>`;
+        scopeHtml = `<div style="font-size:12px">${esc(s.metadata.licenseScope)}</div><div class="amount-note">No subscription term</div>`;
       }
 
       const badges = [];
       if (occs.length > 1) {
         badges.push(`<span class="badge badge-blue">Deduped ×${occs.length}</span>`);
       }
-      if (isConflict) {
-        badges.push(`<span class="badge badge-rose">Conflict $99 vs $107.91</span>`);
+      if (conflictItem) {
+        badges.push(`<span class="badge badge-rose">Conflict ${esc(conflictItem.csvAmount)} vs ${esc(conflictItem.invoiceAmount)}</span>`);
       }
       if (isMasked) {
         badges.push(`<span class="badge badge-amber">Unassigned Mask</span>`);
@@ -443,9 +448,14 @@ function renderInspector() {
 
   let decisionSectionHtml = "";
   if (amtFact) {
+    const amtCur = amtFact.value.currency || "USD";
+    const origAmtCur = amtFact.originalValue?.currency || amtCur;
     const decItems = decisions
       .map(
-        (d) => `
+        (d) => {
+          const priorCur = d.priorValue?.currency || amtCur;
+          const newCur = d.newValue?.currency || amtCur;
+          return `
         <div class="decision-item">
           <div class="decision-top">
             <span class="badge ${d.kind === "human_correct" ? "badge-blue" : d.kind === "undo" ? "badge-amber" : "badge-slate"}">${esc(d.kind)}</span>
@@ -454,12 +464,13 @@ function renderInspector() {
           <div>
             ${
               d.priorValue
-                ? `USD <span class="mono">${esc(d.priorValue.amount_text)}</span> → <strong>USD <span class="mono">${esc(d.newValue.amount_text)}</span></strong>`
-                : `Adopted <strong>USD <span class="mono">${esc(d.newValue.amount_text)}</span></strong> via <span class="mono">${esc(d.ruleVersion)}</span>`
+                ? `${esc(priorCur)} <span class="mono">${esc(d.priorValue.amount_text)}</span> → <strong>${esc(newCur)} <span class="mono">${esc(d.newValue.amount_text)}</span></strong>`
+                : `Adopted <strong>${esc(newCur)} <span class="mono">${esc(d.newValue.amount_text)}</span></strong> via <span class="mono">${esc(d.ruleVersion)}</span>`
             }
           </div>
         </div>
-      `
+      `;
+        }
       )
       .join("");
 
@@ -470,11 +481,11 @@ function renderInspector() {
           <span class="mono">rev ${amtFact.revision}</span>
         </h4>
         <div style="font-size:12px;color:var(--ink-secondary);margin-bottom:8px">
-          Current: <strong class="mono">USD ${esc(amtFact.value.amount_text)}</strong> · Original bytes still say <strong class="mono">USD ${esc(amtFact.originalValue.amount_text)}</strong>. Re-importing never overwrites human edits.
+          Current: <strong class="mono">${esc(amtCur)} ${esc(amtFact.value.amount_text)}</strong> · Original bytes still say <strong class="mono">${esc(origAmtCur)} ${esc(amtFact.originalValue.amount_text)}</strong>. Re-importing never overwrites human edits.
         </div>
         <div class="decision-list">${decItems}</div>
         <form class="correct-form" id="correct-amount-form">
-          <input id="correct-amount-input" class="correct-input" type="text" placeholder="e.g. 99.00" value="${esc(amtFact.value.amount_text)}" aria-label="Corrected USD amount">
+          <input id="correct-amount-input" class="correct-input" type="text" placeholder="e.g. 99.00" value="${esc(amtFact.value.amount_text)}" aria-label="Corrected ${esc(amtCur)} amount">
           <button class="btn btn-sm btn-primary" type="submit">Correct Amount</button>
           ${canUndo ? `<button id="btn-undo-decision" class="btn btn-sm" type="button">Undo</button>` : ""}
         </form>
@@ -851,7 +862,7 @@ function renderExport() {
         <div class="panel-header">
           <div>
             <h3 class="panel-title">Verifiable Offline Exit Package (<code>offline-exit-1</code>)</h3>
-            <div class="brand-sub mono">snapshot_id: ${esc(pkg.snapshotId.slice(0, 20))}… · completeness: complete</div>
+            <div class="brand-sub mono">snapshot_id: ${esc(pkg.snapshotId.slice(0, 20))}… · completeness: ${esc(pkg.manifest.completeness)}${pkg.manifest.missing.length ? ` (${pkg.manifest.missing.length} oversized binary omitted after reload)` : ""}</div>
           </div>
           <span class="badge badge-emerald">Zero Lock-In</span>
         </div>
@@ -1042,6 +1053,14 @@ function wireEvents() {
     showToast("Demo vault & local browser cache cleared. Click '+ Import Sample Batch' to reload preloaded bills from scratch.", true);
   });
 
+  document.getElementById("btn-upload-local")?.addEventListener("click", () => {
+    document.getElementById("file-upload-input")?.click();
+  });
+
+  document.getElementById("btn-open-native-export")?.addEventListener("click", () => {
+    document.getElementById("native-export-input")?.click();
+  });
+
   document.getElementById("file-upload-input").addEventListener("change", (e) => {
     if (e.target.files?.length) {
       handleUploadedFiles(e.target.files);
@@ -1076,15 +1095,23 @@ function wireEvents() {
   });
 
   const dropZone = document.getElementById("drop-zone");
+  let dragDepth = 0;
+  dropZone.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    dragDepth += 1;
+    dropZone.classList.add("drop-active");
+  });
   dropZone.addEventListener("dragover", (e) => {
     e.preventDefault();
     dropZone.classList.add("drop-active");
   });
   dropZone.addEventListener("dragleave", () => {
-    dropZone.classList.remove("drop-active");
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) dropZone.classList.remove("drop-active");
   });
   dropZone.addEventListener("drop", (e) => {
     e.preventDefault();
+    dragDepth = 0;
     dropZone.classList.remove("drop-active");
     if (e.dataTransfer?.files?.length) {
       handleUploadedFiles(e.dataTransfer.files);

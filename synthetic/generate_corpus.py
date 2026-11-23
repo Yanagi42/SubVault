@@ -340,11 +340,10 @@ def write_tree(base: Path, files: dict[str, bytes]) -> None:
         target = base / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-    (base / "SYNTHETIC_ONLY.txt").write_text(BANNER, encoding="utf-8")
+    (base / "SYNTHETIC_ONLY.txt").write_bytes(BANNER.encode("utf-8"))
     manifest = byte_manifest(files)
-    (base / "byte-expectations.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=True) + "\n",
-        encoding="utf-8",
+    (base / "byte-expectations.json").write_bytes(
+        (json.dumps(manifest, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
     )
 
 

@@ -1,11 +1,15 @@
 (() => {
   "use strict";
 
+  const TOKEN_STORE_KEY = "subvault_session_token_v1";
   let SESSION_TOKEN = "";
   const hashMatch = window.location.hash.match(/token=([0-9a-fA-F]+)/);
   if (hashMatch) {
     SESSION_TOKEN = hashMatch[1];
+    try { sessionStorage.setItem(TOKEN_STORE_KEY, SESSION_TOKEN); } catch (_) {}
     try { window.history.replaceState(null, "", window.location.pathname); } catch (_) {}
+  } else {
+    try { SESSION_TOKEN = sessionStorage.getItem(TOKEN_STORE_KEY) || ""; } catch (_) {}
   }
 
   const ICO = {
@@ -26,7 +30,7 @@
     download: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>`,
     lock: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`,
     sun: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>`,
-    paper: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/><path d="M19 3v4M21 5h-4"/></svg>`,
+    paper: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/><path d="M8 7h8M8 11h6"/></svg>`,
     moon: `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>`,
     laptop: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="16" height="12" x="4" y="4" rx="2"/><path d="M2 20h20"/></svg>`,
     refresh: `<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>`,
@@ -191,6 +195,10 @@
     cmdIndex: 0,
     cmdActions: [],
     dragDepth: 0,
+    csvUiState: new Map(),
+    drawerReturnFocus: null,
+    modalReturnFocus: null,
+    cmdReturnFocus: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -246,11 +254,18 @@
   }
 
   function amountToCents(text) {
-    if (!text) return 0;
-    const parts = String(text).split(".");
-    const w = parseInt(parts[0], 10) || 0;
-    const f = parseInt((parts[1] || "00").slice(0, 2).padEnd(2, "0"), 10) || 0;
-    return w * 100 + f;
+    if (text === null || text === undefined || text === "") return 0;
+    const cleaned = String(text).trim().replace(/[,\s]/g, "");
+    if (!cleaned) return 0;
+    const neg = cleaned.startsWith("-");
+    const unsigned = cleaned.replace(/^[+-]/, "");
+    const parts = unsigned.split(".");
+    const w = parseInt(parts[0], 10);
+    if (!Number.isFinite(w)) return 0;
+    const fracRaw = (parts[1] || "").replace(/\D/g, "");
+    const f = parseInt(fracRaw.slice(0, 2).padEnd(2, "0"), 10) || 0;
+    const total = w * 100 + f;
+    return neg ? -total : total;
   }
 
   function centsToText(cents) {
@@ -292,17 +307,123 @@
     }
     const resp = await fetch(path, opts);
     const data = await resp.json().catch(() => ({ ok: false, message: "响应解析失败" }));
+    if (resp.status === 401 && data.error === "unauthorized") {
+      try { sessionStorage.removeItem(TOKEN_STORE_KEY); } catch (_) {}
+    }
     if (!resp.ok || data.ok === false) {
       const err = new Error(data.message || data.error || `请求失败 (${resp.status})`);
       err.code = data.error || "request_failed";
+      err.status = resp.status;
       throw err;
     }
     return data;
   }
 
-  function tokenUrl(path) {
-    const sep = path.includes("?") ? "&" : "?";
-    return `${path}${sep}token=${encodeURIComponent(SESSION_TOKEN)}`;
+  const activeBlobUrls = new Set();
+  function trackBlobUrl(url) {
+    activeBlobUrls.add(url);
+    return url;
+  }
+  function revokeBlobUrls() {
+    for (const url of activeBlobUrls) {
+      try { URL.revokeObjectURL(url); } catch (_) {}
+    }
+    activeBlobUrls.clear();
+  }
+
+  async function fetchAuthedBlob(path) {
+    const resp = await fetch(path, { headers: { "X-SubVault-Token": SESSION_TOKEN } });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      if (resp.status === 401 && data.error === "unauthorized") {
+        try { sessionStorage.removeItem(TOKEN_STORE_KEY); } catch (_) {}
+      }
+      throw new Error(data.message || data.error || `下载失败 (${resp.status})`);
+    }
+    const blob = await resp.blob();
+    const disp = resp.headers.get("content-disposition") || "";
+    let filename = "";
+    const utf8Match = disp.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match) {
+      try { filename = decodeURIComponent(utf8Match[1]); } catch (_) {}
+    }
+    if (!filename) {
+      const asciiMatch = disp.match(/filename="([^"]+)"/i);
+      if (asciiMatch) filename = asciiMatch[1];
+    }
+    return { blob, filename, contentType: resp.headers.get("content-type") || blob.type || "" };
+  }
+
+  async function downloadAuthedFile(path, fallbackName) {
+    try {
+      const { blob, filename } = await fetchAuthedBlob(path);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename || fallbackName || "download.bin";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+    } catch (err) {
+      showToast(err.message || "下载失败", "error");
+    }
+  }
+
+  let previewLoadSeq = 0;
+  async function loadAuthedPreviewInto(container, item) {
+    if (!container || !item) return;
+    const seq = ++previewLoadSeq;
+    const baseMime = (item.media_type || "").split(";")[0].trim().toLowerCase();
+    const isPdf = baseMime === "application/pdf";
+    const isImg = ["image/png", "image/jpeg", "image/webp"].includes(baseMime);
+    const isHtml = baseMime === "text/html";
+    if (!isPdf && !isImg && !isHtml) return;
+    container.innerHTML = `<div class="preview-loading" style="padding:24px;text-align:center;color:var(--ink-3);font-size:13px">原件加载中…</div>`;
+    try {
+      const { blob } = await fetchAuthedBlob(`/api/sources/${encodeURIComponent(item.source_id)}/raw`);
+      if (seq !== previewLoadSeq) return;
+      if (isHtml) {
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        let htmlText;
+        if (buf.length >= 2 && buf[0] === 0xFF && buf[1] === 0xFE) {
+          htmlText = new TextDecoder("utf-16le").decode(buf);
+        } else if (buf.length >= 2 && buf[0] === 0xFE && buf[1] === 0xFF) {
+          htmlText = new TextDecoder("utf-16be").decode(buf);
+        } else {
+          try {
+            htmlText = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+          } catch (_) {
+            try { htmlText = new TextDecoder("gb18030").decode(buf); } catch (__) { htmlText = new TextDecoder("utf-8").decode(buf); }
+          }
+        }
+        if (seq !== previewLoadSeq) return;
+        const iframe = document.createElement("iframe");
+        iframe.setAttribute("sandbox", "");
+        iframe.title = "静态 HTML 原件";
+        iframe.srcdoc = htmlText;
+        container.innerHTML = "";
+        container.appendChild(iframe);
+      } else if (isPdf) {
+        const pdfBlob = blob.type === "application/pdf" ? blob : new Blob([blob], { type: "application/pdf" });
+        const url = trackBlobUrl(URL.createObjectURL(pdfBlob));
+        const iframe = document.createElement("iframe");
+        iframe.src = `${url}#navpanes=0&view=FitH`;
+        iframe.title = "PDF 原件";
+        container.innerHTML = "";
+        container.appendChild(iframe);
+      } else if (isImg) {
+        const url = trackBlobUrl(URL.createObjectURL(blob));
+        const img = document.createElement("img");
+        img.src = url;
+        img.alt = item.display_name || "原件截图";
+        container.innerHTML = "";
+        container.appendChild(img);
+      }
+    } catch (err) {
+      if (seq !== previewLoadSeq) return;
+      container.innerHTML = `<div class="preview-loading" style="padding:24px;text-align:center;color:var(--ink-3);font-size:13px">原件预览失败：${esc(err.message)}</div>`;
+    }
   }
 
   function arrayBufferToBase64(buffer) {
@@ -385,6 +506,7 @@
     document.body.classList.toggle("privacy-blur", state.privacyBlur);
     const btn = $("btn-privacy-toggle");
     btn.classList.toggle("active", state.privacyBlur);
+    btn.setAttribute("aria-pressed", String(state.privacyBlur));
     btn.innerHTML = state.privacyBlur ? ICO.eyeOff : ICO.eyeOpen;
     if (state.privacyBlur) showToast("已拉上磨砂玻璃：金额、账号和密钥已隐藏，鼠标放上去可临时查看");
     else if (forceVal === undefined) showToast("磨砂玻璃已收起，金额恢复显示");
@@ -598,9 +720,12 @@
     burstAt(r.left + r.width / 2, r.top + r.height / 2, opts);
   }
 
-  // 字符“解码”效果：随机字符逐位落定为最终文本（不泄露任何真实字符）
+  // 字符“解码”效果：随机字符逐位落定为最终文本（不泄露任何真实字符；重复触发自动取消上一帧）
+  const scrambleFrames = new WeakMap();
   function scrambleText(el, finalText, dur = 650) {
     if (!el) return;
+    const prevRaf = scrambleFrames.get(el);
+    if (prevRaf) cancelAnimationFrame(prevRaf);
     if (!motionOK()) { el.textContent = finalText; return; }
     const pool = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     const chars = Array.from(finalText);
@@ -609,11 +734,11 @@
       if (!el.isConnected) return;
       const p = Math.min(1, (now - t0) / dur);
       const settled = Math.floor(p * chars.length);
-      el.textContent = chars.map((c, i) => (i < settled || /[\s·\-]/.test(c) ? c : pool[Math.floor(Math.random() * pool.length)])).join("");
-      if (p < 1) requestAnimationFrame(step);
-      else el.textContent = finalText;
+      el.textContent = chars.map((c, i) => (i < settled || /[\s·\-•]/.test(c) ? c : pool[Math.floor(Math.random() * pool.length)])).join("");
+      if (p < 1) scrambleFrames.set(el, requestAnimationFrame(step));
+      else { el.textContent = finalText; scrambleFrames.delete(el); }
     };
-    requestAnimationFrame(step);
+    scrambleFrames.set(el, requestAnimationFrame(step));
   }
 
   // 数字滚动：同一个 key 只在数值变化时从旧值滚到新值，搜索时的重复渲染不会重播
@@ -838,18 +963,23 @@
     HKD: [{ unit: "杯奶茶", cents: 2200 }, { unit: "张电影票", cents: 9000 }, { unit: "个菠萝油", cents: 1400 }],
   };
 
-  function funFactsFor(cur, monthlyCents) {
-    if (!monthlyCents || monthlyCents <= 0) return ["还没有周期订阅，钱包表示很安心"];
-    const daily = Math.max(1, Math.round((monthlyCents * 12) / 365));
-    const yearly = monthlyCents * 12;
-    const facts = [`订阅每天悄悄花掉 ${formatMoneyShort(cur, centsToText(daily))}`];
-    (FUN_EQUIV[cur] || []).forEach((eq, i) => {
-      const monthlyView = i % 2 === 0;
-      const n = (monthlyView ? monthlyCents : yearly) / eq.cents;
-      const nTxt = n >= 10 ? String(Math.round(n)) : n.toFixed(1).replace(/\.0$/, "");
-      facts.push(`${monthlyView ? "每月订阅" : "一年订阅"} ≈ ${nTxt} ${eq.unit}`);
+  function funFactsForAll(totals) {
+    if (!totals || !totals.length) return ["还没有周期订阅，钱包表示很安心"];
+    const dailyParts = totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(Math.max(1, Math.round((c * 12) / 365)))));
+    const yearlyParts = totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(c * 12)));
+    const facts = [`按周期折算，每天约 ${dailyParts.join(" + ")}`];
+    totals.forEach(([cur, monthlyCents]) => {
+      if (!monthlyCents || monthlyCents <= 0) return;
+      const yearly = monthlyCents * 12;
+      const curLabel = totals.length > 1 ? (CURRENCY_NAMES[cur] || cur) : "";
+      (FUN_EQUIV[cur] || []).slice(0, totals.length > 1 ? 2 : 4).forEach((eq, i) => {
+        const monthlyView = i % 2 === 0;
+        const n = (monthlyView ? monthlyCents : yearly) / eq.cents;
+        const nTxt = n >= 10 ? String(Math.round(n)) : n.toFixed(1).replace(/\.0$/, "");
+        facts.push(`${monthlyView ? "每月" : "一年"}${curLabel}订阅 ≈ ${nTxt} ${eq.unit}`);
+      });
     });
-    facts.push(`一年订阅合计 ${formatMoneyShort(cur, centsToText(yearly))}`);
+    facts.push(`按周期折算，一年约 ${yearlyParts.join(" + ")}`);
     return facts;
   }
 
@@ -939,8 +1069,8 @@
     const totalDays = Math.max(1, Math.round((e - s) / 86400000));
     const elapsedDays = totalDays - daysLeft;
     const pct = Math.max(0, Math.min(100, Math.round((elapsedDays / totalDays) * 100)));
-    const statusLabel = daysLeft > 0 ? `还剩 ${daysLeft} 天` : `${perVal.period_end} 已到期`;
-    return { pct, expired: daysLeft <= 0, range: `${perVal.period_start} — ${perVal.period_end}`, statusLabel };
+    const statusLabel = daysLeft > 0 ? `本期还剩 ${daysLeft} 天` : `账单期截至 ${perVal.period_end}`;
+    return { pct, periodEnded: daysLeft <= 0, range: `${perVal.period_start} — ${perVal.period_end}`, statusLabel };
   }
 
   function warrantyInfo(buyDate, warrantyEnd) {
@@ -1004,7 +1134,7 @@
       await navigator.clipboard.writeText(key);
       if (btnEl) {
         const plateText = btnEl.closest(".serial-plate")?.querySelector("span");
-        if (plateText) scrambleText(plateText, plateText.textContent, 620);
+        if (plateText) scrambleText(plateText, maskLicenseKey(key), 620);
         const orig = btnEl.innerHTML;
         btnEl.classList.add("copied");
         btnEl.innerHTML = `${ICO.check} 已复制`;
@@ -1042,7 +1172,8 @@
     }
     bindEvents();
     if (!SESSION_TOKEN) {
-      showToast("请通过双击 subvault-app 打开程序。", "error");
+      showToast("本地会话凭证已失效，请重新打开 SubVault 终端输出的链接或重启 subvault-app。", "error");
+      showLobbyScreen();
       return;
     }
     try {
@@ -1123,6 +1254,39 @@
     });
     $("unlock-passphrase-wrap").classList.toggle("hidden", mode !== "passphrase");
     $("unlock-recovery-wrap").classList.toggle("hidden", mode !== "recovery");
+  }
+
+  function resetVaultUiState() {
+    state.workspace = null;
+    state.groups = [];
+    state.activeNav = "assets";
+    state.collection = "all";
+    state.heroCurrency = "";
+    state.reimburseFilter = "";
+    state.accountFilter = "";
+    state.currencyFilter = "";
+    state.categoryFilter = "";
+    state.searchQuery = "";
+    state.insightsCurrency = "";
+    state.simCutIds.clear();
+    state.triageSkippedIds.clear();
+    state.csvUiState.clear();
+    state.selectedSourceId = null;
+    state.textViewActive = false;
+    state.lastRedactedText = "";
+    countMemory.clear();
+    revokeBlobUrls();
+    if ($("search-box")) $("search-box").value = "";
+    if ($("filter-account")) $("filter-account").value = "";
+    if ($("chk-zip-ack")) $("chk-zip-ack").checked = false;
+    if ($("chk-dir-ack")) $("chk-dir-ack").checked = false;
+    if ($("export-dir-result")) $("export-dir-result").classList.add("hidden");
+    if ($("verify-dir-result")) $("verify-dir-result").classList.add("hidden");
+    if ($("rotate-current-pass")) $("rotate-current-pass").value = "";
+    if ($("rotate-new-pass")) $("rotate-new-pass").value = "";
+    if ($("rotate-new-pass-confirm")) $("rotate-new-pass-confirm").value = "";
+    if ($("chk-rotate-recovery")) $("chk-rotate-recovery").checked = false;
+    closeDrawer();
   }
 
   function showLobbyScreen() {
@@ -1250,7 +1414,7 @@
     return isoOf(new Date(ny, nm, Math.min(d, dim)));
   }
 
-  // 预计续费：只按账单上写明的周期往后推；连续两个周期都没有新账单就视为“可能已停用”，不再预测
+  // 按账单写明的周期计算参考节奏（不伪造“已生效/已停用”状态）
   function nextRenewalInfo(item) {
     const ann = item.annotation || {};
     const cycle = ann.billing_cycle;
@@ -1270,15 +1434,27 @@
     return { stale: false, date, daysLeft, pct };
   }
 
+  function subscriptionIdentityKey(it) {
+    const ann = it.annotation || {};
+    const amt = it.amount_fact?.value;
+    return [
+      "subscription",
+      (ann.vendor || it.display_name || "").trim().toLowerCase(),
+      (ann.plan_name || "").trim().toLowerCase(),
+      (ann.account_label || "").trim().toLowerCase(),
+      ann.billing_cycle || "",
+      amt?.currency || "",
+    ].join("|");
+  }
+
   function buildAssetGroups(ws) {
     const map = new Map();
     for (const it of ws.items || []) {
       if (it.status_flags?.is_csv_statement) continue;
       const ann = it.annotation || {};
       const kind = ann.asset_kind || "general";
-      const amt = it.amount_fact?.value;
       const key = kind === "subscription"
-        ? ["subscription", (ann.vendor || it.display_name || "").trim().toLowerCase(), (ann.plan_name || "").trim().toLowerCase(), (ann.account_label || "").trim().toLowerCase(), ann.billing_cycle || "", amt?.currency || ""].join("|")
+        ? subscriptionIdentityKey(it)
         : `${kind}|${it.source_id}`;
       if (!map.has(key)) map.set(key, { key, kind, items: [] });
       map.get(key).items.push(it);
@@ -1300,11 +1476,11 @@
     return (state.groups || []).find((g) => g.items.some((i) => i.source_id === sourceId)) || null;
   }
 
-  // 每月固定支出：每个订阅只算最新一张账单，排除“可能已停用”的，按币种分开
+  // 每月周期折算：每个独立订阅只取最新一张账单，按币种分开，不依本机时钟私自剔除
   function recurringTotals(groups) {
     const out = {};
     (groups || []).forEach((g) => {
-      if (!g.monthlyCents || g.renewal?.stale) return;
+      if (!g.monthlyCents) return;
       out[g.amount.currency] = (out[g.amount.currency] || 0) + g.monthlyCents;
     });
     return Object.entries(out).sort((a, b) => b[1] - a[1]);
@@ -1662,17 +1838,16 @@
       const totals = recurringTotals(subGroups);
       const monthStr = totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(c))).join(" + ") || "—";
       const yearStr = totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(c * 12))).join(" + ") || "—";
-      const staleN = subGroups.filter((g) => g.renewal?.stale).length;
       hero.innerHTML = `
         <div class="context-strip">
           <div class="ctx-title-group">
             <div class="ctx-title">周期订阅</div>
-            <div class="ctx-sub">同一个订阅的多张账单合成一张卡片；按账单周期推算下次续费${staleN ? `，${staleN} 个长期没有新账单的已移到下方` : ""}</div>
+            <div class="ctx-sub">同一账号与套餐的多张历史账单合并展示；按账单标注周期折算，不代表当前是否仍在扣费</div>
           </div>
           <div class="ctx-metrics">
-            <div class="ctx-metric"><span class="ctx-k">订阅</span><span class="ctx-v">${subGroups.length - staleN} 项</span></div>
-            <div class="ctx-metric"><span class="ctx-k">每月</span><span class="ctx-v sensitive">${esc(monthStr)}</span></div>
-            <div class="ctx-metric"><span class="ctx-k">一年</span><span class="ctx-v sensitive">${esc(yearStr)}</span></div>
+            <div class="ctx-metric"><span class="ctx-k">订阅</span><span class="ctx-v">${subGroups.length} 项</span></div>
+            <div class="ctx-metric"><span class="ctx-k">每月折算</span><span class="ctx-v sensitive">${esc(monthStr)}</span></div>
+            <div class="ctx-metric"><span class="ctx-k">一年折算</span><span class="ctx-v sensitive">${esc(yearStr)}</span></div>
           </div>
         </div>
       `;
@@ -1782,27 +1957,27 @@
       `);
     }
 
-    const facts = totals.length ? funFactsFor(totals[0][0], totals[0][1]) : funFactsFor("CNY", 0);
+    const facts = funFactsForAll(totals);
     const factIdx = ((state.funIdx || 0) % facts.length + facts.length) % facts.length;
     const figuresHtml = totals.length
       ? totals.map(([cur, c]) => `
           <div class="hero-fig">
             <div class="hero-big-num sensitive" data-countup="hero-m-${esc(cur)}" data-cur="${esc(cur)}" data-cents="${c}">${renderEditorialMoney(cur, centsToText(c), false)}</div>
-            <div class="hero-fig-cap">${esc(CURRENCY_NAMES[cur] || cur)} · 每月</div>
+            <div class="hero-fig-cap">${esc(CURRENCY_NAMES[cur] || cur)} · 按周期月折算</div>
           </div>`).join("")
       : `<div class="hero-fig"><div class="hero-big-num" style="color:var(--ink-3)">—</div><div class="hero-fig-cap">还没有周期订阅</div></div>`;
     const yearLine = totals.length
-      ? `一年约 <strong class="sensitive">${esc(totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(c * 12))).join(" + "))}</strong>`
-      : "记一笔周期订阅后，这里会显示每月固定支出";
+      ? `按标注周期折算，一年约 <strong class="sensitive">${esc(totals.map(([cur, c]) => formatMoneyShort(cur, centsToText(c * 12))).join(" + "))}</strong>`
+      : "记一笔周期订阅后，这里会显示按周期折算的月度参考";
     const recordedLine = recorded.length
-      ? `账本共 ${billCount} 笔，已记录 <span class="sensitive">${esc(recorded.map((c) => formatMoneyShort(c.currency, c.total_recorded)).join(" + "))}</span>`
-      : "";
+      ? `已录金额 ${billCount} 笔（共 ${items.length} 份文件），账本已记录 <span class="sensitive">${esc(recorded.map((c) => formatMoneyShort(c.currency, c.total_recorded)).join(" + "))}</span>`
+      : `共 ${items.length} 份原件`;
 
     hero.innerHTML = `
       <div class="hero-primary">
         <div class="hero-top-bar">
-          <span class="hero-eyebrow">每月固定支出</span>
-          <span class="hero-note">各币种分开统计，不做汇率换算</span>
+          <span class="hero-eyebrow">周期订阅月度折算</span>
+          <span class="hero-note">各币种分开统计 · 仅据账单标注周期，不代表当前是否仍在扣费</span>
         </div>
 
         <div class="hero-multi">${figuresHtml}</div>
@@ -1866,7 +2041,6 @@
     const prog = kind === "subscription" ? periodProgressInfo(perVal) : null;
     const group = kind === "subscription" ? groupOfItem(item.source_id) : null;
     const renewal = group?.renewal || null;
-    const isPast = renewal ? renewal.stale : Boolean(prog?.expired);
 
     let driftPill = "";
     if (drift) {
@@ -1929,14 +2103,14 @@
       if (renewal && !renewal.stale) {
         bodyHtml = `
           <div>
-            <div class="meter-caption"><span>下次 ${esc(renewal.date.slice(5).replace("-", "/"))} 预计续费</span><span>${esc(relDayLabel(renewal.daysLeft))}</span></div>
+            <div class="meter-caption"><span>按周期参考 · ${esc(renewal.date.slice(5).replace("-", "/"))}</span><span>${esc(relDayLabel(renewal.daysLeft))}</span></div>
             ${renderTickMeter(renewal.pct, false)}
           </div>
         `;
       } else if (renewal?.stale) {
         bodyHtml = `
           <div>
-            <div class="meter-caption"><span>上次账单 ${esc(renewal.last)}</span><span>两期没有新账单</span></div>
+            <div class="meter-caption"><span>最近账单期至 ${esc(renewal.last)}</span><span>未录新账单（状态未知）</span></div>
             ${renderTickMeter(100, true)}
           </div>
         `;
@@ -1944,7 +2118,7 @@
         bodyHtml = `
           <div>
             <div class="meter-caption"><span>${esc(prog.range)}</span><span>${esc(prog.statusLabel)}</span></div>
-            ${renderTickMeter(prog.pct, prog.expired)}
+            ${renderTickMeter(prog.pct, prog.periodEnded)}
           </div>
         `;
       } else if (ann.bill_date) {
@@ -1968,17 +2142,15 @@
 
     const metaStr = [ann.account_label, ann.category, flags.has_duplicate ? `防重 ×${item.occurrence_count}` : ""].filter(Boolean).join(" · ") || "未分组";
     const spineHtml = kind === "subscription" ? `<span class="obj-spine" style="background:${brand.bg}"></span>` : "";
-    // 只在“全部”里标类型；进入某个分类后类型不言自明，仅保留冲突 / 往期等异常标记
-    const showKindPill = flags.has_conflict || isPast || state.collection === "all";
-    const pastLabel = renewal?.stale ? "可能停用" : "往期";
+    const showKindPill = flags.has_conflict || state.collection === "all";
     const kindPillHtml = showKindPill
-      ? `<span class="micro-pill ${flags.has_conflict ? "amber" : isPast ? "slate" : kindMeta.pill}">${flags.has_conflict ? "冲突" : isPast ? pastLabel : esc(kindMeta.label)}</span>`
+      ? `<span class="micro-pill ${flags.has_conflict ? "amber" : kindMeta.pill}">${flags.has_conflict ? "待确认冲突" : esc(kindMeta.label)}</span>`
       : "";
     const integrityHtml = item.object_intact ? "" : `<span class="micro-pill rose" title="原件校验异常">校验异常</span>`;
     const billCountHtml = group && group.items.length > 1 ? `<span class="bill-count" title="同一个订阅的账单，点开卡片可以逐张查看">${group.items.length} 张账单</span>` : "";
 
     return `
-      <article class="obj-card kind-${esc(kind)} ${isPast ? "is-expired" : ""}" data-source-id="${esc(item.source_id)}">
+      <article class="obj-card kind-${esc(kind)}" tabindex="0" role="button" data-source-id="${esc(item.source_id)}">
         ${spineHtml}
         <div class="oc-top">
           <div class="oc-id">
@@ -2028,7 +2200,7 @@
     }
 
     return `
-      <div class="filing-strip" data-source-id="${esc(item.source_id)}">
+      <div class="filing-strip" tabindex="0" role="button" data-source-id="${esc(item.source_id)}">
         <div class="filing-left">
           <div class="brand-badge brand-badge-sm" style="background:${brand.bg}">${esc(brand.mark)}</div>
           <div style="min-width:0">
@@ -2065,19 +2237,6 @@
         }
       }
       secondaryLabel = "流水与待处理文件";
-    } else if (state.collection === "subscription") {
-      // 两期以上没有新账单的订阅放到下方
-      const active = [];
-      const expired = [];
-      for (const it of list) {
-        if (groupOfItem(it.source_id)?.renewal?.stale) expired.push(it);
-        else active.push(it);
-      }
-      if (active.length > 0 && expired.length > 0) {
-        mainItems = active;
-        secondaryItems = expired;
-        secondaryLabel = "可能已停用（两期以上没有新账单）";
-      }
     }
 
     const gridClass = isWide
@@ -2179,10 +2338,16 @@
       const foot = stage.querySelector(`[data-csv-foot="${cIdx}"]`);
       const qInput = stage.querySelector(`[data-csv-filter-q="${cIdx}"]`);
       const expChk = stage.querySelector(`[data-csv-filter-exp="${cIdx}"]`);
+      const uiState = state.csvUiState.get(item.source_id) || { q: "", expOnly: true, limit: 100 };
+      state.csvUiState.set(item.source_id, uiState);
+      qInput.value = uiState.q;
+      expChk.checked = uiState.expOnly;
 
       const paintRows = () => {
-        const q = (qInput.value || "").trim().toLowerCase();
-        const expOnly = expChk.checked;
+        uiState.q = qInput.value || "";
+        uiState.expOnly = expChk.checked;
+        const q = uiState.q.trim().toLowerCase();
+        const expOnly = uiState.expOnly;
         const filtered = allRows.filter((r) => {
           if (expOnly && r.direction !== "expense") return false;
           if (q && !`${r.merchant || ""} ${r.description || ""} ${r.date || ""} ${r.amount_text || ""}`.toLowerCase().includes(q)) return false;
@@ -2195,17 +2360,32 @@
           sums[c] = (sums[c] || 0) + amountToCents(r.amount_text);
         }
         const sumText = Object.entries(sums).map(([c, v]) => formatMoney(c, centsToText(v))).join(" · ") || "—";
-        foot.innerHTML = `<span>当前显示 <strong>${filtered.length}</strong> 条${expOnly ? "支出" : "记录"}</span><span>合计 <strong class="sensitive">${esc(sumText)}</strong></span>`;
+        const shownCount = Math.min(filtered.length, uiState.limit);
+        const moreBtn = filtered.length > shownCount
+          ? ` <button type="button" class="btn btn-soft btn-sm" data-csv-more="${cIdx}" style="margin-left:8px">加载更多（剩余 ${filtered.length - shownCount} 条）</button>`
+          : "";
+        foot.innerHTML = `<span>当前显示 <strong>${shownCount}</strong> / ${filtered.length} 条${expOnly ? "支出" : "记录"}${moreBtn}</span><span>合计 <strong class="sensitive">${esc(sumText)}</strong></span>`;
+        const moreEl = foot.querySelector(`[data-csv-more="${cIdx}"]`);
+        if (moreEl) {
+          moreEl.addEventListener("click", () => {
+            uiState.limit += 150;
+            paintRows();
+          });
+        }
 
         if (!filtered.length) {
           tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--ink-3);padding:24px">没有符合条件的流水记录</td></tr>`;
           return;
         }
-        tbody.innerHTML = filtered.slice(0, 150).map((r, rIdx) => {
+        tbody.innerHTML = filtered.slice(0, uiState.limit).map((r, rIdx) => {
           const existing = findExistingCsvItem(r);
+          const isNonExpense = ["income", "refund", "neutral"].includes(r.direction);
+          const dirLabel = { income: "收入", refund: "退款", neutral: "中性交易" }[r.direction] || "";
           const actBtn = existing
             ? `<button type="button" class="csv-added-btn" data-ws-open-existing="${esc(existing.source_id)}">${ICO.check} 已在账本</button>`
-            : `<button type="button" class="btn btn-soft btn-sm" data-ws-promote="${rIdx}">加入账本</button>`;
+            : isNonExpense
+              ? `<span class="micro-pill slate">${esc(dirLabel)} · 不计支出</span>`
+              : `<button type="button" class="btn btn-soft btn-sm" data-ws-promote="${rIdx}">加入账本</button>`;
           return `
             <tr>
               <td style="font-size:12px;color:var(--ink-3);white-space:nowrap" class="num">${esc(r.date || "—")}</td>
@@ -2239,6 +2419,7 @@
                 date: r.date || "",
                 currency: r.currency || "CNY",
                 amount_text: r.amount_text || "",
+                direction: r.direction || "",
                 billing_cycle: "unknown",
                 account_label: r.account_hint || undefined,
                 raw_line: r.raw_line || "",
@@ -2254,8 +2435,8 @@
         });
       };
 
-      qInput.addEventListener("input", paintRows);
-      expChk.addEventListener("change", paintRows);
+      qInput.addEventListener("input", () => { uiState.limit = 100; paintRows(); });
+      expChk.addEventListener("change", () => { uiState.limit = 100; paintRows(); });
       paintRows();
     });
 
@@ -2295,7 +2476,7 @@
       if (reimb && REIMBURSE_META[reimb]) acts.push(`<button type="button" class="stamp-btn ${REIMBURSE_META[reimb].cls}" data-reimb-sid="${esc(item.source_id)}" data-reimb-cur="${esc(reimb)}">${REIMBURSE_META[reimb].label} ${ICO.refresh}</button>`);
 
       return `
-        <tr data-source-id="${esc(item.source_id)}">
+        <tr tabindex="0" role="button" data-source-id="${esc(item.source_id)}">
           <td>
             <div class="tbl-id">
               <div class="brand-badge brand-badge-sm" style="background:${brand.bg}">${esc(brand.mark)}</div>
@@ -2353,9 +2534,16 @@
       });
     });
     stage.querySelectorAll("[data-source-id]").forEach((el) => {
-      el.addEventListener("click", () => {
+      const openItem = () => {
         const found = (state.workspace.items || []).find((i) => i.source_id === el.getAttribute("data-source-id"));
         if (found) openDrawer(found);
+      };
+      el.addEventListener("click", openItem);
+      el.addEventListener("keydown", (e) => {
+        if ((e.key === "Enter" || e.key === " ") && e.target === el) {
+          e.preventDefault();
+          openItem();
+        }
       });
     });
   }
@@ -2371,15 +2559,21 @@
     const prevMonthDays = new Date(year, month, 0).getDate();
     const today = new Date();
 
+    // Group recurring subscriptions consistently by (vendor, plan, account, currency, cycle)
     const latestRec = new Map();
+    const realMonthKeys = new Set();
     for (const item of ws.items || []) {
       const ann = item.annotation || {};
       const amtVal = item.amount_fact?.value;
-      if (!amtVal?.amount_text || !["monthly", "quarterly", "yearly"].includes(ann.billing_cycle)) continue;
-      const key = `${(ann.vendor || item.display_name).trim().toLowerCase()}|${amtVal.currency}|${ann.billing_cycle}`;
+      if (!amtVal?.amount_text || !["monthly", "quarterly", "yearly", "weekly"].includes(ann.billing_cycle)) continue;
+      const key = subscriptionIdentityKey(item);
       const dStr = ann.bill_date || item.period_fact?.value?.period_start || "";
+      if (dStr && /^\d{4}-\d{2}-\d{2}$/.test(dStr)) {
+        const [ry, rm] = dStr.split("-").map(Number);
+        if (ry === year && rm === month + 1) realMonthKeys.add(key);
+      }
       const prev = latestRec.get(key);
-      if (!prev || dStr >= prev.dStr) latestRec.set(key, { sid: item.source_id, dStr });
+      if (!prev || dStr >= prev.dStr) latestRec.set(key, { sid: item.source_id, dStr, key });
     }
     const projectable = new Set([...latestRec.values()].map((v) => v.sid));
 
@@ -2410,38 +2604,64 @@
         const [ry, rm, rd] = realDateStr.split("-").map(Number);
         if (ry === year && rm === month + 1) {
           matchedRealDay = rd;
-          addEvt(rd, { kind: "real", source_id: item.source_id, title, money, currency: amtVal.currency, cents, sub: "账单日" });
+          addEvt(rd, { kind: "real", source_id: item.source_id, title, money, currency: amtVal.currency, cents, sub: ann.account_label ? `账单日 · ${ann.account_label}` : "账单日" });
         }
       }
       if (!projectable.has(item.source_id)) continue;
+      const subKey = subscriptionIdentityKey(item);
       const anchorStr = perVal?.period_end || realDateStr;
       if (anchorStr && /^\d{4}-\d{2}-\d{2}$/.test(anchorStr)) {
         const [ay, am, ad] = anchorStr.split("-").map(Number);
-        const diff = (year * 12 + month) - (ay * 12 + (am - 1));
-        const clampedDay = Math.min(ad, daysInMonth);
-        if (diff >= 0 && clampedDay !== matchedRealDay) {
-          let hits = false;
-          if (ann.billing_cycle === "monthly") hits = true;
-          else if (ann.billing_cycle === "quarterly" && diff % 3 === 0) hits = true;
-          else if (ann.billing_cycle === "yearly" && diff % 12 === 0) hits = true;
-          if (hits && !(diff === 0 && perVal?.period_end && matchedRealDay === clampedDay)) {
-            addEvt(clampedDay, { kind: "projected", source_id: item.source_id, title, money, currency: amtVal.currency, cents, sub: "预计续费" });
+        if (ann.billing_cycle === "weekly") {
+          const anchorUtc = Date.UTC(ay, am - 1, ad);
+          const monthStartUtc = Date.UTC(year, month, 1);
+          const monthEndUtc = Date.UTC(year, month, daysInMonth);
+          const stepMs = 7 * 86400000;
+          let curUtc = anchorUtc;
+          if (curUtc < monthStartUtc) {
+            const k = Math.ceil((monthStartUtc - curUtc) / stepMs);
+            curUtc += k * stepMs;
+          }
+          while (curUtc <= monthEndUtc) {
+            const dObj = new Date(curUtc);
+            const wDay = dObj.getUTCDate();
+            if (curUtc >= anchorUtc && wDay !== matchedRealDay) {
+              addEvt(wDay, { kind: "projected", source_id: item.source_id, title, money, currency: amtVal.currency, cents, sub: ann.account_label ? `按周期推算 · ${ann.account_label}` : "按周期推算" });
+            }
+            curUtc += stepMs;
+          }
+        } else {
+          if (realMonthKeys.has(subKey) && !perVal?.period_end) continue;
+          const diff = (year * 12 + month) - (ay * 12 + (am - 1));
+          const clampedDay = Math.min(ad, daysInMonth);
+          if (diff >= 0 && clampedDay !== matchedRealDay && !(realMonthKeys.has(subKey) && diff === 0)) {
+            let hits = false;
+            if (ann.billing_cycle === "monthly") hits = true;
+            else if (ann.billing_cycle === "quarterly" && diff % 3 === 0) hits = true;
+            else if (ann.billing_cycle === "yearly" && diff % 12 === 0) hits = true;
+            if (hits) {
+              addEvt(clampedDay, { kind: "projected", source_id: item.source_id, title, money, currency: amtVal.currency, cents, sub: ann.account_label ? `按周期推算 · ${ann.account_label}` : "按周期推算" });
+            }
           }
         }
       }
     }
 
     agenda.sort((a, b) => a.day - b.day);
-    const monthTotals = {};
+    const realTotals = {};
+    const projTotals = {};
     for (const ev of agenda) {
-      if (ev.currency && ev.cents) monthTotals[ev.currency] = (monthTotals[ev.currency] || 0) + ev.cents;
+      if (!ev.currency || !ev.cents) continue;
+      if (ev.kind === "real") realTotals[ev.currency] = (realTotals[ev.currency] || 0) + ev.cents;
+      else if (ev.kind === "projected") projTotals[ev.currency] = (projTotals[ev.currency] || 0) + ev.cents;
     }
-    const monthTotalRows = Object.entries(monthTotals);
-    const monthFootHtml = monthTotalRows.length
+    const realRows = Object.entries(realTotals);
+    const projRows = Object.entries(projTotals);
+    const monthFootHtml = (realRows.length || projRows.length)
       ? `
         <div class="agenda-total-foot">
-          <div style="font-size:11.5px;font-weight:700;color:var(--ink-3)">${month + 1} 月合计（含预计续费）</div>
-          ${monthTotalRows.map(([cur, c]) => `<div class="agenda-total-row"><span>${esc(cur)} · ${esc(CURRENCY_NAMES[cur] || cur)}</span><strong class="sensitive">${esc(formatMoneyShort(cur, centsToText(c)))}</strong></div>`).join("")}
+          ${realRows.length ? `<div style="font-size:11.5px;font-weight:700;color:var(--ink-3)">${month + 1} 月已录账单</div>${realRows.map(([cur, c]) => `<div class="agenda-total-row"><span>${esc(cur)} · ${esc(CURRENCY_NAMES[cur] || cur)}</span><strong class="sensitive">${esc(formatMoneyShort(cur, centsToText(c)))}</strong></div>`).join("")}` : ""}
+          ${projRows.length ? `<div style="font-size:11.5px;font-weight:700;color:var(--ink-3);margin-top:${realRows.length ? "6px" : "0"}">按周期推算参考（未确认扣费）</div>${projRows.map(([cur, c]) => `<div class="agenda-total-row"><span>${esc(cur)} · ${esc(CURRENCY_NAMES[cur] || cur)}</span><strong class="sensitive">${esc(formatMoneyShort(cur, centsToText(c)))}</strong></div>`).join("")}` : ""}
         </div>
       `
       : "";
@@ -2466,9 +2686,9 @@
     for (let nd = 1; nd <= trailing; nd++) cells += `<div class="cal-cell other"><div class="cal-day">${nd}</div></div>`;
 
     const agendaHtml = agenda.length === 0
-      ? `<p class="folio-p">本月没有账单、预计续费或保修到期。</p>`
+      ? `<p class="folio-p">本月没有账单、周期参考或保修到期。</p>`
       : `<div class="agenda-list">${agenda.map((ev) => `
-          <div class="agenda-row" data-cal-sid="${esc(ev.source_id)}">
+          <div class="agenda-row" tabindex="0" role="button" data-cal-sid="${esc(ev.source_id)}">
             <div style="display:flex;align-items:center;gap:10px;min-width:0">
               <div class="agenda-date-pill">${ev.day}</div>
               <div style="min-width:0">
@@ -2492,7 +2712,7 @@
             </div>
             <div class="cal-legend">
               <span><i class="ldot real"></i>账单日</span>
-              <span><i class="ldot proj"></i>预计续费</span>
+              <span><i class="ldot proj"></i>按周期推算</span>
               <span><i class="ldot war"></i>保修截止</span>
             </div>
           </div>
@@ -2537,9 +2757,16 @@
       renderCalendarPane(ws);
     });
     pane.querySelectorAll("[data-cal-sid]").forEach((el) => {
-      el.addEventListener("click", () => {
+      const openCalItem = () => {
         const found = (ws.items || []).find((i) => i.source_id === el.getAttribute("data-cal-sid"));
         if (found) openDrawer(found);
+      };
+      el.addEventListener("click", openCalItem);
+      el.addEventListener("keydown", (e) => {
+        if ((e.key === "Enter" || e.key === " ") && e.target === el) {
+          e.preventDefault();
+          openCalItem();
+        }
       });
     });
     pane.querySelectorAll("[data-cal-add-date]").forEach((btn) => {
@@ -2599,7 +2826,7 @@
     }).join("");
 
     const legendHtml = catRows.map((row, idx) => `
-      <div class="legend-row" data-jump-cat="${esc(row.name)}">
+      <div class="legend-row" tabindex="0" role="button" data-jump-cat="${esc(row.name)}">
         <div class="legend-l"><span class="swatch" style="background:${palette[idx % palette.length]}"></span><span>${esc(row.name)}</span></div>
         <strong class="sensitive num">${esc(formatMoneyShort(cur, row.amount_text))} · ${Math.round((row.cents / totalCat) * 100)}%</strong>
       </div>
@@ -2619,7 +2846,7 @@
     const totalAcc = accRows.reduce((s, r) => s + (r.cents || 0), 0) || 1;
     const allocSegs = accRows.map((row, idx) => `<div class="alloc-seg" style="width:${Math.max(4, Math.round((row.cents / totalAcc) * 100))}%;background:${palette[(idx + 1) % palette.length]}"></div>`).join("");
     const accLegend = accRows.map((row, idx) => `
-      <div class="legend-row" data-jump-acc="${esc(row.name)}">
+      <div class="legend-row" tabindex="0" role="button" data-jump-acc="${esc(row.name)}">
         <div class="legend-l"><span class="swatch" style="background:${palette[(idx + 1) % palette.length]}"></span><span class="sensitive">${esc(row.name)}（${row.count} 笔）</span></div>
         <strong class="sensitive num">${esc(formatMoneyShort(cur, row.amount_text))} · ${Math.round((row.cents / totalAcc) * 100)}%</strong>
       </div>
@@ -2640,7 +2867,7 @@
               : `<span class="micro-pill ${km.pill}">${esc(km.label)}</span>`;
             const spark = buildMiniSparkline(vp.history || [], drift?.direction === "up" ? "var(--rose)" : "var(--blue)", vp.latest_date);
             return `
-              <div class="vendor-tile" data-jump-vendor="${esc(vp.vendor)}">
+              <div class="vendor-tile" tabindex="0" role="button" data-jump-vendor="${esc(vp.vendor)}">
                 <div class="vt-head">
                   <div class="vt-id">
                     <div class="brand-badge brand-badge-sm" style="background:${brand.bg}">${esc(brand.mark)}</div>
@@ -2665,13 +2892,13 @@
       </div>
     `;
 
-    // Deduplicate recurring subscriptions by (vendor, currency, cycle) keeping only the latest bill
+    // Deduplicate recurring subscriptions consistently by (vendor, plan, account, currency, cycle)
     const latestSubMap = new Map();
     for (const it of ws.items || []) {
       const ann = it.annotation || {};
       const amt = it.amount_fact?.value;
       if (!amt || amt.currency !== cur || !["monthly", "yearly", "quarterly", "weekly"].includes(ann.billing_cycle)) continue;
-      const key = `${(ann.vendor || it.display_name).trim().toLowerCase()}|${ann.billing_cycle}`;
+      const key = subscriptionIdentityKey(it);
       const dStr = ann.bill_date || it.period_fact?.value?.period_start || "";
       const prev = latestSubMap.get(key);
       if (!prev || dStr >= prev.dStr) latestSubMap.set(key, { it, dStr });
@@ -2685,17 +2912,18 @@
       const mult = { monthly: 12, yearly: 1, quarterly: 4, weekly: 52 }[ann.billing_cycle] || 0;
       const yrCents = amountToCents(amt.amount_text) * mult;
       const isCut = state.simCutIds.has(it.source_id);
+      const subTag = [ann.account_label, ann.plan_name].filter(Boolean).join(" · ");
       if (isCut) {
         yearlySave += yrCents;
-        cutList.push(`${ann.vendor || it.display_name}（${formatMoney(cur, amt.amount_text)} / ${CYCLE_LABELS[ann.billing_cycle]}）`);
+        cutList.push(`${ann.vendor || it.display_name}${ann.account_label ? ` [${ann.account_label}]` : ""}（${formatMoney(cur, amt.amount_text)} / ${CYCLE_LABELS[ann.billing_cycle]}）`);
       }
       return `
         <div class="sim-row ${isCut ? "cut" : ""}">
           <div style="min-width:0">
             <div class="sim-title" style="font-weight:700;font-size:13.5px">${esc(ann.vendor || it.display_name)}</div>
-            <div style="font-size:12px;color:var(--ink-3)" class="sensitive num">${esc(formatMoneyShort(cur, amt.amount_text))} / ${esc(CYCLE_LABELS[ann.billing_cycle])} · 年合 ${esc(formatMoneyShort(cur, centsToText(yrCents)))}</div>
+            <div style="font-size:12px;color:var(--ink-3)" class="sensitive num">${esc(formatMoneyShort(cur, amt.amount_text))} / ${esc(CYCLE_LABELS[ann.billing_cycle])} · 年合 ${esc(formatMoneyShort(cur, centsToText(yrCents)))}${subTag ? ` · ${esc(subTag)}` : ""}</div>
           </div>
-          <label class="ios-switch"><input type="checkbox" data-sim-sid="${esc(it.source_id)}" ${isCut ? "checked" : ""}><span class="ios-slider"></span></label>
+          <label class="ios-switch"><input type="checkbox" aria-label="试算取消 ${esc(ann.vendor || it.display_name)}" data-sim-sid="${esc(it.source_id)}" ${isCut ? "checked" : ""}><span class="ios-slider"></span></label>
         </div>
       `;
     }).join("");
@@ -2779,12 +3007,32 @@
       c.addEventListener("click", () => { state.categoryFilter = c.getAttribute("data-cat-slice"); state.currencyFilter = cur; navigateTo("assets", "all"); });
     });
     catLegends.forEach((r) => {
+      const jump = () => { state.categoryFilter = r.getAttribute("data-jump-cat"); state.currencyFilter = cur; navigateTo("assets", "all"); };
       r.addEventListener("mouseenter", () => highlightCat(r.getAttribute("data-jump-cat")));
       r.addEventListener("mouseleave", () => highlightCat(""));
-      r.addEventListener("click", () => { state.categoryFilter = r.getAttribute("data-jump-cat"); state.currencyFilter = cur; navigateTo("assets", "all"); });
+      r.addEventListener("click", jump);
+      r.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); jump(); } });
     });
-    pane.querySelectorAll("[data-jump-acc]").forEach((r) => r.addEventListener("click", () => { const a = r.getAttribute("data-jump-acc"); state.accountFilter = a === "未分组" ? "" : a; navigateTo("assets", "all"); }));
-    pane.querySelectorAll("[data-jump-vendor]").forEach((t) => t.addEventListener("click", () => { const v = t.getAttribute("data-jump-vendor") || ""; state.searchQuery = v; $("search-box").value = v; navigateTo("assets", "all"); }));
+    pane.querySelectorAll("[data-jump-acc]").forEach((r) => {
+      const jump = () => {
+        const a = r.getAttribute("data-jump-acc");
+        state.accountFilter = a === "未分组" ? "" : a;
+        if ($("filter-account")) $("filter-account").value = state.accountFilter;
+        navigateTo("assets", "all");
+      };
+      r.addEventListener("click", jump);
+      r.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); jump(); } });
+    });
+    pane.querySelectorAll("[data-jump-vendor]").forEach((t) => {
+      const jump = () => {
+        const v = t.getAttribute("data-jump-vendor") || "";
+        state.searchQuery = v;
+        if ($("search-box")) $("search-box").value = v;
+        navigateTo("assets", "all");
+      };
+      t.addEventListener("click", jump);
+      t.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); jump(); } });
+    });
     pane.querySelectorAll("[data-sim-sid]").forEach((chk) => chk.addEventListener("change", () => {
       const sid = chk.getAttribute("data-sim-sid");
       if (chk.checked) {
@@ -2829,19 +3077,18 @@
 
     const item = queue[0];
     const ann = item.annotation || {};
-    const rawUrl = tokenUrl(`/api/sources/${encodeURIComponent(item.source_id)}/raw`);
-    const isImage = item.media_type.startsWith("image/");
-    const previewHtml = item.media_type === "application/pdf"
-      ? `<iframe src="${esc(rawUrl)}" title="PDF 原件"></iframe>`
-      : isImage
-        ? `<img src="${esc(rawUrl)}" alt="${esc(item.display_name)}">`
-        : item.media_type.startsWith("text/html")
-          ? `<iframe sandbox="" src="${esc(rawUrl)}" title="静态 HTML"></iframe>`
-          : `<pre id="triage-text-preview" class="code-sheet" style="margin:0">加载中…</pre>`;
+    const baseMime = (item.media_type || "").split(";")[0].trim().toLowerCase();
+    const isImage = ["image/png", "image/jpeg", "image/webp"].includes(baseMime);
+    const hasRichPreview = baseMime === "application/pdf" || isImage || baseMime === "text/html";
+    const previewHtml = hasRichPreview
+      ? `<div class="preview-loading" style="padding:24px;text-align:center;color:var(--ink-3);font-size:13px">原件加载中…</div>`
+      : `<pre id="triage-text-preview" class="code-sheet" style="margin:0">加载中…</pre>`;
 
     const defaultCur = state.heroCurrency || "CNY";
     const curs = (state.bootstrap?.currencies || ["CNY", "USD", "EUR", "GBP", "JPY", "HKD"])
       .map((c) => `<option value="${esc(c)}" ${c === defaultCur ? "selected" : ""}>${esc(c)} ${esc(CURRENCY_SYMBOLS[c] || "")}</option>`).join("");
+    const initialCycle = (ann.billing_cycle && ann.billing_cycle !== "unknown") ? ann.billing_cycle : "monthly";
+    const initialAcc = ann.account_label || "个人";
 
     pane.innerHTML = `
       <div class="folio-card triage-bar">
@@ -2855,7 +3102,7 @@
       <div class="triage-split">
         <div class="folio-card pad-24">
           <div class="micro-eyebrow" style="margin-bottom:10px">原件预览 · ${formatBytes(item.byte_length)}</div>
-          <div class="preview-frame ${isImage ? "is-image" : ""}" style="margin-bottom:0">${previewHtml}</div>
+          <div class="preview-frame ${isImage ? "is-image" : ""}" data-triage-preview style="margin-bottom:0">${previewHtml}</div>
         </div>
         <div class="folio-card pad-24">
           <h3 class="folio-h3" style="margin-bottom:14px">补充信息</h3>
@@ -2868,18 +3115,18 @@
             </div>
             <div class="chip-strip">
               <span class="chip-strip-lbl">周期</span>
-              ${["monthly", "yearly", "quarterly", "one_time"].map((c) => `<button type="button" class="tap-chip ${ann.billing_cycle === c ? "active" : ""}" data-tr-cycle="${c}">${CYCLE_LABELS[c]}</button>`).join("")}
+              ${["monthly", "yearly", "quarterly", "one_time"].map((c) => `<button type="button" class="tap-chip ${initialCycle === c ? "active" : ""}" data-tr-cycle="${c}">${CYCLE_LABELS[c]}</button>`).join("")}
             </div>
             <div class="chip-strip">
               <span class="chip-strip-lbl">账号</span>
-              ${["个人", "公司工作", "家庭共享"].map((a) => `<button type="button" class="tap-chip ${ann.account_label === a ? "active" : ""}" data-tr-acc="${a}">${a}</button>`).join("")}
+              ${["个人", "公司工作", "家庭共享"].map((a) => `<button type="button" class="tap-chip ${initialAcc === a ? "active" : ""}" data-tr-acc="${a}">${a}</button>`).join("")}
             </div>
             <div class="chip-strip">
               <span class="chip-strip-lbl">分类</span>
               ${["AI 工具", "数码硬件", "云存储", "开发工具", "办公效率"].map((k) => `<button type="button" class="tap-chip ${ann.category === k ? "active" : ""}" data-tr-cat="${k}">${k}</button>`).join("")}
             </div>
             <div class="grid-2">
-              <label class="field"><span>归属账号</span><input id="tr-account" type="text" value="${esc(ann.account_label || "个人")}"></label>
+              <label class="field"><span>归属账号</span><input id="tr-account" type="text" value="${esc(initialAcc)}"></label>
               <label class="field"><span>分类</span><input id="tr-category" type="text" value="${esc(ann.category || "")}"></label>
             </div>
             <label class="field"><span>账单日期（可选）</span><input id="tr-date" type="date" value="${esc(ann.bill_date || "")}"></label>
@@ -2889,12 +3136,19 @@
       </div>
     `;
 
-    if ($("triage-text-preview")) {
-      api("GET", `/api/sources/${encodeURIComponent(item.source_id)}/text`)
-        .then((res) => { if ($("triage-text-preview")) $("triage-text-preview").textContent = res.text || ""; })
+    if (hasRichPreview) {
+      loadAuthedPreviewInto(pane.querySelector("[data-triage-preview]"), item);
+    } else if ($("triage-text-preview")) {
+      const targetSid = item.source_id;
+      api("GET", `/api/sources/${encodeURIComponent(targetSid)}/text`)
+        .then((res) => {
+          const el = $("triage-text-preview");
+          const curQueue = getTriageQueue(state.workspace || {});
+          if (el && curQueue[0]?.source_id === targetSid) el.textContent = res.text || "";
+        })
         .catch(() => {});
     }
-    let chosenCycle = ann.billing_cycle || "monthly";
+    let chosenCycle = initialCycle;
     pane.querySelectorAll("[data-tr-cycle]").forEach((b) => b.addEventListener("click", () => {
       chosenCycle = b.getAttribute("data-tr-cycle");
       pane.querySelectorAll("[data-tr-cycle]").forEach((x) => x.classList.toggle("active", x === b));
@@ -2974,8 +3228,25 @@
     }));
   }
 
+  function trapFocusIn(container, e) {
+    if (e.key !== "Tab" || !container || container.classList.contains("hidden")) return;
+    const focusable = [...container.querySelectorAll('button:not([disabled]), [href], input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+      .filter((el) => el.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
   // --- Floating Detail Drawer ---
   function openDrawer(item, defaultTab) {
+    if (!state.selectedSourceId) state.drawerReturnFocus = document.activeElement;
     state.selectedSourceId = item.source_id;
     state.textViewActive = false;
     state.lastRedactedText = "";
@@ -2990,15 +3261,20 @@
     $("dtab-csv-btn").classList.toggle("hidden", !isCsv);
     renderDrawer(item);
     switchDrawerTab(defaultTab || (isCsv ? "csv" : item.status_flags?.needs_manual_entry ? "edit" : "summary"));
+    requestAnimationFrame(() => $("btn-close-drawer")?.focus());
   }
 
   function closeDrawer() {
+    const returnTo = state.drawerReturnFocus;
+    state.drawerReturnFocus = null;
     state.selectedSourceId = null;
+    revokeBlobUrls();
     const drawer = $("detail-drawer");
     const back = $("drawer-backdrop");
     if (drawer.classList.contains("hidden") || !motionOK()) {
       drawer.classList.add("hidden");
       back.classList.add("hidden");
+      if (returnTo && returnTo.isConnected) try { returnTo.focus(); } catch (_) {}
       return;
     }
     drawer.classList.add("closing");
@@ -3009,6 +3285,7 @@
       if (state.selectedSourceId) return;
       drawer.classList.add("hidden");
       back.classList.add("hidden");
+      if (returnTo && returnTo.isConnected) try { returnTo.focus(); } catch (_) {}
     }, 190);
   }
 
@@ -3048,8 +3325,8 @@
     add("分类", esc(ann.category));
     add("账单日期", esc(ann.bill_date));
     if (per?.period_start) add("服务周期", `${esc(per.period_start)} — ${esc(per.period_end)}`);
-    if (group?.renewal && !group.renewal.stale) add("预计续费", `${esc(group.renewal.date)} · ${relDayLabel(group.renewal.daysLeft)}`);
-    if (group?.renewal?.stale) add("续费", "两期以上没有新账单，可能已停用");
+    if (group?.renewal && !group.renewal.stale) add("周期参考", `${esc(group.renewal.date)} · ${relDayLabel(group.renewal.daysLeft)}（仅据账单周期）`);
+    if (group?.renewal?.stale) add("账单状态", `最近账单期至 ${esc(group.renewal.last)}（未录新账单，不代表当前是否扣费）`);
     if (kind === "hardware") {
       const w = warrantyInfo(ann.bill_date, ann.warranty_end);
       if (w) add("保修", `${esc(ann.warranty_end)} · ${esc(w.statusLabel)}`);
@@ -3061,15 +3338,12 @@
     add("备注", esc(ann.notes));
     add("原件", `${esc(item.display_name)} · ${formatBytes(item.byte_length)}`);
 
-    const rawUrl = tokenUrl(`/api/sources/${encodeURIComponent(item.source_id)}/raw`);
-    const isImg = item.media_type.startsWith("image/");
-    const preview = item.media_type === "application/pdf"
-      ? `<iframe src="${esc(rawUrl)}" title="PDF 原件"></iframe>`
-      : isImg
-        ? `<img src="${esc(rawUrl)}" alt="${esc(item.display_name)}">`
-        : item.media_type.startsWith("text/html")
-          ? `<iframe sandbox="" src="${esc(rawUrl)}" title="HTML 原件"></iframe>`
-          : `<pre class="ds-text" data-ds-text>加载中…</pre>`;
+    const baseMime = (item.media_type || "").split(";")[0].trim().toLowerCase();
+    const isImg = ["image/png", "image/jpeg", "image/webp"].includes(baseMime);
+    const hasRichPreview = baseMime === "application/pdf" || isImg || baseMime === "text/html";
+    const preview = hasRichPreview
+      ? `<div class="preview-loading" style="padding:24px;text-align:center;color:var(--ink-3);font-size:13px">原件加载中…</div>`
+      : `<pre class="ds-text" data-ds-text>加载中…</pre>`;
 
     const bills = group && group.items.length > 1
       ? `
@@ -3093,7 +3367,7 @@
       <div class="ds-grid">
         <dl class="ds-facts">${rows.join("")}</dl>
         <div class="ds-proof">
-          <div class="preview-frame ds-preview ${isImg ? "is-image" : ""}">${preview}</div>
+          <div class="preview-frame ds-preview ${isImg ? "is-image" : ""}" data-ds-preview>${preview}</div>
           <div class="ds-integrity ${item.object_intact ? "ok" : "bad"}">${ICO.shield}<span>${item.object_intact ? "SHA-256 校验一致，原件未改动" : "校验异常，请检查账本"}</span></div>
         </div>
       </div>
@@ -3101,10 +3375,12 @@
       <div class="ds-actions">
         <button type="button" class="btn btn-ink btn-sm" data-ds-tab="edit">编辑</button>
         <button type="button" class="btn btn-soft btn-sm" data-ds-tab="evidence">原件与校验码</button>
-        <a class="btn btn-ghost btn-sm" href="${esc(tokenUrl(`/api/sources/${encodeURIComponent(item.source_id)}/raw?download=1`))}" download>下载原件</a>
+        <button type="button" class="btn btn-ghost btn-sm" data-ds-dl-raw>下载原件</button>
       </div>`;
 
     box.querySelectorAll("[data-ds-tab]").forEach((b) => b.addEventListener("click", () => switchDrawerTab(b.getAttribute("data-ds-tab"))));
+    const dlRawBtn = box.querySelector("[data-ds-dl-raw]");
+    if (dlRawBtn) dlRawBtn.addEventListener("click", () => downloadAuthedFile(`/api/sources/${encodeURIComponent(item.source_id)}/raw?download=1`, item.display_name));
     box.querySelectorAll("[data-ds-open-sid]").forEach((b) => b.addEventListener("click", () => {
       const it = (state.workspace?.items || []).find((i) => i.source_id === b.getAttribute("data-ds-open-sid"));
       if (it) openDrawer(it);
@@ -3112,14 +3388,18 @@
     const keyBtn = box.querySelector("[data-ds-copy-key]");
     if (keyBtn) keyBtn.addEventListener("click", () => {
       const plate = box.querySelector(".ds-key");
-      if (plate) scrambleText(plate, plate.textContent, 620);
+      if (plate) scrambleText(plate, maskLicenseKey(ann.license_key), 620);
       copyLicenseKey(ann.vendor || item.display_name, ann.license_key, keyBtn);
     });
+    if (hasRichPreview) {
+      loadAuthedPreviewInto(box.querySelector("[data-ds-preview]"), item);
+    }
     const textBox = box.querySelector("[data-ds-text]");
     if (textBox) {
-      api("GET", `/api/sources/${encodeURIComponent(item.source_id)}/text`)
-        .then((res) => { textBox.textContent = res.text || "（无纯文本预览）"; })
-        .catch(() => { textBox.textContent = "（无法预览）"; });
+      const targetSid = item.source_id;
+      api("GET", `/api/sources/${encodeURIComponent(targetSid)}/text`)
+        .then((res) => { if (state.selectedSourceId === targetSid) textBox.textContent = res.text || "（无纯文本预览）"; })
+        .catch(() => { if (state.selectedSourceId === targetSid) textBox.textContent = "（无法预览）"; });
     }
   }
 
@@ -3201,7 +3481,7 @@
       <div><strong>SHA-256：</strong><code>${esc(item.content_sha256)}</code></div>
       <div><strong>完整性：</strong>${item.object_intact ? "校验一致，原件未改动" : "校验异常，请检查账本"}</div>
     `;
-    $("btn-download-raw").href = tokenUrl(`/api/sources/${encodeURIComponent(item.source_id)}/raw?download=1`);
+    $("btn-download-raw").onclick = () => downloadAuthedFile(`/api/sources/${encodeURIComponent(item.source_id)}/raw?download=1`, item.display_name);
 
     $("evidence-occurrences").innerHTML = `
       <div class="micro-eyebrow" style="margin:6px 0 2px">导入记录（共 ${item.occurrence_count} 次）</div>
@@ -3217,18 +3497,29 @@
     const item = (state.workspace?.items || []).find((i) => i.source_id === sourceId);
     if (!item) return;
     const box = $("evidence-preview-box"), textBox = $("evidence-text-box");
-    const rawUrl = tokenUrl(`/api/sources/${encodeURIComponent(sourceId)}/raw`);
-    const isImg = item.media_type.startsWith("image/");
+    const baseMime = (item.media_type || "").split(";")[0].trim().toLowerCase();
+    const isImg = ["image/png", "image/jpeg", "image/webp"].includes(baseMime);
+    const hasRichPreview = baseMime === "application/pdf" || isImg || baseMime === "text/html";
     box.classList.toggle("is-image", isImg);
-    if (item.media_type === "application/pdf") { box.innerHTML = `<iframe src="${esc(rawUrl)}" title="PDF 原件"></iframe>`; box.classList.remove("hidden"); }
-    else if (isImg) { box.innerHTML = `<img src="${esc(rawUrl)}" alt="${esc(item.display_name)}">`; box.classList.remove("hidden"); }
-    else if (item.media_type.startsWith("text/html")) { box.innerHTML = `<iframe sandbox="" src="${esc(rawUrl)}" title="静态 HTML 原件"></iframe>`; box.classList.remove("hidden"); }
-    else { box.classList.add("hidden"); state.textViewActive = true; }
+    if (hasRichPreview) {
+      box.classList.remove("hidden");
+      loadAuthedPreviewInto(box, item);
+    } else {
+      box.classList.add("hidden");
+      state.textViewActive = true;
+    }
     textBox.classList.toggle("hidden", !state.textViewActive);
+    textBox.textContent = "加载中…";
     try {
       const res = await api("GET", `/api/sources/${encodeURIComponent(sourceId)}/text`);
-      textBox.textContent = res.text || "（无纯文本预览）";
-    } catch (err) { textBox.textContent = `文本加载失败：${err.message}`; }
+      if (state.selectedSourceId === sourceId) {
+        textBox.textContent = res.text || "（无纯文本预览）";
+      }
+    } catch (err) {
+      if (state.selectedSourceId === sourceId) {
+        textBox.textContent = `文本加载失败：${err.message}`;
+      }
+    }
   }
 
   function renderCsvRows(item) {
@@ -3241,15 +3532,34 @@
       return true;
     });
     if (!rows.length) { box.innerHTML = `<p class="folio-p">没有符合条件的流水记录。</p>`; return; }
-    box.innerHTML = rows.slice(0, 150).map((r, idx) => `
-      <div class="csv-row">
-        <div>
-          <strong>${esc(r.merchant || "未标注商户")} · <span class="sensitive num">${esc(formatMoney(r.currency || "CNY", r.amount_text))}</span></strong>
-          <small>${esc(r.date || "")} · ${esc(r.description || "")}</small>
+    const limit = Number(box.dataset.csvLimit || "100");
+    const visible = rows.slice(0, limit);
+    const moreHtml = rows.length > limit
+      ? `<div style="text-align:center;padding-top:8px"><button type="button" class="btn btn-soft btn-sm" id="btn-drawer-csv-more">加载更多（剩余 ${rows.length - limit} 条）</button></div>`
+      : "";
+    box.innerHTML = visible.map((r, idx) => {
+      const isNonExpense = ["income", "refund", "neutral"].includes(r.direction);
+      const dirLabel = { income: "收入", refund: "退款", neutral: "中性交易" }[r.direction] || "";
+      const actHtml = isNonExpense
+        ? `<span class="micro-pill slate">${esc(dirLabel)} · 不计支出</span>`
+        : `<button type="button" class="btn btn-soft btn-sm" data-csv-promote="${idx}">加入账本</button>`;
+      return `
+        <div class="csv-row">
+          <div>
+            <strong>${esc(r.merchant || "未标注商户")} · <span class="sensitive num">${esc(formatMoney(r.currency || "CNY", r.amount_text))}</span></strong>
+            <small>${esc(r.date || "")} · ${esc(r.description || "")}</small>
+          </div>
+          ${actHtml}
         </div>
-        <button type="button" class="btn btn-soft btn-sm" data-csv-promote="${idx}">加入账本</button>
-      </div>
-    `).join("");
+      `;
+    }).join("") + moreHtml;
+    const moreBtn = $("btn-drawer-csv-more");
+    if (moreBtn) {
+      moreBtn.addEventListener("click", () => {
+        box.dataset.csvLimit = String(limit + 150);
+        renderCsvRows(item);
+      });
+    }
     box.querySelectorAll("[data-csv-promote]").forEach((btn) => btn.addEventListener("click", async () => {
       const r = rows[Number(btn.getAttribute("data-csv-promote"))];
       if (!r) return;
@@ -3257,7 +3567,7 @@
       try {
         const res = await api("POST", "/api/csv/promote", {
           parent_source_id: item.source_id, row_number: r.row_number, merchant: r.merchant || "", description: r.description || "",
-          date: r.date || "", currency: r.currency || "CNY", amount_text: r.amount_text || "", billing_cycle: "unknown",
+          date: r.date || "", currency: r.currency || "CNY", amount_text: r.amount_text || "", direction: r.direction || "", billing_cycle: "unknown",
           account_label: r.account_hint || undefined, raw_line: r.raw_line || "",
         });
         showToast(res.storage_reused ? "这条流水已经加过，已跳过重复" : `已将「${r.merchant || "该笔流水"}」加入账本`, "ok");
@@ -3300,20 +3610,30 @@
         const ref = (snap.items || []).find((i) => i.source_id === state.selectedSourceId);
         if (ref) renderDrawer(ref);
         showToast("已撤销上一步修改", "ok");
-      } catch (err) { showToast(err.message, "error"); }
+      } catch (err) {
+        showToast(err.message, "error");
+        btn.disabled = false;
+      }
     }));
   }
 
   // --- Spotlight Command Palette ---
   function openCmdPalette() {
     if (!state.workspace) return;
+    state.cmdReturnFocus = document.activeElement;
     state.cmdOpen = true; state.cmdIndex = 0;
     $("modal-cmd").classList.remove("hidden");
     $("cmd-input").value = "";
     renderCmdList("");
     $("cmd-input").focus();
   }
-  function closeCmdPalette() { state.cmdOpen = false; $("modal-cmd").classList.add("hidden"); }
+  function closeCmdPalette() {
+    state.cmdOpen = false;
+    $("modal-cmd").classList.add("hidden");
+    const ret = state.cmdReturnFocus;
+    state.cmdReturnFocus = null;
+    if (ret && ret.isConnected) try { ret.focus(); } catch (_) {}
+  }
 
   function renderCmdList(query) {
     const q = query.trim().toLowerCase();
@@ -3330,7 +3650,7 @@
       { ico: ICO.calendar, label: "打开日历", sub: "账单日、预计续费和保修截止", run: () => navigateTo("calendar") },
       { ico: ICO.chart, label: "打开统计", sub: "分类占比、商家汇总和试算", run: () => navigateTo("insights") },
       { ico: ICO.bolt, label: "打开待整理", sub: "对照原件补充信息", run: () => navigateTo("triage") },
-      { ico: ICO.download, label: "导出 Excel 表格 (.csv)", sub: "包含分类、保修与报销状态", run: () => { window.location.href = tokenUrl("/api/export/csv"); } },
+      { ico: ICO.download, label: "导出 Excel 表格 (.csv)", sub: "包含分类、保修与报销状态", run: () => downloadAuthedFile("/api/export/csv", "subvault-ledger.csv") },
       { ico: ICO.sun, label: "切换外观", sub: "浅色 / 暖白 / 深色", run: () => cycleTheme() },
       { ico: ICO.eye, label: "隐藏或显示金额", sub: "快捷键 P", run: () => togglePrivacy() },
       { ico: ICO.lock, label: "锁定账本", sub: "返回解锁界面", run: () => $("btn-lock-vault").click() },
@@ -3386,8 +3706,11 @@
   }
 
   function openManualModal(prefillDate) {
+    state.modalReturnFocus = document.activeElement;
     $("modal-manual").classList.remove("hidden");
     $("man-vendor").value = ""; $("man-plan").value = ""; $("man-amount").value = ""; $("man-notes").value = "";
+    $("man-account").value = "个人"; $("man-category").value = "";
+    document.querySelectorAll("[data-man-acc]").forEach((x) => x.classList.toggle("active", x.getAttribute("data-man-acc") === "个人"));
     $("man-license-key").value = ""; $("man-license-key").type = "password"; $("btn-man-toggle-key").textContent = "显示";
     $("man-license-scope").value = ""; $("man-warranty-end").value = ""; $("man-reimburse-status").value = "pending";
     const defCur = state.heroCurrency || "CNY";
@@ -3396,12 +3719,24 @@
     setManualAssetKind("subscription");
     $("man-vendor").focus();
   }
-  function closeManualModal() { $("modal-manual").classList.add("hidden"); }
+  function closeManualModal() {
+    $("modal-manual").classList.add("hidden");
+    const ret = state.modalReturnFocus;
+    state.modalReturnFocus = null;
+    if (ret && ret.isConnected) try { ret.focus(); } catch (_) {}
+  }
 
   // --- Upload & Drop ---
+  const IGNORED_DROP_NAMES = new Set([".ds_store", "thumbs.db", "desktop.ini"]);
+
   async function importFileList(files, origin) {
-    const valid = Array.from(files).filter((f) => f && f.size > 0);
-    if (!valid.length) return;
+    const all = Array.from(files || []).filter(Boolean);
+    const nonIgnored = all.filter((f) => !IGNORED_DROP_NAMES.has((f.name || "").toLowerCase()));
+    const valid = nonIgnored.filter((f) => f.size > 0);
+    if (!valid.length) {
+      if (all.length > 0) showToast("选中的文件为空（0 字节）或为系统隐藏文件，未导入", "error");
+      return;
+    }
     const from = origin || state.importOrigin || importOriginFor($("btn-import-files"));
     state.importOrigin = null;
     if (from) flyPapersInto(from.x, from.y, valid);
@@ -3414,6 +3749,11 @@
       const f = valid[i];
       const pct = Math.round(((i + 0.5) / valid.length) * 100);
       prog.innerHTML = `<span class="ip-bar" style="width:${pct}%"></span><span class="ip-text">收进金库 ${i + 1}/${valid.length} · ${esc(f.name)}</span>`;
+      if (f.size > 8 * 1024 * 1024) {
+        failed += 1;
+        lastError = `${f.name}: 单个文件不能超过 8 MiB`;
+        continue;
+      }
       try {
         const res = await api("POST", "/api/import", { filename: f.name, content_base64: arrayBufferToBase64(await f.arrayBuffer()), batch_id: batchId });
         if (res.reused) reused += 1; else added += 1;
@@ -3431,21 +3771,32 @@
 
   async function collectDroppedFiles(dt) {
     const out = [];
-    const items = dt.items ? Array.from(dt.items) : [];
-    if (!items.some((it) => typeof it.webkitGetAsEntry === "function")) return Array.from(dt.files || []);
+    const items = dt?.items ? Array.from(dt.items) : [];
+    const hasEntryApi = items.some((it) => typeof it.webkitGetAsEntry === "function");
+    if (!hasEntryApi) return Array.from(dt?.files || []);
+    // Snapshot every FileSystemEntry synchronously BEFORE the first await (Chromium clears DataTransferItemList after async yield).
+    const rootEntries = items
+      .map((it) => {
+        try { return typeof it.webkitGetAsEntry === "function" ? it.webkitGetAsEntry() : null; }
+        catch (_) { return null; }
+      })
+      .filter(Boolean);
+    if (!rootEntries.length) return Array.from(dt?.files || []);
     async function walk(entry) {
       if (!entry) return;
-      if (entry.isFile) { const f = await new Promise((r) => entry.file(r, () => r(null))); if (f) out.push(f); }
-      else if (entry.isDirectory) {
+      if (entry.isFile) {
+        const f = await new Promise((r) => entry.file(r, () => r(null)));
+        if (f && !IGNORED_DROP_NAMES.has((f.name || "").toLowerCase())) out.push(f);
+      } else if (entry.isDirectory) {
         const reader = entry.createReader();
         while (true) {
-          const b = await new Promise((r) => reader.readEntries(r, () => r([])));
-          if (!b.length) break;
-          for (const c of b) await walk(c);
+          const batch = await new Promise((r) => reader.readEntries(r, () => r([])));
+          if (!batch.length) break;
+          for (const child of batch) await walk(child);
         }
       }
     }
-    for (const it of items) { const e = it.webkitGetAsEntry(); if (e) await walk(e); }
+    for (const entry of rootEntries) await walk(entry);
     return out;
   }
 
@@ -3481,20 +3832,34 @@
     $("create-passphrase-confirm").addEventListener("input", updateTumblers);
 
     // Vault pill popover
+    const setPopoverOpen = (open) => {
+      $("vault-popover").classList.toggle("hidden", !open);
+      $("vault-pill-btn").setAttribute("aria-expanded", String(open));
+    };
     $("vault-pill-btn").addEventListener("click", (e) => {
       e.stopPropagation();
-      $("vault-popover").classList.toggle("hidden");
+      setPopoverOpen($("vault-popover").classList.contains("hidden"));
     });
     document.addEventListener("click", (e) => {
       if (!$("vault-popover").contains(e.target) && !$("vault-pill-btn").contains(e.target)) {
-        $("vault-popover").classList.add("hidden");
+        setPopoverOpen(false);
       }
     });
 
-    // Keyboard shortcuts
+    // Keyboard shortcuts & dialog focus trap
     document.addEventListener("keydown", (e) => {
       const inInput = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
+      const anyModalOpen = !$("modal-manual").classList.contains("hidden")
+        || !$("modal-recovery").classList.contains("hidden")
+        || state.cmdOpen;
+      if (e.key === "Tab") {
+        if (!$("modal-recovery").classList.contains("hidden")) { trapFocusIn($("modal-recovery"), e); return; }
+        if (state.cmdOpen) { trapFocusIn($("modal-cmd"), e); return; }
+        if (!$("modal-manual").classList.contains("hidden")) { trapFocusIn($("modal-manual"), e); return; }
+        if (state.selectedSourceId) { trapFocusIn($("detail-drawer"), e); return; }
+      }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        if (!$("modal-recovery").classList.contains("hidden")) return;
         e.preventDefault();
         if (state.cmdOpen) closeCmdPalette(); else openCmdPalette();
         return;
@@ -3507,11 +3872,11 @@
         return;
       }
       if (e.key === "Escape") {
-        $("vault-popover").classList.add("hidden");
+        setPopoverOpen(false);
         if (!$("modal-manual").classList.contains("hidden")) { closeManualModal(); return; }
         if (state.selectedSourceId) { closeDrawer(); return; }
       }
-      if (!inInput && !$("screen-workspace").classList.contains("hidden")) {
+      if (!inInput && !anyModalOpen && !state.selectedSourceId && !$("screen-workspace").classList.contains("hidden")) {
         if (e.key === "/") { e.preventDefault(); navigateTo("assets"); $("search-box").focus(); }
         else if (e.key.toLowerCase() === "p") togglePrivacy();
       }
@@ -3557,7 +3922,8 @@
         else if (state.unlockMode === "recovery") payload.recovery_key = $("unlock-recovery").value.trim();
         const snap = await api("POST", "/api/vault/unlock", payload);
         $("unlock-passphrase").value = ""; $("unlock-recovery").value = "";
-        await playVaultDoor(() => { state.workspace = snap; showWorkspaceScreen(); });
+        resetVaultUiState();
+        await playVaultDoor(() => { state.workspace = snap; showWorkspaceScreen(); navigateTo("assets", "all"); });
         showToast("金库门已打开，欢迎回来", "ok");
       } catch (err) {
         errBox.textContent = err.message; errBox.classList.remove("hidden");
@@ -3580,9 +3946,10 @@
       try {
         const res = await api("POST", "/api/vault/init", { path: $("create-path").value.trim(), protection: prot, passphrase: prot === "passphrase" ? pass : "" });
         $("create-passphrase").value = ""; $("create-passphrase-confirm").value = ""; updateTumblers();
+        resetVaultUiState();
         await refreshWorkspace();
         const enter = async () => {
-          await playVaultDoor(() => showWorkspaceScreen());
+          await playVaultDoor(() => { showWorkspaceScreen(); navigateTo("assets", "all"); });
           launchConfetti({ count: 90 });
           showToast("新金库落成，开始往里放东西吧", "ok");
         };
@@ -3674,19 +4041,25 @@
     $("folder-picker-input").addEventListener("change", (e) => { importFileList(e.target.files); e.target.value = ""; });
     $("btn-lock-vault").addEventListener("click", async () => {
       $("vault-popover").classList.add("hidden");
-      await api("POST", "/api/vault/lock", {});
-      state.workspace = null;
-      const info = await api("GET", "/api/bootstrap");
-      renderRecentVaults(info.recent_vaults || []);
-      await playVaultDoor(() => {
-        showLobbyScreen();
-        setLobbyTab("unlock");
-        if ((info.recent_vaults || []).length) selectRecentVault(info.recent_vaults[0]);
-      }, true);
-      showToast("金库已锁好", "ok");
+      try {
+        await api("POST", "/api/vault/lock", {});
+        resetVaultUiState();
+        const info = await api("GET", "/api/bootstrap");
+        renderRecentVaults(info.recent_vaults || []);
+        await playVaultDoor(() => {
+          showLobbyScreen();
+          setLobbyTab("unlock");
+          if ((info.recent_vaults || []).length) selectRecentVault(info.recent_vaults[0]);
+        }, true);
+        showToast("金库已锁好", "ok");
+      } catch (err) {
+        showToast(err.message || "锁定账本失败", "error");
+      }
     });
     $("btn-shutdown-app").addEventListener("click", async () => {
       try { await api("POST", "/api/shutdown", {}); } catch (_) {}
+      resetVaultUiState();
+      try { sessionStorage.removeItem(TOKEN_STORE_KEY); } catch (_) {}
       document.body.innerHTML = `<div class="farewell"><div class="farewell-lock">${LOCK_ART}</div><h2>SubVault 已安全退出</h2><p>金库门已锁好，本地服务已停止，可以直接关闭这个页面。</p></div>`;
     });
 
@@ -3766,11 +4139,11 @@
     });
     $("btn-dl-redact").addEventListener("click", () => downloadTextFile("subvault-redacted-template.txt", state.lastRedactedText));
 
-    $("btn-dl-excel").addEventListener("click", () => { window.location.href = tokenUrl("/api/export/csv"); });
+    $("btn-dl-excel").addEventListener("click", () => downloadAuthedFile("/api/export/csv", "subvault-ledger.csv"));
     $("btn-dl-zip").addEventListener("click", () => {
       const enc = state.workspace?.vault?.encrypted;
       if (enc && !$("chk-zip-ack").checked) { showToast("请先勾选明文导出确认框", "error"); return; }
-      window.location.href = tokenUrl(`/api/export/zip${enc ? "?acknowledge_plaintext=yes" : ""}`);
+      downloadAuthedFile(`/api/export/zip${enc ? "?acknowledge_plaintext=yes" : ""}`, "subvault-exit-pack.zip");
     });
     $("btn-export-dir").addEventListener("click", async () => {
       const outDir = $("export-dir-path").value.trim(), enc = state.workspace?.vault?.encrypted, ack = $("chk-dir-ack").checked;
@@ -3779,8 +4152,9 @@
       if (enc && !ack) { showToast("请先勾选明文导出确认框", "error"); return; }
       try {
         const res = await api("POST", "/api/export/package", { out_dir: outDir, acknowledge_plaintext: Boolean(ack) });
-        resBox.className = "inline-banner";
-        resBox.textContent = res.verified ? `导出并校验通过：共核验 ${res.verification?.files_verified ?? "?"} 个文件` : `已导出到 ${outDir}，但校验存在提醒`;
+        const count = res.verification?.verified_files ?? "?";
+        resBox.className = res.verified ? "inline-banner" : "inline-banner error";
+        resBox.textContent = res.verified ? `导出并校验通过：共核验 ${count} 个文件` : `已导出到 ${outDir}，但校验发现问题：${res.verification?.reason || "请检查目录"}`;
         resBox.classList.remove("hidden"); $("verify-dir-path").value = outDir;
       } catch (err) { resBox.className = "inline-banner error"; resBox.textContent = err.message; resBox.classList.remove("hidden"); }
     });
@@ -3789,18 +4163,28 @@
       if (!dir) { showToast("请填写备份包目录路径", "error"); return; }
       try {
         const res = await api("POST", "/api/verify-package", { package_dir: dir });
+        const count = res.report?.verified_files ?? "?";
+        const defectCount = Array.isArray(res.report?.defects) ? res.report.defects.length : 0;
         resBox.className = res.verified ? "inline-banner" : "inline-banner error";
-        resBox.textContent = res.verified ? `校验通过：共 ${res.report?.files_verified ?? "?"} 个文件完整无篡改` : `校验未通过：${res.report?.reason || "发现文件缺失或被修改"}`;
+        resBox.textContent = res.verified
+          ? `校验通过：共 ${count} 个文件完整无篡改`
+          : `校验未通过：${res.report?.reason || "发现文件缺失或被修改"}${defectCount > 0 ? `（共 ${defectCount} 处异常）` : ""}`;
         resBox.classList.remove("hidden");
       } catch (err) { resBox.className = "inline-banner error"; resBox.textContent = err.message; resBox.classList.remove("hidden"); }
     });
     $("form-rotate-pass").addEventListener("submit", async (e) => {
       e.preventDefault();
+      const curCred = $("rotate-current-pass").value;
       const p1 = $("rotate-new-pass").value, p2 = $("rotate-new-pass-confirm").value, rot = $("chk-rotate-recovery").checked;
+      if (!curCred.trim()) { showToast("请先输入当前主密码或离线恢复密钥", "error"); return; }
       if (p1.length < 6) { showToast("新密码至少需要 6 位字符", "error"); return; }
       if (p1 !== p2) { showToast("两次输入的新密码不一致", "error"); return; }
+      const payload = { new_passphrase: p1, rotate_recovery_key: rot };
+      if (/^svrk-/i.test(curCred.trim())) payload.recovery_key = curCred.trim();
+      else payload.current_passphrase = curCred;
       try {
-        const res = await api("POST", "/api/vault/rotate-passphrase", { new_passphrase: p1, rotate_recovery_key: rot });
+        const res = await api("POST", "/api/vault/rotate-passphrase", payload);
+        $("rotate-current-pass").value = "";
         $("rotate-new-pass").value = ""; $("rotate-new-pass-confirm").value = ""; $("chk-rotate-recovery").checked = false;
         if (res.recovery_key) openRecoveryModal(res.recovery_key, () => showToast("主密码与恢复密钥已更新", "ok"));
         else showToast("主密码已更新", "ok");

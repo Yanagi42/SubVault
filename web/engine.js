@@ -1180,11 +1180,15 @@ export class SubVaultStore {
 
     const reviewTxt = this.renderReviewSheet();
 
+    const copiedObjects = objectEntries.filter((o) => !o.rawBytesMissing);
+    const missingObjects = objectEntries.filter((o) => o.rawBytesMissing);
+    const completeness = missingObjects.length === 0 ? "complete" : "partial";
+
     const files = [
       { path: "records.json", sha256: snapshotId, byte_length: utf8Bytes(recordsJson).length },
       { path: "facts.csv", sha256: sha256Text(factsCsv), byte_length: utf8Bytes(factsCsv).length },
       { path: "review.txt", sha256: sha256Text(reviewTxt), byte_length: utf8Bytes(reviewTxt).length },
-      ...objectEntries.map((o) => ({
+      ...copiedObjects.map((o) => ({
         path: `originals/${o.objectId}`,
         sha256: o.contentSha256,
         byte_length: o.byteLength,
@@ -1195,20 +1199,25 @@ export class SubVaultStore {
     const manifestObj = {
       package_version: "offline-exit-1",
       snapshot_id: snapshotId,
-      completeness: "complete",
+      completeness,
       vault_format: this.vaultFormat,
       protection: "undecided",
       security_complete: false,
       synthetic_only: true,
       live_directory_copy: false,
       files,
-      missing: [],
+      missing: missingObjects.map((o) => ({
+        object_id: o.objectId,
+        expected_sha256: o.contentSha256,
+        expected_byte_length: o.byteLength,
+        reason: "binary_bytes_not_persisted_in_localstorage"
+      })),
       counts: {
         sources: this.sources.length,
         occurrences: this.occurrences.length,
         objects: this.objects.size,
-        objects_copied: this.objects.size,
-        objects_not_copied: 0,
+        objects_copied: copiedObjects.length,
+        objects_not_copied: missingObjects.length,
         facts: this.facts.length,
         decisions: this.decisions.length
       }
@@ -1222,7 +1231,7 @@ export class SubVaultStore {
       manifestJson,
       reviewTxt,
       manifest: manifestObj,
-      originals: objectEntries.map((o) => ({
+      originals: copiedObjects.map((o) => ({
         path: `originals/${o.objectId}`,
         objectId: o.objectId,
         bytes: o.rawBytes instanceof Uint8Array ? o.rawBytes : utf8Bytes(o.rawContent)
@@ -1459,6 +1468,19 @@ export class SubVaultStore {
   // --- Browser LocalStorage Snapshot Serialization ---
 
   toSnapshot() {
+    const MAX_OBJ_B64_BYTES = 512 * 1024;
+    const MAX_TOTAL_B64_BYTES = 2_400_000;
+    let totalBinary = 0;
+    const serializedObjects = [...this.objects.entries()].map(([k, v]) => {
+      if (v.rawBytes instanceof Uint8Array && v.rawBytes.length > 0) {
+        if (v.rawBytes.length <= MAX_OBJ_B64_BYTES && totalBinary + v.rawBytes.length <= MAX_TOTAL_B64_BYTES) {
+          totalBinary += v.rawBytes.length;
+          return [k, { ...v, rawBytes: null, rawBytesB64: bytesToBase64(v.rawBytes), rawBytesMissing: false }];
+        }
+        return [k, { ...v, rawBytes: null, rawBytesB64: null, rawBytesMissing: true }];
+      }
+      return [k, { ...v, rawBytes: null, rawBytesB64: null, rawBytesMissing: Boolean(v.rawBytesMissing) }];
+    });
     return {
       schema: "subvault-web-state-1",
       mode: this.mode,
@@ -1466,7 +1488,7 @@ export class SubVaultStore {
       vaultFormat: this.vaultFormat,
       reviewAnchorDate: this.reviewAnchorDate,
       seq: this.seq,
-      objects: [...this.objects.entries()].map(([k, v]) => [k, { ...v, rawBytes: null }]),
+      objects: serializedObjects,
       sources: this.sources,
       occurrences: this.occurrences,
       facts: this.facts,
@@ -1483,7 +1505,24 @@ export class SubVaultStore {
     this.vaultFormat = Number(snap.vaultFormat || 4);
     this.reviewAnchorDate = snap.reviewAnchorDate || REVIEW_ANCHOR_DATE;
     this.seq = Number(snap.seq || 1);
-    this.objects = new Map(snap.objects || []);
+    this.objects = new Map(
+      (snap.objects || []).map(([k, v]) => {
+        const obj = { ...v };
+        if (typeof obj.rawBytesB64 === "string" && obj.rawBytesB64.length > 0) {
+          try {
+            obj.rawBytes = base64ToBytes(obj.rawBytesB64);
+            obj.rawBytesMissing = false;
+          } catch {
+            obj.rawBytes = null;
+            obj.rawBytesMissing = true;
+          }
+        } else {
+          obj.rawBytes = null;
+        }
+        delete obj.rawBytesB64;
+        return [k, obj];
+      })
+    );
     this.sources = snap.sources || [];
     this.occurrences = snap.occurrences || [];
     this.facts = snap.facts || [];
@@ -1492,6 +1531,25 @@ export class SubVaultStore {
     this.activityLog = snap.activityLog || [];
     return true;
   }
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return typeof btoa === "function" ? btoa(binary) : Buffer.from(bytes).toString("base64");
+}
+
+function base64ToBytes(b64) {
+  if (typeof atob === "function") {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  return new Uint8Array(Buffer.from(b64, "base64"));
 }
 
 function csvEscape(val) {

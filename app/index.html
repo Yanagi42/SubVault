@@ -232,11 +232,11 @@
       <div class="masthead-inner">
         <!-- 左：账本身份胶囊（点击展开路径 / 锁定 / 退出浮层） -->
         <div class="vault-anchor">
-          <button id="vault-pill-btn" class="vault-pill" type="button" title="账本状态与安全退出">
+          <button id="vault-pill-btn" class="vault-pill" type="button" title="账本状态与安全退出" aria-haspopup="menu" aria-expanded="false">
             <img src="/icon.svg" alt="SubVault" width="20" height="20" class="vp-logo">
             <span id="mh-vault-name" class="vp-name">我的订阅账本</span>
-            <span id="mh-vault-dot" class="vp-dot green"></span>
-            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 9 6 6 6-6"/></svg>
+            <span id="mh-vault-dot" class="vp-dot green" aria-hidden="true"></span>
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
           </button>
           <div id="vault-popover" class="vault-popover hidden">
             <div class="vp-pop-head">
@@ -272,25 +272,25 @@
         <div class="masthead-right">
           <div id="import-progress" class="import-pill hidden"></div>
 
-          <button id="btn-cmd-open" class="icon-circle" type="button" title="搜索或快捷操作（Ctrl+K）">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <button id="btn-cmd-open" class="icon-circle" type="button" title="搜索或快捷操作（Ctrl+K）" aria-label="打开快捷搜索面板">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
           </button>
-          <button id="btn-privacy-toggle" class="icon-circle" type="button" title="隐藏金额与密钥（快捷键 P）">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+          <button id="btn-privacy-toggle" class="icon-circle" type="button" title="隐藏金额与密钥（快捷键 P）" aria-label="切换隐私磨砂保护" aria-pressed="false">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
           </button>
-          <button id="btn-theme-cycle" class="icon-circle" type="button" title="切换外观（浅色 / 暖白 / 深色）">
-            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+          <button id="btn-theme-cycle" class="icon-circle" type="button" title="切换外观（浅色 / 暖白 / 深色）" aria-label="切换外观主题">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
           </button>
 
           <button id="btn-open-manual" class="btn btn-soft btn-sm" type="button">记一笔</button>
 
           <div class="split-ink-btn">
             <button id="btn-import-files" class="btn btn-ink btn-sm" type="button">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
               导入
             </button>
-            <button id="btn-import-folder" class="btn btn-ink btn-sm btn-icon-pad" type="button" title="导入整个文件夹">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            <button id="btn-import-folder" class="btn btn-ink btn-sm btn-icon-pad" type="button" title="导入整个文件夹" aria-label="导入整个文件夹">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
             </button>
           </div>
         </div>
@@ -324,23 +324,23 @@
           <div class="collection-tools">
             <div id="active-filter-chips" class="inline-chips"></div>
             <div class="search-capsule">
-              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-              <input id="search-box" type="search" placeholder="搜索商家、型号、备注…">
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+              <input id="search-box" type="search" placeholder="搜索商家、型号、备注…" aria-label="搜索商家、型号或备注">
             </div>
-            <select id="filter-account" class="ghost-select" title="按账号筛选">
+            <select id="filter-account" class="ghost-select" title="按账号筛选" aria-label="按账号筛选">
               <option value="">所有账号</option>
             </select>
-            <select id="sort-order" class="ghost-select" title="排序方式">
+            <select id="sort-order" class="ghost-select" title="排序方式" aria-label="排序方式">
               <option value="recent">按录入时间</option>
               <option value="amount_desc">金额从高到低</option>
               <option value="date_desc">日期最近</option>
             </select>
             <div class="view-toggle" role="group" aria-label="切换卡片或列表">
-              <button class="vt-btn active" data-view-mode="cards" type="button" title="卡片">
-                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect width="7" height="7" x="3" y="3" rx="1.2"/><rect width="7" height="7" x="14" y="3" rx="1.2"/><rect width="7" height="7" x="14" y="14" rx="1.2"/><rect width="7" height="7" x="3" y="14" rx="1.2"/></svg>
+              <button class="vt-btn active" data-view-mode="cards" type="button" title="卡片视图" aria-label="卡片视图">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><rect width="7" height="7" x="3" y="3" rx="1.2"/><rect width="7" height="7" x="14" y="3" rx="1.2"/><rect width="7" height="7" x="14" y="14" rx="1.2"/><rect width="7" height="7" x="3" y="14" rx="1.2"/></svg>
               </button>
-              <button class="vt-btn" data-view-mode="table" type="button" title="列表">
-                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>
+              <button class="vt-btn" data-view-mode="table" type="button" title="列表视图" aria-label="列表视图">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><line x1="8" x2="21" y1="6" y2="6"/><line x1="8" x2="21" y1="12" y2="12"/><line x1="8" x2="21" y1="18" y2="18"/><line x1="3" x2="3.01" y1="6" y2="6"/><line x1="3" x2="3.01" y1="12" y2="12"/><line x1="3" x2="3.01" y1="18" y2="18"/></svg>
               </button>
             </div>
           </div>
@@ -427,14 +427,18 @@
             <p class="folio-p">直接更换密码，不需要重新导入文件。</p>
           </div>
           <form id="form-rotate-pass" class="stack-12">
+            <label class="field">
+              <span>当前主密码（或离线恢复密钥 SVRK-…）</span>
+              <input id="rotate-current-pass" type="password" autocomplete="current-password" required placeholder="输入当前主密码或 SVRK-... 恢复密钥">
+            </label>
             <div class="grid-2">
               <label class="field">
                 <span>新主密码（至少 6 位）</span>
-                <input id="rotate-new-pass" type="password" required placeholder="输入新密码">
+                <input id="rotate-new-pass" type="password" autocomplete="new-password" required placeholder="输入新密码">
               </label>
               <label class="field">
                 <span>确认新主密码</span>
-                <input id="rotate-new-pass-confirm" type="password" required placeholder="再次输入">
+                <input id="rotate-new-pass-confirm" type="password" autocomplete="new-password" required placeholder="再次输入">
               </label>
             </div>
             <label class="check-row">
@@ -590,11 +594,11 @@
     </div>
   </div>
 
-  <div id="modal-cmd" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+  <div id="modal-cmd" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="快捷命令面板">
     <div class="cmd-sheet">
       <div class="cmd-search">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
-        <input id="cmd-input" type="text" placeholder="搜索记录、商家或功能…">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="cmd-input" type="text" placeholder="搜索记录、商家或功能…" aria-label="搜索记录、商家或功能">
         <kbd>Esc</kbd>
       </div>
       <div id="cmd-list" class="cmd-list"></div>
@@ -605,7 +609,7 @@
        右侧浮雕详情检视抽屉
        ===================================================================== -->
   <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
-  <aside id="detail-drawer" class="drawer hidden" aria-label="资产详情与原件核对">
+  <aside id="detail-drawer" class="drawer hidden" role="dialog" aria-modal="true" aria-label="资产详情与原件核对">
     <div class="drawer-head">
       <div class="drawer-id">
         <div id="drawer-avatar" class="brand-badge">SV</div>
@@ -789,7 +793,7 @@
       <div id="dpane-evidence" class="dpane hidden">
         <div class="meta-sheet" id="evidence-meta"></div>
         <div class="btn-row" style="margin-bottom:12px">
-          <a id="btn-download-raw" class="btn btn-soft btn-sm" href="#" download>下载原件</a>
+          <button id="btn-download-raw" class="btn btn-soft btn-sm" type="button">下载原件</button>
           <button id="btn-toggle-text-view" class="btn btn-ghost btn-sm" type="button">查看纯文本</button>
         </div>
         <div id="evidence-preview-box" class="preview-frame"></div>

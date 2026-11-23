@@ -26,13 +26,13 @@
         <button id="btn-import-sample" class="btn btn-emerald" type="button" title="Import the 12-file synthetic corpus (re-clicking demonstrates byte-identical duplicate detection)">
           + Import Sample Batch
         </button>
-        <label class="btn" for="file-upload-input" title="Drop or select local .html, .txt, .csv, or .pdf files — hashed locally in browser">
+        <button id="btn-upload-local" class="btn" type="button" title="Drop or select local .html, .txt, .csv, or .pdf files — hashed locally in browser">
           Upload Local File
-        </label>
+        </button>
         <input id="file-upload-input" type="file" multiple accept=".html,.htm,.txt,.csv,.pdf" class="hidden">
-        <label class="btn" for="native-export-input" title="Open and SHA-256 verify an exported folder from native `subvault export` CLI">
+        <button id="btn-open-native-export" class="btn" type="button" title="Open and SHA-256 verify an exported folder from native `subvault export` CLI">
           Open Native Export
-        </label>
+        </button>
         <input id="native-export-input" type="file" webkitdirectory multiple class="hidden">
         <button id="btn-go-export" class="btn btn-primary" type="button">
           Export Exit Pack
