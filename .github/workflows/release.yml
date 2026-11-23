@@ -47,6 +47,7 @@ jobs:
           SUBVAULT_GIT_SHA: ${{ github.sha }}
         run: |
           python3 synthetic/generate_corpus.py --check
+          node --check app/app.js
           cargo fetch --locked
           cargo fmt --check
           cargo clippy --lib --bins --locked -- -D warnings
@@ -84,20 +85,39 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Run Windows pre-release verification gate
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Verify synthetic corpus & workbench syntax
+        run: python synthetic/generate_corpus.py --check
+
+      - name: Check workbench frontend syntax
+        run: node --check app/app.js
+
+      - name: Check Clippy lints on Windows (lib & binary)
+        run: cargo clippy --lib --bins --locked -- -D warnings
+
+      - name: Run Windows pre-release test suites
         env:
           SUBVAULT_GIT_SHA: ${{ github.sha }}
-        run: |
-          node --check app/app.js
-          cargo clippy --lib --bins --locked -- -D warnings
-          cargo test --locked --lib --test windows_native --test format6_crypto --test redact --test real_bills --test workbench_e2e --test pdf_bill --test verify_package --test review_sheet --test review_snapshot -- --test-threads=1
+        run: cargo test --locked --lib --test windows_native --test format6_crypto --test redact --test real_bills --test workbench_e2e --test pdf_bill --test verify_package --test review_sheet --test review_snapshot -- --test-threads=1
 
-      - name: Package Windows portable archive
+      - name: Package Windows portable archive & verify SHA256SUMS
         shell: pwsh
         env:
           SUBVAULT_GIT_SHA: ${{ github.sha }}
           TAG_NAME: ${{ inputs.tag || github.ref_name }}
-        run: ./scripts/package-release-windows.ps1 -TagName "$env:TAG_NAME"
+        run: |
+          ./scripts/package-release-windows.ps1 -TagName "$env:TAG_NAME"
+          $line = (Get-Content dist/SHA256SUMS-windows.txt).Trim()
+          $parts = $line -split '\s+'
+          $actual = (Get-FileHash (Join-Path dist $parts[1]) -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $parts[0]) { throw "SHA256 mismatch: $actual != $($parts[0])" }
+
+      - name: Run Web Demo & Windows CLI-Web interop checks
+        run: node scripts/test-web.mjs
 
       - name: Upload Windows release artifact
         uses: actions/upload-artifact@v4

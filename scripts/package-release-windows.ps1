@@ -68,8 +68,11 @@ foreach ($File in $WebFiles) {
 Copy-Item -Recurse -Path (Join-Path $Root "web\assets") -Destination (Join-Path $StageDir "web\assets")
 Copy-Item -Recurse -Path (Join-Path $Root "synthetic\corpus") -Destination (Join-Path $StageDir "synthetic\corpus")
 Copy-Item -Path (Join-Path $Root "README.md") -Destination (Join-Path $StageDir "README.md")
-if (Test-Path (Join-Path $Root "RELEASE_NOTES.md")) {
-    Copy-Item -Path (Join-Path $Root "RELEASE_NOTES.md") -Destination (Join-Path $StageDir "RELEASE_NOTES.md")
+foreach ($Doc in @("RELEASE_NOTES.md", "SECURITY.md", "LICENSE", "LICENSE-MIT", "LICENSE-APACHE")) {
+    $SrcDoc = Join-Path $Root $Doc
+    if (Test-Path $SrcDoc) {
+        Copy-Item -Path $SrcDoc -Destination (Join-Path $StageDir $Doc)
+    }
 }
 
 $BuiltUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")

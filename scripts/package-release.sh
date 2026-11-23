@@ -66,9 +66,11 @@ cp -R "$ROOT/synthetic/corpus" "$STAGE_DIR/synthetic/corpus"
 
 # Copy documentation & metadata
 cp "$ROOT/README.md" "$STAGE_DIR/README.md"
-if [[ -f "$ROOT/RELEASE_NOTES.md" ]]; then
-  cp "$ROOT/RELEASE_NOTES.md" "$STAGE_DIR/RELEASE_NOTES.md"
-fi
+for doc in RELEASE_NOTES.md SECURITY.md LICENSE LICENSE-MIT LICENSE-APACHE; do
+  if [[ -f "$ROOT/$doc" ]]; then
+    cp "$ROOT/$doc" "$STAGE_DIR/$doc"
+  fi
+done
 cat >"$STAGE_DIR/VERSION.txt" <<EOF
 version=v${VERSION}
 target=${OS}-${ARCH}

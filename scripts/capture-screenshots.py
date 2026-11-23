@@ -27,6 +27,12 @@ BROWSER_CANDIDATES = [
     shutil.which("chromium-browser"),
     shutil.which("google-chrome"),
     shutil.which("google-chrome-stable"),
+    shutil.which("chrome"),
+    shutil.which("msedge"),
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
     "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
 ]
@@ -50,18 +56,22 @@ class SubpathCheckHandler(http.server.SimpleHTTPRequestHandler):
         pass
 
 
+def is_wsl() -> bool:
+    return os.name != "nt" and shutil.which("wslpath") is not None
+
+
 def to_browser_path(browser: str, path: Path) -> str:
-    if browser.lower().endswith(".exe"):
+    if browser.lower().endswith(".exe") and is_wsl():
         return subprocess.check_output(["wslpath", "-w", str(path)], text=True).strip()
     return str(path)
 
 
 def capture(browser: str, url: str, dest: Path, width: int = 1440, height: int = 940) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # Windows browsers may not write directly into WSL UNC paths cleanly on all setups;
-    # write to a temp path if needed, then copy into repo.
-    is_win = browser.lower().endswith(".exe")
-    if is_win:
+    # Windows browsers invoked from WSL may not write directly into WSL UNC paths cleanly;
+    # write to a temp path in WSL, then copy into repo. On native Windows, write directly.
+    use_wsl_tmp = browser.lower().endswith(".exe") and is_wsl()
+    if use_wsl_tmp:
         win_tmp = Path("/mnt/c/Users/Public")
         if win_tmp.exists() and os.access(win_tmp, os.W_OK):
             tmp_shot = win_tmp / f"subvault-shot-{dest.name}"
@@ -85,7 +95,7 @@ def capture(browser: str, url: str, dest: Path, width: int = 1440, height: int =
             f"--screenshot={out_arg}",
             url,
         ]
-        if not is_win:
+        if not use_wsl_tmp:
             cmd.insert(-1, f"--user-data-dir={profile_dir}")
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
         if proc.returncode != 0:
