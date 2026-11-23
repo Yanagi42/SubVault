@@ -23,19 +23,20 @@ impl VaultLock {
     pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
         use std::fs::OpenOptions;
         use std::io::Write;
-        let existed = path.exists();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)?;
-        if !existed {
-            file.write_all(LOCK_TEXT.as_bytes())?;
-            file.sync_all()?;
-        }
         match crate::platform::try_lock_exclusive(&file) {
-            crate::lock_contract::LockAcquire::Acquired => Ok(Some(Self { file })),
+            crate::lock_contract::LockAcquire::Acquired => {
+                if file.metadata()?.len() == 0 {
+                    file.write_all(LOCK_TEXT.as_bytes())?;
+                    file.sync_all()?;
+                }
+                Ok(Some(Self { file }))
+            }
             crate::lock_contract::LockAcquire::Busy => Ok(None),
             crate::lock_contract::LockAcquire::Failure(err) => Err(err),
         }

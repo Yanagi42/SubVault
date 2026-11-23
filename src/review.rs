@@ -52,6 +52,13 @@ pub fn review_sheet(vault: &Path, out: &Path, package: Option<&Path>, auth: Auth
     )
 }
 
+pub(crate) fn review_sheet_in_memory(vault: &Path, auth: AuthInput) -> Result<String, Report> {
+    let (facts, candidates, sources, _, _) = read_snapshot(vault, &auth)?;
+    let link = export_link(None, &sources, &facts);
+    let (text, _, _) = render(&facts, &candidates, &sources, &link);
+    Ok(text)
+}
+
 #[allow(clippy::type_complexity)]
 fn read_snapshot(
     vault: &Path,
@@ -276,6 +283,8 @@ fn live_fact_keys(facts: &Value) -> Option<BTreeSet<String>> {
             row.get("candidate_id")?.as_str()?,
             row.get("fact_type")?.as_str()?,
             row.get("revision")?.as_i64()?,
+            field(row.get("value")?, "statement"),
+            field(row.get("value")?, "currency"),
             field(row.get("value")?, "amount_text"),
             field(row.get("value")?, "period_start"),
             field(row.get("value")?, "period_end"),
@@ -300,6 +309,8 @@ fn packed_fact_keys(facts: Option<&Value>) -> Option<BTreeSet<String>> {
             row.get("candidate_id")?.as_str()?,
             row.get("fact_type")?.as_str()?,
             row.get("revision")?.as_i64()?,
+            field(row.get("value")?, "statement"),
+            field(row.get("value")?, "currency"),
             field(row.get("value")?, "amount_text"),
             field(row.get("value")?, "period_start"),
             field(row.get("value")?, "period_end"),
@@ -318,6 +329,8 @@ fn csv_fact_keys(text: &str) -> Option<BTreeSet<String>> {
     let candidate_id = index("candidate_id")?;
     let fact_type = index("fact_type")?;
     let revision = index("revision")?;
+    let statement = index("statement")?;
+    let currency = index("currency")?;
     let amount = index("amount_text")?;
     let start = index("period_start")?;
     let end = index("period_end")?;
@@ -337,6 +350,8 @@ fn csv_fact_keys(text: &str) -> Option<BTreeSet<String>> {
             &row[candidate_id],
             &row[fact_type],
             row[revision].parse().ok()?,
+            row[statement].clone(),
+            row[currency].clone(),
             row[amount].clone(),
             row[start].clone(),
             row[end].clone(),
@@ -353,13 +368,15 @@ fn fact_key(
     candidate_id: &str,
     fact_type: &str,
     revision: i64,
+    statement: String,
+    currency: String,
     amount: String,
     start: String,
     end: String,
     latest: &str,
 ) -> String {
     format!(
-        "{fact_id}\t{source_id}\t{candidate_id}\t{fact_type}\t{revision}\t{amount}\t{start}\t{end}\t{latest}"
+        "{fact_id}\t{source_id}\t{candidate_id}\t{fact_type}\t{revision}\t{statement}\t{currency}\t{amount}\t{start}\t{end}\t{latest}"
     )
 }
 
@@ -565,14 +582,37 @@ fn amount_conclusion(fact: &Value, value: &Value) -> String {
     } else {
         format!("{} {}", show(currency), show(current))
     };
-    match stated_amount(fact["decisions"].as_array()) {
-        Some(original) if original != current => format!(
-            "当前记录金额 {money} 是人工修改后的值，原件仍写 {}。",
-            show(&original)
-        ),
+    match stated_amount_with_currency(fact["decisions"].as_array()) {
+        Some((orig_cur, original))
+            if original != current
+                || (!orig_cur.is_empty() && !currency.is_empty() && orig_cur != currency) =>
+        {
+            let orig_display =
+                if !orig_cur.is_empty() && !currency.is_empty() && orig_cur != currency {
+                    format!("{} {}", show(&orig_cur), show(&original))
+                } else {
+                    show(&original)
+                };
+            format!("当前记录金额 {money} 是人工修改后的值，原件仍写 {orig_display}。")
+        }
         Some(_) => format!("当前记录金额 {money}，与原件所写相同。"),
         None if current.is_empty() => "这条金额事实没有当前金额文本。".to_string(),
-        None => format!("当前记录金额 {money}。库里没有凭据金额。"),
+        None => match human_recorded_amount(fact["decisions"].as_array()) {
+            Some((orig_cur, original))
+                if original != current
+                    || (!orig_cur.is_empty() && !currency.is_empty() && orig_cur != currency) =>
+            {
+                let orig_display =
+                    if !orig_cur.is_empty() && !currency.is_empty() && orig_cur != currency {
+                        format!("{} {}", show(&orig_cur), show(&original))
+                    } else {
+                        show(&original)
+                    };
+                format!("当前记录金额 {money}（原为人工录入 {orig_display}，后经修改）。")
+            }
+            Some(_) => format!("当前记录金额 {money}（人工录入，无自动提取原件金额）。"),
+            None => format!("当前记录金额 {money}。库里没有凭据金额。"),
+        },
     }
 }
 
@@ -634,7 +674,7 @@ fn render(
     text.push_str(if is_real {
         "\
 详单
-这是真实资料库（格式 6）的只读文字审阅单。桌面交互界面尚未完成。
+这是真实资料库（格式 6）的只读文字审阅单（不含图像与交互界面）。
 原件里的 HTML 只按文字抄出，不渲染，也不打开链接，也不取远程资源。
 控制字符、换行和双向控制写成 \\u{XXXX}。反斜杠写成 \\\\。
 这些信息不代表什么
@@ -671,7 +711,7 @@ fn render(
     } else if facts_body["slice"].as_str() == Some("T5-pdf") {
         text.push_str("格式 5 收录静态 PDF 与 HTML 原件，不收纯文本片段，也不做 OCR。\n");
     } else if is_real {
-        text.push_str("格式 6 支持静态 PDF、HTML 与文本片段，不做 OCR。\n");
+        text.push_str("格式 6 支持静态 PDF、HTML、CSV 与文本片段，不做 OCR。\n");
     }
     text.push_str("来源\n");
     if sources.is_empty() {
@@ -924,13 +964,38 @@ fn push_span(text: &mut String, locator: &Value, fallback_excerpt: Option<&str>)
 }
 
 fn stated_amount(decisions: Option<&Vec<Value>>) -> Option<String> {
+    stated_amount_with_currency(decisions).map(|(_, amt)| amt)
+}
+
+fn stated_amount_with_currency(decisions: Option<&Vec<Value>>) -> Option<(String, String)> {
     let decisions = decisions?;
     for decision in decisions {
         if decision["kind"].as_str() != Some("rule_adopt") {
             continue;
         }
         if let Some(amount) = decision["new_value"]["amount_text"].as_str() {
-            return Some(amount.to_string());
+            let cur = decision["new_value"]["currency"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            return Some((cur, amount.to_string()));
+        }
+    }
+    None
+}
+
+fn human_recorded_amount(decisions: Option<&Vec<Value>>) -> Option<(String, String)> {
+    let decisions = decisions?;
+    for decision in decisions {
+        if decision["kind"].as_str() != Some("human_record") {
+            continue;
+        }
+        if let Some(amount) = decision["new_value"]["amount_text"].as_str() {
+            let cur = decision["new_value"]["currency"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            return Some((cur, amount.to_string()));
         }
     }
     None
@@ -951,6 +1016,23 @@ fn stated_phrase(amount: &Option<String>, fact: &Value) -> String {
         let end = decision["new_value"]["period_end"].as_str().unwrap_or("");
         if !start.is_empty() || !end.is_empty() {
             return format!("period_start={} period_end={}", show(start), show(end));
+        }
+    }
+    for decision in decisions {
+        if decision["kind"].as_str() != Some("human_record") {
+            continue;
+        }
+        if let Some(amt) = decision["new_value"]["amount_text"].as_str() {
+            return format!("人工录入 amount_text={}", show(amt));
+        }
+        let start = decision["new_value"]["period_start"].as_str().unwrap_or("");
+        let end = decision["new_value"]["period_end"].as_str().unwrap_or("");
+        if !start.is_empty() || !end.is_empty() {
+            return format!(
+                "人工录入 period_start={} period_end={}",
+                show(start),
+                show(end)
+            );
         }
     }
     "库里没有rule_adopt".to_string()
@@ -977,14 +1059,56 @@ fn decision_words(decision: &Value, stated_amount: Option<&str>) -> String {
                 }
             }
         }
+        "human_record" => {
+            if let Some(amount) = new_value["amount_text"].as_str() {
+                let cur = new_value["currency"].as_str().unwrap_or("");
+                if cur.is_empty() {
+                    format!("人工录入 amount_text={}", show(amount))
+                } else {
+                    format!("人工录入 {} {}", show(cur), show(amount))
+                }
+            } else {
+                let start = new_value["period_start"].as_str().unwrap_or("");
+                let end = new_value["period_end"].as_str().unwrap_or("");
+                if start.is_empty() && end.is_empty() {
+                    "人工录入".to_string()
+                } else {
+                    format!(
+                        "人工录入 period_start={} period_end={}",
+                        show(start),
+                        show(end)
+                    )
+                }
+            }
+        }
         "human_correct" => {
-            let stated = stated_amount.unwrap_or("库里没有凭据金额");
-            let current = new_value["amount_text"].as_str().unwrap_or("");
-            format!("你修改（原文仍写{}）当前 {}", show(stated), show(current))
+            if let Some(current) = new_value["amount_text"].as_str() {
+                let stated = stated_amount.unwrap_or("库里没有凭据金额");
+                format!("你修改（原文仍写{}）当前 {}", show(stated), show(current))
+            } else {
+                let start = new_value["period_start"].as_str().unwrap_or("");
+                let end = new_value["period_end"].as_str().unwrap_or("");
+                if !start.is_empty() || !end.is_empty() {
+                    format!("你修改服务期 当前 {} 至 {}", show(start), show(end))
+                } else {
+                    let stated = stated_amount.unwrap_or("库里没有凭据金额");
+                    format!("你修改（原文仍写{}）当前 ", show(stated))
+                }
+            }
         }
         "undo" => {
             let current = new_value["amount_text"].as_str().unwrap_or("");
-            format!("已撤销 当前 {}", show(current))
+            if !current.is_empty() {
+                format!("已撤销 当前 {}", show(current))
+            } else {
+                let start = new_value["period_start"].as_str().unwrap_or("");
+                let end = new_value["period_end"].as_str().unwrap_or("");
+                if !start.is_empty() || !end.is_empty() {
+                    format!("已撤销 当前 {} 至 {}", show(start), show(end))
+                } else {
+                    format!("已撤销 当前 {}", show(current))
+                }
+            }
         }
         other => show(other),
     }
@@ -1114,7 +1238,11 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Report> {
         }
         Err(err) => return Err(write_io("not_created", &err, None)),
     };
-    if let Err(err) = file.write_all(bytes).and_then(|_| file.flush()) {
+    if let Err(err) = file
+        .write_all(bytes)
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+    {
         let (cleanup, cleanup_error) = match fs::remove_file(path) {
             Ok(()) => ("removed", None),
             Err(remove_err) => ("failed", Some(remove_err.to_string())),

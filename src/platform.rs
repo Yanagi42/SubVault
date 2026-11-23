@@ -176,6 +176,17 @@ mod linux {
             .open(path)
     }
 
+    /// `O_CREAT|O_EXCL|O_NOFOLLOW` with mode `0o600` set atomically at creation
+    /// time so sensitive files (e.g. offline recovery keys) have no TOCTOU window.
+    pub fn open_new_nofollow_private(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+
     pub fn exclusive_create_refused(err: &io::Error) -> bool {
         matches!(
             err.raw_os_error(),
@@ -903,6 +914,10 @@ mod windows {
             .open(path)
     }
 
+    pub fn open_new_nofollow_private(path: &Path) -> io::Result<File> {
+        open_new_nofollow(path)
+    }
+
     pub fn exclusive_create_refused(err: &io::Error) -> bool {
         matches!(
             err.raw_os_error(),
@@ -1300,8 +1315,8 @@ mod windows {
 pub use linux::{
     classify_rename_dir, directory_id, exclusive_create_refused, filesystem_magic, fill_random,
     final_directory_entry, fsync_dir, is_enospc, network_filesystem, open_dir_for_publish,
-    open_new_nofollow, raise_sigstop, rename_dir_noreplace, sync_file, try_lock_exclusive,
-    unlock_exclusive, DirectoryId, PublishedDir,
+    open_new_nofollow, open_new_nofollow_private, raise_sigstop, rename_dir_noreplace, sync_file,
+    try_lock_exclusive, unlock_exclusive, DirectoryId, PublishedDir,
 };
 
 #[cfg(all(target_os = "linux", test))]
@@ -1311,7 +1326,8 @@ pub use linux::test_enospc_error;
 pub use windows::{
     classify_rename_dir, directory_id, exclusive_create_refused, filesystem_magic, fill_random,
     final_directory_entry, fsync_dir, is_enospc, network_filesystem, open_dir_for_publish,
-    open_new_nofollow, rename_dir_noreplace, sync_file, DirectoryId, PublishedDir,
+    open_new_nofollow, open_new_nofollow_private, rename_dir_noreplace, sync_file, DirectoryId,
+    PublishedDir,
 };
 
 #[cfg(all(target_os = "windows", test))]

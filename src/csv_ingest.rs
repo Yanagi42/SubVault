@@ -417,7 +417,7 @@ fn persist_reuse(
 }
 
 fn replay(
-    _session: &super::Session,
+    session: &super::Session,
     req: &CsvRequest,
     existing: &CommandRow,
 ) -> Result<Value, Fail> {
@@ -431,9 +431,56 @@ fn replay(
         Fail::new(EXIT_RECOVERY, "RecoveryRequired", "result_unreadable")
             .extra("new_effect", json!(false))
     })?;
-    if let Some(map) = body.as_object_mut() {
-        map.insert("new_effect".into(), json!(false));
-        map.insert("command_id".into(), json!(req.command_id));
+    let hash = body
+        .get("content_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let object_id = body
+        .get("object_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !hash.is_empty() && !object_id.is_empty() {
+        let object = ObjectRow {
+            object_id,
+            content_sha256: hash.clone(),
+            byte_length: body.get("byte_length").and_then(Value::as_i64).unwrap_or(0),
+            relpath: String::new(),
+        };
+        confirm_hosted(
+            &session.root,
+            &object,
+            &hash,
+            object.byte_length,
+            &session.cipher,
+        )?;
+    }
+    let Some(map) = body.as_object_mut() else {
+        return Err(
+            Fail::new(EXIT_RECOVERY, "RecoveryRequired", "result_unreadable")
+                .extra("new_effect", json!(false)),
+        );
+    };
+    map.insert("new_effect".into(), json!(false));
+    map.insert("command_id".into(), json!(req.command_id));
+    match fs::read(&req.source) {
+        Ok(bytes) if sha256_bytes(&bytes) == hash => {
+            map.insert("payload_matches".into(), json!(true));
+            map.insert("external_reread".into(), json!(true));
+        }
+        Ok(_) => {
+            return Err(Fail::new(EXIT_REJECTED, "Rejected", "payload_conflict")
+                .extra("new_effect", json!(false))
+                .extra("preservation", json!(PRESERVED))
+                .extra("payload_matches", json!(false))
+                .extra("external_reread", json!(true))
+                .extra("content_sha256", json!(hash)));
+        }
+        Err(_) => {
+            map.insert("payload_matches".into(), Value::Null);
+            map.insert("external_reread".into(), json!(false));
+        }
     }
     Ok(body)
 }

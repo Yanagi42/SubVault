@@ -13,10 +13,12 @@ use std::path::Path;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::fsutil::MAX_OBJECT_BYTES;
 use crate::ids::hex_encode;
 use crate::model::{honesty, Report, EXIT_OK, EXIT_RECOVERY, EXIT_REJECTED};
 
 const PACKAGE_VERSION: &str = "offline-exit-1";
+const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn verify_package(package: &Path) -> Report {
     let meta = match fs::symlink_metadata(package) {
@@ -30,7 +32,7 @@ pub fn verify_package(package: &Path) -> Report {
     }
 
     let manifest_path = package.join("manifest.json");
-    let manifest_bytes = match read_regular_file(&manifest_path) {
+    let manifest_bytes = match read_regular_file(&manifest_path, MAX_METADATA_BYTES) {
         Ok(bytes) => bytes,
         Err(reason) => {
             return invalid(
@@ -138,15 +140,33 @@ pub fn verify_package(package: &Path) -> Report {
             continue;
         }
         let full = package.join(rel);
-        let bytes = match read_regular_file(&full) {
-            Ok(bytes) => bytes,
-            Err(reason) => {
-                defects.push(json!({ "path": rel, "reason": reason }));
-                continue;
+        let (actual_hash, actual_len) = if rel == "records.json" || rel == "facts.csv" {
+            let bytes = match read_regular_file(&full, MAX_METADATA_BYTES) {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    defects.push(json!({ "path": rel, "reason": reason }));
+                    continue;
+                }
+            };
+            let len = bytes.len() as u64;
+            let hash = sha256_bytes(&bytes);
+            if len == expected_len && hash == expected_hash {
+                if rel == "records.json" {
+                    records_bytes = Some(bytes);
+                } else {
+                    csv_bytes = Some(bytes);
+                }
+            }
+            (hash, len)
+        } else {
+            match hash_regular_file(&full, MAX_OBJECT_BYTES) {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    defects.push(json!({ "path": rel, "reason": reason }));
+                    continue;
+                }
             }
         };
-        let actual_len = bytes.len() as u64;
-        let actual_hash = sha256_bytes(&bytes);
         if actual_len != expected_len {
             defects.push(json!({
                 "path": rel,
@@ -165,11 +185,7 @@ pub fn verify_package(package: &Path) -> Report {
             }));
             continue;
         }
-        if rel == "records.json" {
-            records_bytes = Some(bytes);
-        } else if rel == "facts.csv" {
-            csv_bytes = Some(bytes);
-        } else if rel.starts_with("originals/") {
+        if rel.starts_with("originals/") {
             verified_originals += 1;
         }
         verified_map.insert(rel.to_string(), (actual_hash, actual_len));
@@ -216,6 +232,19 @@ pub fn verify_package(package: &Path) -> Report {
                             "reason": "records_version_mismatch"
                         }));
                     }
+                    if let (Some(mf), Some(rf)) = (
+                        vault_format,
+                        val.get("vault_format").and_then(Value::as_i64),
+                    ) {
+                        if mf != rf {
+                            defects.push(json!({
+                                "path": "records.json",
+                                "reason": "records_vault_format_mismatch",
+                                "expected": mf,
+                                "actual": rf
+                            }));
+                        }
+                    }
                     Some(val)
                 }
                 _ => {
@@ -234,6 +263,16 @@ pub fn verify_package(package: &Path) -> Report {
         if let Some(objects) = records.get("objects").and_then(Value::as_array) {
             for obj in objects {
                 let Some(pkg_path) = obj.get("package_path").and_then(Value::as_str) else {
+                    if completeness == "complete" {
+                        let oid = obj
+                            .get("object_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        defects.push(json!({
+                            "path": format!("originals/{oid}"),
+                            "reason": "records_object_missing_package_path"
+                        }));
+                    }
                     continue;
                 };
                 let expected_hash = obj.get("content_sha256").and_then(Value::as_str);
@@ -265,17 +304,32 @@ pub fn verify_package(package: &Path) -> Report {
         }
     }
 
-    // Cross-check facts.csv against records.json facts when both exist
+    // Cross-check facts.csv against records.json facts when facts exist
     let mut facts_csv_checked = false;
-    if let (Some(records), Some(csv)) = (&records, &csv_bytes) {
-        facts_csv_checked = true;
-        match std::str::from_utf8(csv) {
-            Err(_) => defects.push(json!({ "path": "facts.csv", "reason": "csv_invalid_utf8" })),
-            Ok(text) => {
-                if !facts_match_csv(records, text) {
-                    defects.push(json!({ "path": "facts.csv", "reason": "csv_mismatch" }));
+    if let Some(records) = &records {
+        let expects_csv = records.get("facts").and_then(Value::as_array).is_some();
+        match &csv_bytes {
+            Some(csv) => {
+                facts_csv_checked = true;
+                match std::str::from_utf8(csv) {
+                    Err(_) => {
+                        defects.push(json!({ "path": "facts.csv", "reason": "csv_invalid_utf8" }))
+                    }
+                    Ok(text) => {
+                        if !facts_match_csv(records, text) {
+                            defects.push(json!({ "path": "facts.csv", "reason": "csv_mismatch" }));
+                        }
+                    }
                 }
             }
+            None if expects_csv
+                && !defects
+                    .iter()
+                    .any(|d| d.get("path").and_then(Value::as_str) == Some("facts.csv")) =>
+            {
+                defects.push(json!({ "path": "facts.csv", "reason": "missing_facts_csv" }));
+            }
+            None => {}
         }
     }
 
@@ -341,7 +395,7 @@ fn invalid(reason: &str, defects: Vec<Value>) -> Report {
     }
 }
 
-fn read_regular_file(path: &Path) -> Result<Vec<u8>, &'static str> {
+fn read_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, &'static str> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err("missing_file"),
@@ -353,11 +407,51 @@ fn read_regular_file(path: &Path) -> Result<Vec<u8>, &'static str> {
     if !meta.file_type().is_file() {
         return Err("not_a_regular_file");
     }
-    let mut file = File::open(path).map_err(|_| "unreadable_file")?;
+    if meta.len() > max_bytes {
+        return Err("file_too_large");
+    }
+    let file = File::open(path).map_err(|_| "unreadable_file")?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| "unreadable_file")?;
+    if bytes.len() as u64 > max_bytes {
+        return Err("file_too_large");
+    }
     Ok(bytes)
+}
+
+fn hash_regular_file(path: &Path, max_bytes: u64) -> Result<(String, u64), &'static str> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err("missing_file"),
+        Err(_) => return Err("unreadable_file"),
+    };
+    if meta.file_type().is_symlink() {
+        return Err("symlink_in_package");
+    }
+    if !meta.file_type().is_file() {
+        return Err("not_a_regular_file");
+    }
+    if meta.len() > max_bytes {
+        return Err("file_too_large");
+    }
+    let mut file = File::open(path).map_err(|_| "unreadable_file")?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|_| "unreadable_file")?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > max_bytes {
+            return Err("file_too_large");
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok((hex_encode(&hasher.finalize()), total))
 }
 
 fn scan_tree(root: &Path, dir: &Path, out: &mut BTreeSet<String>) -> Result<(), Vec<Value>> {
@@ -438,6 +532,8 @@ fn facts_match_csv(records: &Value, csv_text: &str) -> bool {
         Some(candidate_id),
         Some(fact_type),
         Some(revision),
+        Some(statement),
+        Some(currency),
         Some(amount),
         Some(start),
         Some(end),
@@ -448,6 +544,8 @@ fn facts_match_csv(records: &Value, csv_text: &str) -> bool {
         idx("candidate_id"),
         idx("fact_type"),
         idx("revision"),
+        idx("statement"),
+        idx("currency"),
         idx("amount_text"),
         idx("period_start"),
         idx("period_end"),
@@ -469,12 +567,14 @@ fn facts_match_csv(records: &Value, csv_text: &str) -> bool {
             return false;
         };
         csv_keys.insert(format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             row[fact_id],
             row[source_id],
             row[candidate_id],
             row[fact_type],
             rev,
+            row[statement],
+            row[currency],
             row[amount],
             row[start],
             row[end],
@@ -497,7 +597,9 @@ fn facts_match_csv(records: &Value, csv_text: &str) -> bool {
         };
         let latest_id = decs.last().and_then(Value::as_str).unwrap_or("");
         rec_keys.insert(format!(
-            "{fid}\t{sid}\t{cid}\t{ftype}\t{rev}\t{}\t{}\t{}\t{latest_id}",
+            "{fid}\t{sid}\t{cid}\t{ftype}\t{rev}\t{}\t{}\t{}\t{}\t{}\t{latest_id}",
+            val_field(val, "statement"),
+            val_field(val, "currency"),
             val_field(val, "amount_text"),
             val_field(val, "period_start"),
             val_field(val, "period_end"),

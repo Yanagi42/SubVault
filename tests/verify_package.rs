@@ -274,4 +274,34 @@ fn verify_package_catches_snapshot_and_csv_mismatch_and_bad_paths() {
         .unwrap()
         .iter()
         .any(|c| c == "verify-package --package PATH"));
+
+    // Deleting facts.csv from manifest + disk while records.facts exists -> missing_facts_csv
+    let tmp_src = Tmp::new("nocsv-src");
+    let pack_nocsv = build_exported_format4_package(&tmp_src);
+    let nocsv_dir = tmp.path().join("nocsv-pack");
+    fs::create_dir_all(nocsv_dir.join("originals")).unwrap();
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(pack_nocsv.join("manifest.json")).unwrap()).unwrap();
+    for entry in manifest["files"].as_array().unwrap() {
+        let rel = entry["path"].as_str().unwrap();
+        if rel != "facts.csv" {
+            let dst = nocsv_dir.join(rel);
+            if let Some(p) = dst.parent() {
+                fs::create_dir_all(p).unwrap();
+            }
+            fs::copy(pack_nocsv.join(rel), dst).unwrap();
+        }
+    }
+    manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|e| e["path"].as_str() != Some("facts.csv"));
+    fs::write(
+        nocsv_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let (code, body) = run(&["verify-package", "--package", nocsv_dir.to_str().unwrap()]);
+    assert_eq!(code, 12, "{body}");
+    assert_eq!(body["reason"], "missing_facts_csv");
 }

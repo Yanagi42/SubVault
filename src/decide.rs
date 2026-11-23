@@ -210,13 +210,42 @@ fn required_date(draft: &StatedDraft<'_>, key: &str) -> Result<String, Fail> {
 
 fn date_text(text: &str) -> bool {
     let bytes = text.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !bytes
             .iter()
             .enumerate()
             .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(year) = text[0..4].parse::<u32>() else {
+        return false;
+    };
+    let Ok(month) = text[5..7].parse::<u32>() else {
+        return false;
+    };
+    let Ok(day) = text[8..10].parse::<u32>() else {
+        return false;
+    };
+    if year < 1900 || !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return false,
+    };
+    day <= max_day
 }
 
 pub fn query_facts(
@@ -623,6 +652,17 @@ fn record_manual_inner(req: ManualFactRequest) -> Result<Value, Fail> {
     }
 
     let session = super::open_real_session(&req.vault, &req.auth)?;
+    let canonical = manual_fact_canonical(
+        &req.source_id,
+        amount_pair.as_ref().map(|(c, _)| c.as_str()).unwrap_or(""),
+        amount_pair.as_ref().map(|(_, a)| a.as_str()).unwrap_or(""),
+        period_pair.as_ref().map(|(s, _)| s.as_str()).unwrap_or(""),
+        period_pair.as_ref().map(|(_, e)| e.as_str()).unwrap_or(""),
+        &actor_id,
+    );
+    if let Some(body) = take_committed(&session, &req.command_id, &canonical)? {
+        return Ok(body);
+    }
     let source = store::source_by_id_with_cipher(&session.conn, &req.source_id, &session.cipher)
         .map_err(|err| unseen_db(err, "source_lookup"))?
         .ok_or_else(|| rejected("unknown_source"))?;
@@ -631,88 +671,115 @@ fn record_manual_inner(req: ManualFactRequest) -> Result<Value, Fail> {
         .conn
         .unchecked_transaction()
         .map_err(|err| db_fail(err, "begin"))?;
+    if read_receipt(&tx, &req.command_id, &session.cipher)?.is_ready() {
+        return Err(rejected("command_race"));
+    }
 
-    // Reuse an existing source_version if present, otherwise create a manual one.
-    let existing_sv: Option<String> = tx
-        .query_row(
-            "SELECT source_version_id FROM source_versions WHERE source_id = ?1 ORDER BY source_version_id LIMIT 1",
+    // Check existing facts upfront before inserting any run/attempt so period-only updates create zero orphan runs.
+    let existing_amt: Option<String> = if amount_pair.is_some() {
+        tx.query_row(
+            "SELECT fact_id FROM facts WHERE source_id = ?1 AND fact_type = 'stated_amount_paid' LIMIT 1",
             [&source.source_id],
             |row| row.get(0),
         )
         .optional()
-        .map_err(|err| db_fail(err, "lookup_source_version"))?;
-
-    let source_version_id = if let Some(sv_id) = existing_sv {
-        sv_id
+        .map_err(|err| db_fail(err, "lookup_fact"))?
     } else {
-        let sv_id = ids::random_id("sv_").map_err(|err| crate::model::io_fail(err, "random"))?;
-        let enc_hash = session
+        None
+    };
+    if amount_pair.is_some() && existing_amt.is_some() {
+        return Err(rejected("amount_fact_already_exists"));
+    }
+    let existing_period: Option<(String, i64, String, String)> = if period_pair.is_some() {
+        tx.query_row(
+            "SELECT fact_id, revision, candidate_id, value_json FROM facts WHERE source_id = ?1 AND fact_type = 'stated_service_period' LIMIT 1",
+            [&source.source_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|err| db_fail(err, "lookup_fact"))?
+    } else {
+        None
+    };
+    let needs_candidate_run =
+        amount_pair.is_some() || (period_pair.is_some() && existing_period.is_none());
+
+    let (source_version_id, run_id, attempt_id) = if needs_candidate_run {
+        // Reuse an existing source_version if present, otherwise create a manual one.
+        let existing_sv: Option<String> = tx
+            .query_row(
+                "SELECT source_version_id FROM source_versions WHERE source_id = ?1 ORDER BY source_version_id LIMIT 1",
+                [&source.source_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| db_fail(err, "lookup_source_version"))?;
+
+        let sv_id = if let Some(sv_id) = existing_sv {
+            sv_id
+        } else {
+            let sv_id =
+                ids::random_id("sv_").map_err(|err| crate::model::io_fail(err, "random"))?;
+            let enc_hash = session
+                .cipher
+                .encrypt_field(
+                    "source_versions",
+                    &sv_id,
+                    "content_sha256",
+                    &source.content_sha256,
+                )
+                .map_err(|err| cipher_tamper_fail(err, "encrypt_version"))?;
+            tx.execute(
+                "INSERT INTO source_versions(source_version_id, source_id, object_id, content_sha256, byte_length, media_type, role, eml) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'user_provided_manual', 0)",
+                params![
+                    sv_id,
+                    source.source_id,
+                    source.object_id,
+                    enc_hash,
+                    source.byte_length,
+                    source.media_type
+                ],
+            )
+            .map_err(|err| db_fail(err, "insert_version"))?;
+            sv_id
+        };
+
+        let run_id = ids::random_id("run_").map_err(|err| crate::model::io_fail(err, "random"))?;
+        let attempt_id =
+            ids::random_id("att_").map_err(|err| crate::model::io_fail(err, "random"))?;
+        let logical_key_plain = format!("manual:{}:{}", source.source_id, req.command_id);
+        let stored_logical_key = session
+            .cipher
+            .dedup_key("extraction_runs.logical_key", &logical_key_plain);
+        tx.execute(
+            "INSERT INTO extraction_runs(run_id, logical_key, source_version_id, source_id, extractor, extractor_version, normalization, join_version, rules_version, config_json, status) VALUES (?1, ?2, ?3, ?4, 'subvault-manual', '1', 'manual-entry-1', 'manual-1', 'manual-record-1', '{}', 'succeeded')",
+            params![run_id, stored_logical_key, sv_id, source.source_id],
+        )
+        .map_err(|err| db_fail(err, "insert_run"))?;
+        let detail_stored = session
             .cipher
             .encrypt_field(
-                "source_versions",
-                &sv_id,
-                "content_sha256",
-                &source.content_sha256,
+                "extraction_attempts",
+                &attempt_id,
+                "detail_json",
+                "{\"extraction\":\"manual\"}",
             )
-            .map_err(|err| cipher_tamper_fail(err, "encrypt_version"))?;
+            .map_err(|err| cipher_tamper_fail(err, "encrypt_attempt"))?;
         tx.execute(
-            "INSERT INTO source_versions(source_version_id, source_id, object_id, content_sha256, byte_length, media_type, role, eml) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'user_provided_manual', 0)",
-            params![
-                sv_id,
-                source.source_id,
-                source.object_id,
-                enc_hash,
-                source.byte_length,
-                source.media_type
-            ],
+            "INSERT INTO extraction_attempts(attempt_id, run_id, attempt_no, command_id, status, published, detail_json) VALUES (?1, ?2, 1, ?3, 'succeeded', 1, ?4)",
+            params![attempt_id, run_id, req.command_id, detail_stored],
         )
-        .map_err(|err| db_fail(err, "insert_version"))?;
-        sv_id
+        .map_err(|err| db_fail(err, "insert_attempt"))?;
+        (sv_id, run_id, attempt_id)
+    } else {
+        (String::new(), String::new(), String::new())
     };
-
-    let run_id = ids::random_id("run_").map_err(|err| crate::model::io_fail(err, "random"))?;
-    let attempt_id = ids::random_id("att_").map_err(|err| crate::model::io_fail(err, "random"))?;
-    let logical_key_plain = format!("manual:{}:{}", source.source_id, req.command_id);
-    let stored_logical_key = session
-        .cipher
-        .dedup_key("extraction_runs.logical_key", &logical_key_plain);
-    tx.execute(
-        "INSERT INTO extraction_runs(run_id, logical_key, source_version_id, source_id, extractor, extractor_version, normalization, join_version, rules_version, config_json, status) VALUES (?1, ?2, ?3, ?4, 'subvault-manual', '1', 'manual-entry-1', 'manual-1', 'manual-record-1', '{}', 'succeeded')",
-        params![run_id, stored_logical_key, source_version_id, source.source_id],
-    )
-    .map_err(|err| db_fail(err, "insert_run"))?;
-    let detail_stored = session
-        .cipher
-        .encrypt_field(
-            "extraction_attempts",
-            &attempt_id,
-            "detail_json",
-            "{\"extraction\":\"manual\"}",
-        )
-        .map_err(|err| cipher_tamper_fail(err, "encrypt_attempt"))?;
-    tx.execute(
-        "INSERT INTO extraction_attempts(attempt_id, run_id, attempt_no, command_id, status, published, detail_json) VALUES (?1, ?2, 1, ?3, 'succeeded', 1, ?4)",
-        params![attempt_id, run_id, req.command_id, detail_stored],
-    )
-    .map_err(|err| db_fail(err, "insert_attempt"))?;
 
     let mut recorded_facts: Vec<Value> = Vec::new();
     let now = super::now_ms();
     let mut ordinal = 0i64;
 
     if let Some((cur, amt)) = amount_pair {
-        // Check whether a stated_amount_paid fact already exists for this source.
-        let existing_amt: Option<String> = tx
-            .query_row(
-                "SELECT fact_id FROM facts WHERE source_id = ?1 AND fact_type = 'stated_amount_paid' LIMIT 1",
-                [&source.source_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| db_fail(err, "lookup_fact"))?;
-        if existing_amt.is_some() {
-            return Err(rejected("amount_fact_already_exists"));
-        }
         let cand_id =
             ids::random_id("cand_").map_err(|err| crate::model::io_fail(err, "random"))?;
         let fact_id =
@@ -790,15 +857,6 @@ fn record_manual_inner(req: ManualFactRequest) -> Result<Value, Fail> {
     }
 
     if let Some((start, end)) = period_pair {
-        let existing_period: Option<(String, i64, String, String)> = tx
-            .query_row(
-                "SELECT fact_id, revision, candidate_id, value_json FROM facts WHERE source_id = ?1 AND fact_type = 'stated_service_period' LIMIT 1",
-                [&source.source_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(|err| db_fail(err, "lookup_fact"))?;
-
         if let Some((fact_id, rev, cand_id, stored_old)) = existing_period {
             let old_plain = session
                 .cipher
@@ -923,9 +981,6 @@ fn record_manual_inner(req: ManualFactRequest) -> Result<Value, Fail> {
         }
     }
 
-    tx.commit().map_err(|err| db_fail(err, "commit"))?;
-    let _ = store::checkpoint(&session.conn);
-
     let mut body = honesty("Committed");
     body.insert("slice".into(), json!("M4-real"));
     body.insert("command_id".into(), json!(req.command_id));
@@ -933,7 +988,14 @@ fn record_manual_inner(req: ManualFactRequest) -> Result<Value, Fail> {
     body.insert("facts".into(), Value::Array(recorded_facts));
     body.insert("new_effect".into(), json!(true));
     apply_format_honesty(&mut body, session.vault_format, session.protection);
-    Ok(Value::Object(body))
+    let result = Value::Object(body);
+    let encoded = serde_json::to_string(&result)
+        .map_err(|_| Fail::new(EXIT_NOT_PRESERVED, "NotPreserved", "result_encode"))?;
+    insert_receipt(&tx, &req.command_id, &canonical, &encoded, &session.cipher)?;
+    tx.commit().map_err(|err| db_fail(err, "commit"))?;
+    let _ = store::checkpoint(&session.conn);
+
+    Ok(result)
 }
 
 pub struct UndoRequest {
@@ -981,9 +1043,6 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
         return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
     }
     let revision = parse_revision(&req.expected_revision)?;
-    if !body::usd_amount_text(&req.amount_text) {
-        return Err(rejected("amount_text_rejected"));
-    }
     let actor_id = human_actor(&req.actor_id)?;
     let requested_currency = match &req.currency {
         Some(raw) => Some(
@@ -996,25 +1055,29 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
     require_decision_vault(&req.vault)?;
     let session = super::open_session_with_auth(&req.vault, &req.auth)?;
     require_fact_tables(&session.conn)?;
+    let normalized_amount = if session.vault_format >= 6 {
+        crate::real_extract::normalize_amount_text(&req.amount_text)
+            .ok_or_else(|| rejected("amount_text_rejected"))?
+    } else if body::usd_amount_text(&req.amount_text) {
+        req.amount_text.clone()
+    } else {
+        return Err(rejected("amount_text_rejected"));
+    };
     if let Some(ref cur) = requested_currency {
         if session.vault_format < 6 && cur != "USD" {
             return Err(rejected("currency_requires_format_6"));
         }
     }
-    let existing_currency = load_fact(&session.conn, &req.fact_id, &session.cipher)?
-        .and_then(|f| {
-            f.value
-                .get("currency")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "USD".to_string());
-    let effective_currency = requested_currency.unwrap_or(existing_currency);
+    let canonical_currency = if session.vault_format >= 6 {
+        requested_currency.as_deref().unwrap_or("")
+    } else {
+        requested_currency.as_deref().unwrap_or("USD")
+    };
     let canonical = correct_canonical(
         &req.fact_id,
         &req.expected_revision,
-        &effective_currency,
-        &req.amount_text,
+        canonical_currency,
+        &normalized_amount,
         &actor_id,
     );
     let mut hooks = super::HookRun::new(req.hooks);
@@ -1032,6 +1095,13 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
     if fact.revision != revision {
         return Err(rejected("revision_conflict"));
     }
+    let effective_currency = requested_currency.unwrap_or_else(|| {
+        fact.value
+            .get("currency")
+            .and_then(Value::as_str)
+            .unwrap_or("USD")
+            .to_string()
+    });
     journal.state = "started".into();
     journal.payload_fingerprint = Some(hash);
     journal.reason = None;
@@ -1060,7 +1130,7 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
     }
     let mut value = fact.value.clone();
     value.insert("currency".into(), json!(effective_currency));
-    value.insert("amount_text".into(), json!(req.amount_text));
+    value.insert("amount_text".into(), json!(normalized_amount));
     let new_json = Value::Object(value).to_string();
     let decision_id = ids::random_id("dec_").map_err(|err| crate::model::io_fail(err, "random"))?;
     let recorded_at = super::now_ms();
@@ -1104,7 +1174,7 @@ fn correct_inner(req: CorrectRequest) -> Result<Value, Fail> {
         session.protection,
     );
     body.insert("decision_id".into(), json!(decision_id));
-    body.insert("amount_text".into(), json!(req.amount_text));
+    body.insert("amount_text".into(), json!(normalized_amount));
     body.insert("currency".into(), json!(effective_currency));
     body.insert("actor_kind".into(), json!("human"));
     body.insert("actor_id".into(), json!(actor_id));
@@ -1286,6 +1356,19 @@ fn undo_inner(req: UndoRequest) -> Result<Value, Fail> {
         tx,
         &hooks,
         &session.cipher,
+    )
+}
+
+fn manual_fact_canonical(
+    source_id: &str,
+    currency: &str,
+    amount: &str,
+    period_start: &str,
+    period_end: &str,
+    actor_id: &str,
+) -> String {
+    format!(
+        "{PAYLOAD_VERSION}\nrecord_fact\nsource_id={source_id}\ncurrency={currency}\namount_text={amount}\nperiod_start={period_start}\nperiod_end={period_end}\nactor_id={actor_id}\n"
     )
 }
 

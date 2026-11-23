@@ -45,6 +45,15 @@ pub const DEFAULT_ARGON2_M_COST: u32 = 65_536;
 pub const DEFAULT_ARGON2_T_COST: u32 = 3;
 pub const DEFAULT_ARGON2_P_COST: u32 = 1;
 
+const MIN_ARGON2_M_COST: u32 = 16_384; // 16 MiB
+const MAX_ARGON2_M_COST: u32 = 524_288; // 512 MiB
+const MIN_ARGON2_T_COST: u32 = 1;
+const MAX_ARGON2_T_COST: u32 = 10;
+const MIN_ARGON2_P_COST: u32 = 1;
+const MAX_ARGON2_P_COST: u32 = 8;
+const MIN_ARGON2_SALT_LEN: usize = 16;
+const MAX_ARGON2_SALT_LEN: usize = 64;
+
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 type HmacSha256 = Hmac<Sha256>;
@@ -848,7 +857,7 @@ pub fn encode_recovery_key(raw: &[u8; 32]) -> Zeroizing<String> {
     payload[..32].copy_from_slice(raw);
     payload[32..35].copy_from_slice(&digest[..3]);
 
-    let encoded = base32_encode(payload.as_ref());
+    let encoded = Zeroizing::new(base32_encode(payload.as_ref()));
     let mut out = String::with_capacity(5 + encoded.len() + 14);
     out.push_str("SVRK");
     for chunk in encoded.as_bytes().chunks(4) {
@@ -864,11 +873,13 @@ pub fn decode_recovery_key(text: &str) -> Result<Zeroizing<[u8; 32]>, CryptoErro
         .strip_prefix("SVRK-")
         .or_else(|| trimmed.strip_prefix("svrk-"))
         .ok_or(CryptoError::InvalidFormat("recovery_key_prefix"))?;
-    let clean: String = stripped
-        .chars()
-        .filter(|c| *c != '-' && !c.is_ascii_whitespace())
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
+    let clean = Zeroizing::new(
+        stripped
+            .chars()
+            .filter(|c| *c != '-' && !c.is_ascii_whitespace())
+            .map(|c| c.to_ascii_uppercase())
+            .collect::<String>(),
+    );
     if clean.len() != 56 {
         return Err(CryptoError::InvalidFormat("recovery_key_length"));
     }
@@ -880,7 +891,11 @@ pub fn decode_recovery_key(text: &str) -> Result<Zeroizing<[u8; 32]>, CryptoErro
     hasher.update(b"subvault-recovery-key-v1\0");
     hasher.update(&decoded[..32]);
     let digest = hasher.finalize();
-    if decoded[32..35] != digest[..3] {
+    let mut diff = 0u8;
+    for i in 0..3 {
+        diff |= decoded[32 + i] ^ digest[i];
+    }
+    if diff != 0 {
         return Err(CryptoError::InvalidFormat("recovery_key_checksum"));
     }
     let mut raw = Zeroizing::new([0u8; 32]);
@@ -1030,9 +1045,18 @@ pub fn unwrap_dek_with_passphrase(
         .and_then(Value::as_u64)
         .and_then(|v| u32::try_from(v).ok())
         .ok_or(CryptoError::InvalidFormat("p_cost"))?;
+    if !(MIN_ARGON2_M_COST..=MAX_ARGON2_M_COST).contains(&m_cost)
+        || !(MIN_ARGON2_T_COST..=MAX_ARGON2_T_COST).contains(&t_cost)
+        || !(MIN_ARGON2_P_COST..=MAX_ARGON2_P_COST).contains(&p_cost)
+    {
+        return Err(CryptoError::InvalidFormat("kdf_params_out_of_bounds"));
+    }
     let salt = B64
         .decode(&slot.salt_b64)
         .map_err(|_| CryptoError::InvalidFormat("salt_b64"))?;
+    if !(MIN_ARGON2_SALT_LEN..=MAX_ARGON2_SALT_LEN).contains(&salt.len()) {
+        return Err(CryptoError::InvalidFormat("salt_len"));
+    }
     let kek = derive_argon2_kek(passphrase, &salt, m_cost, t_cost, p_cost)?;
     unwrap_slot_dek(vault_id, "passphrase", slot, &kek)
 }
@@ -1070,15 +1094,17 @@ fn unwrap_slot_dek(
         .map_err(|_| CryptoError::InvalidFormat("wrapped_dek_b64"))?;
     let cipher = XChaCha20Poly1305::new(kek.into());
     let aad = slot_aad(vault_id, slot_kind);
-    let plain = cipher
-        .decrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: &wrapped,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::AuthFailed)?;
+    let plain = Zeroizing::new(
+        cipher
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &wrapped,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| CryptoError::AuthFailed)?,
+    );
     if plain.len() != 32 {
         return Err(CryptoError::InvalidFormat("dek_len"));
     }
@@ -1163,6 +1189,22 @@ mod tests {
         assert!(matches!(
             unwrap_dek_with_passphrase("vlt_other", &pass_slot, "correct horse battery staple"),
             Err(CryptoError::AuthFailed)
+        ));
+
+        // Malicious out-of-bounds Argon2id parameters must be rejected before KDF allocation
+        let mut oom_slot = pass_slot.clone();
+        oom_slot.kdf_params_json =
+            json!({ "m_cost": u32::MAX, "t_cost": 3, "p_cost": 1 }).to_string();
+        assert!(matches!(
+            unwrap_dek_with_passphrase("vlt_test", &oom_slot, "correct horse battery staple"),
+            Err(CryptoError::InvalidFormat("kdf_params_out_of_bounds"))
+        ));
+
+        let mut weak_slot = pass_slot.clone();
+        weak_slot.kdf_params_json = json!({ "m_cost": 8, "t_cost": 1, "p_cost": 1 }).to_string();
+        assert!(matches!(
+            unwrap_dek_with_passphrase("vlt_test", &weak_slot, "correct horse battery staple"),
+            Err(CryptoError::InvalidFormat("kdf_params_out_of_bounds"))
         ));
     }
 

@@ -57,12 +57,15 @@ pub use decide::{
     correct_fact, query_facts, record_manual_fact, undo_decision, CorrectRequest,
     ManualFactRequest, UndoRequest,
 };
+pub(crate) use export::export_package_in_memory;
 pub use export::{export_copy, ExportRequest};
 pub use fragment::{query_candidates, submit_fragment, FragmentRequest};
 pub use html::{submit_html, HtmlRequest};
 pub use pdf::{submit_pdf, PdfRequest};
+pub(crate) use redact::redact_vault_source_in_memory;
 pub use redact::{redact_template, RedactRequest};
 pub use review::review_sheet;
+pub(crate) use review::review_sheet_in_memory;
 
 const IMPORT_STOPS: &[&str] = &[
     "before_copy",
@@ -290,6 +293,7 @@ pub fn help_report() -> Report {
             "version",
             "init --vault PATH [--format 1|2|3|4|5|6] [--protection passphrase|os-disk] [--passphrase-file PATH|--passphrase-stdin] [--recovery-key-out PATH]",
             "rotate-passphrase --vault PATH [--passphrase-file PATH|--recovery-key-file PATH] --new-passphrase-file PATH [--rotate-recovery-key] [--recovery-key-out PATH]",
+            "app [--vault PATH] [--port PORT] [--no-browser]",
             "open --vault PATH [--passphrase-file PATH|--recovery-key-file PATH]",
             "verify --vault PATH [--passphrase-file PATH|--recovery-key-file PATH]",
             "import --vault PATH --command-id ID --media-type TYPE --source PATH [--batch-id ID] [--display-name NAME]",
@@ -299,7 +303,7 @@ pub fn help_report() -> Report {
             "html --vault PATH --command-id ID --source PATH [--batch-id ID]",
             "pdf --vault PATH --command-id ID --source PATH [--batch-id ID]",
             "csv --vault PATH --command-id ID --source PATH [--batch-id ID]",
-            "annotate --vault PATH --source-id ID [--vendor NAME] [--plan NAME] [--account LABEL] [--cycle monthly|yearly|quarterly|weekly|one_time|unknown] [--category NAME] [--bill-date YYYY-MM-DD] [--notes TEXT]",
+            "annotate --vault PATH --source-id ID [--vendor NAME] [--plan NAME] [--account LABEL] [--cycle monthly|yearly|quarterly|weekly|one_time|unknown] [--category NAME] [--bill-date YYYY-MM-DD] [--notes TEXT] [--asset-kind subscription|license|hardware|reimbursable|general] [--warranty-end YYYY-MM-DD] [--license-scope TEXT] [--reimburse-status none|pending|submitted|reimbursed]",
             "record-fact --vault PATH --command-id ID --source-id ID [--currency CODE --amount-text TEXT] [--period-start YYYY-MM-DD --period-end YYYY-MM-DD] --actor-id ID",
             "candidates --vault PATH [--source-id ID]",
             "facts --vault PATH [--source-id ID] [--fact-id ID]",
@@ -309,7 +313,7 @@ pub fn help_report() -> Report {
             "redact (--source PATH | --vault PATH --source-id ID) --out PATH [--redact-term STR]...",
             "correct --vault PATH --command-id ID --fact-id ID --expected-revision N --amount-text TEXT [--currency CODE] --actor-id ID",
             "undo --vault PATH --command-id ID --decision-id ID --expected-revision N --actor-id ID",
-            "cancel --vault PATH --command-id ID --generation N [--kind preservation|fragment|extraction]",
+            "cancel --vault PATH --command-id ID --generation N [--kind preservation|fragment|extraction|csv]",
             "recover --vault PATH",
             "hold --vault PATH --stop-at lock_held --checkpoint PATH"
         ]),
@@ -1483,12 +1487,14 @@ fn annotate_inner(req: AnnotateRequest) -> Result<Report, Fail> {
         }
     }
     if let Some(ref date) = req.bill_date {
-        if !date.is_empty() && crate::real_extract::parse_date_token(date).is_none() {
+        let trimmed = date.trim();
+        if !trimmed.is_empty() && crate::real_extract::parse_date_token(trimmed).is_none() {
             return Err(Fail::new(EXIT_USAGE, "Usage", "bad_bill_date"));
         }
     }
     if let Some(ref date) = req.warranty_end {
-        if !date.is_empty() && crate::real_extract::parse_date_token(date).is_none() {
+        let trimmed = date.trim();
+        if !trimmed.is_empty() && crate::real_extract::parse_date_token(trimmed).is_none() {
             return Err(Fail::new(EXIT_USAGE, "Usage", "bad_warranty_end"));
         }
     }
@@ -1692,16 +1698,37 @@ pub(crate) fn delete_sources(
         .conn
         .unchecked_transaction()
         .map_err(|err| db_fail(err, "delete_sources_begin"))?;
-    let (deleted, orphaned_objects) = store::delete_sources_atomic(&tx, source_ids)
-        .map_err(|err| db_fail(err, "delete_sources"))?;
+    let (deleted, orphaned_objects, pruned_commands) =
+        store::delete_sources_atomic(&tx, source_ids, &session.cipher)
+            .map_err(|err| db_fail(err, "delete_sources"))?;
     tx.commit()
         .map_err(|err| db_fail(err, "delete_sources_commit"))?;
     let _ = store::checkpoint(&session.conn);
 
+    let mut unlinked_object = false;
     for obj_id in orphaned_objects {
         if let Some(relpath) = canonical_object_relpath(&obj_id) {
-            let _ = fs::remove_file(session.root.join(relpath));
+            if fs::remove_file(session.root.join(relpath)).is_ok() {
+                unlinked_object = true;
+            }
         }
+    }
+    if unlinked_object {
+        let _ = fsutil::fsync_dir(&session.root.join("objects"));
+    }
+
+    let mut unlinked_journal = false;
+    for cid in pruned_commands {
+        if is_command_id(&cid) {
+            if fs::remove_file(journal_path(&session.root, &cid)).is_ok() {
+                unlinked_journal = true;
+            }
+            let _ = fs::remove_file(staging_path(&session.root, &cid));
+            let _ = fs::remove_file(session.root.join("control").join(&cid));
+        }
+    }
+    if unlinked_journal {
+        let _ = fsutil::fsync_dir(&session.root.join("journal"));
     }
     Ok(deleted)
 }
@@ -1789,6 +1816,8 @@ fn rotate_passphrase_inner(req: RotatePassphraseRequest) -> Result<Report, Fail>
             store::upsert_keyslot(&tx, rec_slot).map_err(|err| db_fail(err, "rotate_recovery"))?;
         }
         tx.commit().map_err(|err| db_fail(err, "rotate_commit"))?;
+        // Scrub overwritten keyslot bytes from SQLite free pages and truncate WAL
+        let _ = session.conn.execute_batch("VACUUM;");
         let _ = store::checkpoint(&session.conn);
         Ok(())
     })();
@@ -2878,6 +2907,7 @@ fn cancel_inner(req: CancelRequest) -> Result<Report, Fail> {
         || journal.kind == "decision"
         || journal.kind == "html"
         || journal.kind == "pdf"
+        || journal.kind == "csv"
     {
         return Err(fragment_journal_conflict());
     }
@@ -3241,7 +3271,7 @@ fn validate_new_key_out_before_init(vault_path: &Path, key_out: &Path) -> Result
 }
 
 fn write_recovery_key_file(path: &Path, key_text: &str) -> Result<(), Fail> {
-    let mut file = match crate::platform::open_new_nofollow(path) {
+    let mut file = match crate::platform::open_new_nofollow_private(path) {
         Ok(file) => file,
         Err(err) if crate::platform::exclusive_create_refused(&err) => {
             return Err(Fail::new(EXIT_REJECTED, "Rejected", "output_exists")
@@ -3407,14 +3437,37 @@ fn visible_main_format(db: &Path) -> Result<FormatView, Fail> {
     })
 }
 
+fn percent_encode_uri_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len() + 16);
+    for &b in bytes {
+        if matches!(b, b'%' | b'?' | b'#') || b < 0x20 || b == 0x7f {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        } else if b.is_ascii() {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
     let abs = path
         .canonicalize()
         .map_err(|err| unseen_io(err, "canonicalize"))?;
-    let text = abs.to_string_lossy();
     #[cfg(target_os = "windows")]
     {
-        if text.starts_with(r"\\?\UNC\") || text.starts_with(r"\\?\unc\") {
+        let text = abs.to_string_lossy();
+        if text
+            .as_bytes()
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(br"\\?\UNC\"))
+        {
             return Err(Fail::new(
                 EXIT_UNSUPPORTED_FS,
                 "UnsupportedFilesystem",
@@ -3422,26 +3475,15 @@ fn file_uri(path: &Path, query: &str) -> Result<String, Fail> {
             ));
         }
         let stripped = text.strip_prefix(r"\\?\").unwrap_or(&text);
-        if stripped.contains('?') || stripped.contains('#') {
-            return Err(Fail::new(
-                EXIT_REJECTED,
-                "Rejected",
-                "vault_path_unsupported",
-            ));
-        }
         let slash = stripped.replace('\\', "/");
-        Ok(format!("file:///{slash}?{query}"))
+        let encoded = percent_encode_uri_bytes(slash.as_bytes());
+        Ok(format!("file:///{encoded}?{query}"))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        if text.contains('?') || text.contains('#') {
-            return Err(Fail::new(
-                EXIT_REJECTED,
-                "Rejected",
-                "vault_path_unsupported",
-            ));
-        }
-        Ok(format!("file:{text}?{query}"))
+        use std::os::unix::ffi::OsStrExt;
+        let encoded = percent_encode_uri_bytes(abs.as_os_str().as_bytes());
+        Ok(format!("file:{encoded}?{query}"))
     }
 }
 
@@ -3991,8 +4033,9 @@ fn already_committed(row: &CommandRow) -> Result<Value, Fail> {
     };
     map.insert("outcome".into(), json!("AlreadyCommitted"));
     map.insert("new_effect".into(), json!(false));
-    map.insert("user_ready".into(), json!(false));
-    map.insert("security_complete".into(), json!(false));
+    map.entry("user_ready").or_insert_with(|| json!(false));
+    map.entry("security_complete")
+        .or_insert_with(|| json!(false));
     map.insert("purchase_id".into(), Value::Null);
     map.insert("entitlement_id".into(), Value::Null);
     Ok(value)
@@ -4177,6 +4220,7 @@ fn cancel_without_lock(req: &CancelRequest, banner: VaultBannerKind) -> Result<R
         || journal.kind == "decision"
         || journal.kind == "html"
         || journal.kind == "pdf"
+        || journal.kind == "csv"
     {
         return Err(fragment_journal_conflict());
     }

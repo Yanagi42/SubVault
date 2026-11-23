@@ -173,6 +173,8 @@ pub fn configure(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.busy_timeout(std::time::Duration::from_millis(0))?;
     conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "secure_delete", "ON")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())
 }
 
@@ -539,8 +541,49 @@ fn decrypt_source_row(mut row: SourceRow, cipher: &VaultCipher) -> rusqlite::Res
 }
 
 pub fn checkpoint(conn: &Connection) -> rusqlite::Result<()> {
-    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-    Ok(())
+    let mode = match read_journal_mode(conn) {
+        SqlAnswer::Value(mode) => mode,
+        SqlAnswer::Sqlite(err) => return Err(err),
+        SqlAnswer::Shape(detail) => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(format!(
+                    "journal_mode shape error: {detail}"
+                ))),
+            ))
+        }
+    };
+    let row = match read_truncate_checkpoint(conn) {
+        SqlAnswer::Value(row) => row,
+        SqlAnswer::Sqlite(err) => return Err(err),
+        SqlAnswer::Shape(detail) => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::other(format!(
+                    "wal_checkpoint shape error: {detail}"
+                ))),
+            ))
+        }
+    };
+    match judge_truncate_checkpoint(&mode, row) {
+        TruncateVerdict::Complete => Ok(()),
+        TruncateVerdict::Busy(r) => Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some(format!(
+                "wal_checkpoint(TRUNCATE) busy: busy={} log={} checkpointed={}",
+                r.busy, r.log, r.checkpointed
+            )),
+        )),
+        TruncateVerdict::Abnormal(r) => Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "wal_checkpoint(TRUNCATE) incomplete in mode {mode}: busy={} log={} checkpointed={}",
+                r.busy, r.log, r.checkpointed
+            )),
+        )),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1649,14 +1692,36 @@ pub fn update_marker_with_cipher(
 }
 
 /// Format 6 only: atomically deletes the specified sources and all dependent
-/// facts, decisions, extraction runs/candidates, occurrences, and annotations,
-/// returning `(deleted_source_count, orphaned_object_ids_to_unlink)`.
+/// facts, decisions, extraction runs/candidates, occurrences, annotations, and
+/// associated idempotency commands/receipts, returning
+/// `(deleted_source_count, orphaned_object_ids_to_unlink, pruned_command_ids)`.
 pub fn delete_sources_atomic(
     tx: &Transaction<'_>,
     source_ids: &[String],
-) -> rusqlite::Result<(usize, Vec<String>)> {
+    cipher: &VaultCipher,
+) -> rusqlite::Result<(usize, Vec<String>, Vec<String>)> {
     let mut candidate_objects: Vec<String> = Vec::new();
+    let mut candidate_commands: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let target_sources: std::collections::BTreeSet<&str> =
+        source_ids.iter().map(String::as_str).collect();
     let mut deleted = 0usize;
+
+    // Collect command_ids from commands whose result_json references a deleted source
+    // (catches marker commands and any command row whose dependent tables were pruned).
+    if let Ok(cmds) = list_commands_with_cipher(tx, cipher) {
+        for cmd in cmds {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cmd.result_json) {
+                if val
+                    .get("source_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|sid| target_sources.contains(sid))
+                {
+                    candidate_commands.insert(cmd.command_id);
+                }
+            }
+        }
+    }
 
     for sid in source_ids {
         let obj_id: Option<String> = tx
@@ -1671,6 +1736,32 @@ pub fn delete_sources_atomic(
         };
         if !candidate_objects.contains(&obj_id) {
             candidate_objects.push(obj_id);
+        }
+
+        // Collect all command_ids tied to this source before deleting dependent rows.
+        {
+            let mut stmt = tx.prepare("SELECT command_id FROM occurrences WHERE source_id = ?1")?;
+            for cid in stmt.query_map([sid], |r| r.get::<_, String>(0))? {
+                candidate_commands.insert(cid?);
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "SELECT command_id FROM extraction_attempts \
+                 WHERE run_id IN (SELECT run_id FROM extraction_runs WHERE source_id = ?1)",
+            )?;
+            for cid in stmt.query_map([sid], |r| r.get::<_, String>(0))? {
+                candidate_commands.insert(cid?);
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "SELECT command_id FROM decisions \
+                 WHERE fact_id IN (SELECT fact_id FROM facts WHERE source_id = ?1)",
+            )?;
+            for cid in stmt.query_map([sid], |r| r.get::<_, String>(0))? {
+                candidate_commands.insert(cid?);
+            }
         }
 
         // Remove self-referencing undo chains leaf-first before deleting root decisions
@@ -1710,6 +1801,33 @@ pub fn delete_sources_atomic(
         deleted += tx.execute("DELETE FROM sources WHERE source_id = ?1", [sid])?;
     }
 
+    let has_t3 = table_exists(tx, "t3_receipts")?;
+    let mut pruned_commands = Vec::new();
+    for cid in candidate_commands {
+        let occ_left: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM occurrences WHERE command_id = ?1",
+            [&cid],
+            |r| r.get(0),
+        )?;
+        let att_left: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM extraction_attempts WHERE command_id = ?1",
+            [&cid],
+            |r| r.get(0),
+        )?;
+        let dec_left: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM decisions WHERE command_id = ?1",
+            [&cid],
+            |r| r.get(0),
+        )?;
+        if occ_left == 0 && att_left == 0 && dec_left == 0 {
+            if has_t3 {
+                tx.execute("DELETE FROM t3_receipts WHERE command_id = ?1", [&cid])?;
+            }
+            tx.execute("DELETE FROM commands WHERE command_id = ?1", [&cid])?;
+            pruned_commands.push(cid);
+        }
+    }
+
     let mut orphaned_objects = Vec::new();
     for obj_id in candidate_objects {
         let remaining: i64 = tx.query_row(
@@ -1723,7 +1841,7 @@ pub fn delete_sources_atomic(
         }
     }
 
-    Ok((deleted, orphaned_objects))
+    Ok((deleted, orphaned_objects, pruned_commands))
 }
 
 #[cfg(test)]

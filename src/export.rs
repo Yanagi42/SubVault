@@ -42,6 +42,87 @@ pub fn export_copy(req: ExportRequest) -> Report {
     }
 }
 
+pub(crate) struct MemoryPackageFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Builds a verifiable `offline-exit-1` package completely in memory without
+/// writing decrypted originals or plaintext secrets to shared temp directories.
+pub(crate) fn export_package_in_memory(
+    vault: &Path,
+    allow_partial: bool,
+    acknowledge_plaintext: bool,
+    auth: &AuthInput,
+) -> Result<Vec<MemoryPackageFile>, Fail> {
+    super::guard_vault(vault)?;
+    let loaded = read_locked(vault, auth, acknowledge_plaintext)?;
+    if let Some(fail) = loaded.blocking {
+        return Err(fail);
+    }
+    if !loaded.defects.is_empty() && !allow_partial {
+        return Err(recovery(defect_reason(&loaded.defects))
+            .extra("missing", Value::Array(loaded.defects.clone())));
+    }
+    let completeness = if loaded.defects.is_empty() {
+        "complete"
+    } else {
+        "partial"
+    };
+    let records_bytes =
+        serde_json::to_vec_pretty(&loaded.records).map_err(|_| recovery("export_encode"))?;
+    let snapshot_id = sha256_bytes(&records_bytes);
+    let mut files: Vec<Written> = Vec::new();
+    files.push(Written {
+        path: "records.json".into(),
+        bytes: records_bytes,
+        object_id: None,
+    });
+    if let Some(csv) = loaded.csv.as_ref() {
+        files.push(Written {
+            path: "facts.csv".into(),
+            bytes: csv.clone(),
+            object_id: None,
+        });
+    }
+    for copy in &loaded.copies {
+        let hashed = sha256_bytes(&copy.bytes);
+        if hashed != copy.content_sha256 || copy.bytes.len() as i64 != copy.byte_length {
+            return Err(recovery("export_verify_failed"));
+        }
+        files.push(Written {
+            path: copy.package_path.clone(),
+            bytes: copy.bytes.clone(),
+            object_id: Some(copy.object_id.clone()),
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let manifest = manifest_value(
+        &snapshot_id,
+        completeness,
+        loaded.vault_format,
+        loaded.protection,
+        acknowledge_plaintext,
+        &files,
+        &loaded.defects,
+        &loaded.counts,
+    );
+    let manifest_bytes =
+        serde_json::to_vec_pretty(&manifest).map_err(|_| recovery("export_encode"))?;
+    files.push(Written {
+        path: "manifest.json".into(),
+        bytes: manifest_bytes,
+        object_id: None,
+    });
+    Ok(files
+        .into_iter()
+        .map(|f| MemoryPackageFile {
+            path: f.path,
+            bytes: f.bytes,
+        })
+        .collect())
+}
+
 fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
     validate_hook_names(
         req.hooks.stop_at.as_deref(),
@@ -146,6 +227,11 @@ fn export_inner(req: ExportRequest) -> Result<(i32, Value), Fail> {
         return Err(
             scratch.fail(recovery("export_verify_failed").extra("os_error", json!(message)))
         );
+    }
+    let originals_dir = scratch.temp.join("originals");
+    if originals_dir.is_dir() {
+        fsutil::fsync_dir(&originals_dir)
+            .map_err(|err| scratch.fail(copy_fail(err, "export_sync")))?;
     }
     fsutil::fsync_dir(&scratch.temp).map_err(|err| scratch.fail(copy_fail(err, "export_sync")))?;
     match fs::symlink_metadata(crate::platform::final_directory_entry(&req.out)) {

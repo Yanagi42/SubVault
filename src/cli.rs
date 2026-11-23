@@ -61,6 +61,7 @@ struct Flags {
     redact_terms: Vec<String>,
     port: Option<u16>,
     no_browser: bool,
+    help: bool,
 }
 
 impl Flags {
@@ -117,6 +118,7 @@ impl Flags {
             redact_terms: Vec::new(),
             port: None,
             no_browser: false,
+            help: false,
         }
     }
 
@@ -137,13 +139,16 @@ pub fn execute(args: Vec<String>) -> Report {
     if args.is_empty() || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
         return engine::help_report();
     }
-    if args[0] == "version" {
+    if args[0] == "version" || args[0] == "--version" || args[0] == "-V" {
         return engine::version_report();
     }
     let (command, flags) = match parse(&args) {
         Ok(parsed) => parsed,
         Err(fail) => return fail.into_report(),
     };
+    if flags.help {
+        return engine::help_report();
+    }
     if command == "review" && (flags.stop_at.is_some() || flags.inject.is_some()) {
         return usage("review_has_no_hook");
     }
@@ -331,6 +336,9 @@ pub fn execute(args: Vec<String>) -> Report {
             else {
                 return usage("csv_required_flags");
             };
+            if flags.media_type.is_some() {
+                return usage("csv_media_type_fixed");
+            }
             engine::submit_csv(engine::CsvRequest {
                 vault,
                 command_id,
@@ -553,6 +561,11 @@ fn parse(args: &[String]) -> Result<(String, Flags), Fail> {
             }
             "--no-browser" => {
                 flags.no_browser = true;
+                index += 1;
+                continue;
+            }
+            "--help" | "-h" => {
+                flags.help = true;
                 index += 1;
                 continue;
             }
