@@ -93,8 +93,8 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
     } else {
         MAX_HTML_BYTES
     };
-    let bytes = read_html(&req.source, max_bytes)?;
-    let text = std::str::from_utf8(&bytes).expect("read_html accepted utf-8");
+    let (bytes, decoded_text, is_plain_utf8) =
+        read_html(&req.source, max_bytes, session.vault_format >= 6)?;
     let hash = sha256_bytes(&bytes);
     if let Some(source) = store::source_by_hash_with_cipher(
         &session.conn,
@@ -128,7 +128,7 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
     };
     journal.state = "object_ready".into();
     journal::write_with_cipher(&session.root, &journal, &session.cipher)?;
-    let (prepared, hints) = extract_for_session(text, session.vault_format);
+    let (prepared, hints) = extract_for_session(&decoded_text, session.vault_format, is_plain_utf8);
     let committed = match commit(
         &session,
         &req,
@@ -170,7 +170,11 @@ fn submit_inner(req: HtmlRequest) -> Result<Value, Fail> {
     }
 }
 
-fn read_html(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Fail> {
+fn read_html(
+    path: &Path,
+    max_bytes: u64,
+    allow_non_utf8: bool,
+) -> Result<(Vec<u8>, String, bool), Fail> {
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(err) => {
@@ -201,13 +205,86 @@ fn read_html(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Fail> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|err| io_fail(err, "html_read").extra("preservation", json!(NOT_PRESERVED)))?;
-    if std::str::from_utf8(&bytes).is_err() {
+    let Some((decoded, is_plain_utf8)) = decode_html_bytes(&bytes, allow_non_utf8) else {
         return Err(Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
             .extra("bytes_read", json!(bytes.len()))
             .extra("preservation", json!(NOT_PRESERVED))
             .extra("new_effect", json!(false)));
+    };
+    Ok((bytes, decoded, is_plain_utf8))
+}
+
+pub(crate) fn decode_html_bytes(bytes: &[u8], allow_non_utf8: bool) -> Option<(String, bool)> {
+    if !allow_non_utf8 {
+        let text = std::str::from_utf8(bytes).ok()?;
+        return Some((text.to_string(), true));
     }
-    Ok(bytes)
+    // Format 6+: UTF-16LE / UTF-16BE BOM
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        if bytes.len() < 4 || bytes.len() % 2 != 0 {
+            return None;
+        }
+        let (decoded, _, had_errors) = encoding_rs::UTF_16LE.decode(bytes);
+        if had_errors || is_binary_html_text(&decoded, true) {
+            return None;
+        }
+        return Some((decoded.trim_start_matches('\u{feff}').to_string(), false));
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        if bytes.len() < 4 || bytes.len() % 2 != 0 {
+            return None;
+        }
+        let (decoded, _, had_errors) = encoding_rs::UTF_16BE.decode(bytes);
+        if had_errors || is_binary_html_text(&decoded, true) {
+            return None;
+        }
+        return Some((decoded.trim_start_matches('\u{feff}').to_string(), false));
+    }
+    // Reject NUL bytes in non-UTF-16 inputs so binary files are not accepted as HTML
+    if bytes.contains(&0) {
+        return None;
+    }
+    // UTF-8 BOM
+    if let Some(stripped) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        if let Ok(s) = std::str::from_utf8(stripped) {
+            if is_binary_html_text(s, false) {
+                return None;
+            }
+            return Some((s.to_string(), false));
+        }
+    }
+    // Clean UTF-8
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if is_binary_html_text(s, false) {
+            return None;
+        }
+        return Some((s.to_string(), true));
+    }
+    // GB18030 / GBK fallback for legacy Chinese HTML invoices/emails
+    let (decoded, _, had_errors) = encoding_rs::GB18030.decode(bytes);
+    if had_errors || is_binary_html_text(&decoded, true) {
+        return None;
+    }
+    Some((decoded.into_owned(), false))
+}
+
+fn is_binary_html_text(text: &str, strict_controls: bool) -> bool {
+    let mut total = 0usize;
+    let mut bad_controls = 0usize;
+    for ch in text.chars() {
+        if ch == '\0' {
+            return true;
+        }
+        total += 1;
+        let code = ch as u32;
+        if (code < 0x20 && !matches!(ch, '\t' | '\n' | '\r' | '\u{000c}')) || code == 0x7F {
+            bad_controls += 1;
+            if strict_controls {
+                return true;
+            }
+        }
+    }
+    total == 0 || (bad_controls > 0 && bad_controls * 20 >= total)
 }
 
 fn start_journal(root: &Path, req: &HtmlRequest, cipher: &VaultCipher) -> Result<Journal, Fail> {
@@ -1051,17 +1128,26 @@ fn prepared(status: &'static str, reason: Option<String>, hits: Vec<Hit>) -> Pre
 fn extract_for_session(
     source: &str,
     vault_format: i64,
+    is_plain_utf8: bool,
 ) -> (Prepared, crate::real_extract::ExtractedHints) {
-    let strict = extract(source);
     if vault_format < 6 {
-        return (strict, crate::real_extract::ExtractedHints::default());
+        return (
+            extract(source),
+            crate::real_extract::ExtractedHints::default(),
+        );
     }
     let real = crate::real_extract::extract_real_html(source);
     let hints = real.hints;
-    let strict_has_usable = strict.hits.iter().any(|h| h.usable);
-    if strict_has_usable || strict.status == "conflict" {
-        return (strict, hints);
-    }
+    let strict = if is_plain_utf8 {
+        let strict = extract(source);
+        let strict_has_usable = strict.hits.iter().any(|h| h.usable);
+        if strict_has_usable || strict.status == "conflict" {
+            return (strict, hints);
+        }
+        Some(strict)
+    } else {
+        None
+    };
     if real.adopt_amount_idx.is_some()
         || real.adopt_period_idx.is_some()
         || real.status == "conflict"
@@ -1130,7 +1216,13 @@ fn extract_for_session(
             hints,
         );
     }
-    (strict, hints)
+    match strict {
+        Some(strict) => (strict, hints),
+        None => (
+            prepared(real.status, real.reason.map(str::to_string), Vec::new()),
+            hints,
+        ),
+    }
 }
 
 fn extract(source: &str) -> Prepared {
@@ -1960,5 +2052,43 @@ mod tests {
             Some("ambiguous_association")
         );
         assert!(ambiguous_prepared.hits.iter().all(|hit| !hit.usable));
+    }
+
+    #[test]
+    fn format6_decodes_gb18030_and_utf16_html_while_legacy_rejects_non_utf8() {
+        let gbk_html = "<html><body><p>实付金额：¥98.00</p></body></html>";
+        let (gbk_bytes, _, _) = encoding_rs::GB18030.encode(gbk_html);
+        // Format 4/5 rejects non-UTF-8 strictly
+        assert!(decode_html_bytes(&gbk_bytes, false).is_none());
+        assert!(decode_html_bytes(&[0xFF, 0xFE], false).is_none());
+        // Format 6 decodes GB18030 cleanly while preserving non-UTF-8 flag
+        let (decoded, is_plain_utf8) = decode_html_bytes(&gbk_bytes, true).unwrap();
+        assert_eq!(decoded, gbk_html);
+        assert!(!is_plain_utf8);
+        let (prep, _) = extract_for_session(&decoded, 6, is_plain_utf8);
+        assert_eq!(prep.status, "matched");
+        assert_eq!(prep.hits[0].currency.as_deref(), Some("CNY"));
+        assert_eq!(prep.hits[0].amount_text.as_deref(), Some("98.00"));
+
+        // UTF-16LE BOM HTML
+        let mut utf16le = vec![0xFFu8, 0xFEu8];
+        for unit in "<p>Amount paid: $20.00</p>".encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let (decoded_16, is_plain_16) = decode_html_bytes(&utf16le, true).unwrap();
+        assert_eq!(decoded_16, "<p>Amount paid: $20.00</p>");
+        assert!(!is_plain_16);
+
+        // UTF-8 BOM HTML
+        let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
+        utf8_bom.extend_from_slice("<p>Amount paid: $20.00</p>".as_bytes());
+        let (decoded_bom, is_plain_bom) = decode_html_bytes(&utf8_bom, true).unwrap();
+        assert_eq!(decoded_bom, "<p>Amount paid: $20.00</p>");
+        assert!(!is_plain_bom);
+
+        // Binary garbage & bare BOM rejected even in Format 6
+        assert!(decode_html_bytes(&[0xFF, 0xFE], true).is_none());
+        assert!(decode_html_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR", true).is_none());
+        assert!(decode_html_bytes(b"PK\x03\x04\x14\x00\x00\x00", true).is_none());
     }
 }

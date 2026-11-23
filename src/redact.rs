@@ -219,89 +219,42 @@ impl Redactor {
         let indent_len = line.len() - trimmed_start.len();
         let indent = &line[..indent_len];
 
-        // Avoid masking already-redacted placeholder-only values
-        const LABELS: &[&str] = &[
-            "billing address:",
-            "account holder:",
-            "account email:",
-            "account name:",
-            "account id:",
-            "customer email:",
-            "customer name:",
-            "payment method:",
-            "card ending in:",
-            "card ending in ",
-            "card ending:",
-            "cardholder:",
-            "billed to:",
-            "bill to:",
-            "ship to:",
-            "full name:",
-            "subscriber:",
-            "recipient:",
-            "telephone:",
-            "customer:",
-            "username:",
-            "member id:",
-            "user id:",
-            "account:",
-            "address:",
-            "street:",
-            "mobile:",
-            "tax id:",
-            "vat id:",
-            "email:",
-            "phone:",
-            "name:",
-            "city:",
-            "vat:",
-            "gst:",
-            "tin:",
-            "客户姓名：",
-            "客户姓名:",
-            "账单地址：",
-            "账单地址:",
-            "付款方式：",
-            "付款方式:",
-            "收件人：",
-            "收件人:",
-            "姓名：",
-            "姓名:",
-            "账户：",
-            "账户:",
-            "账号：",
-            "账号:",
-            "地址：",
-            "地址:",
-            "电话：",
-            "电话:",
-            "手机：",
-            "手机:",
-            "邮箱：",
-            "邮箱:",
-            "税号：",
-            "税号:",
-            "卡号：",
-            "卡号:",
-        ];
+        // Special no-colon prefix: `Card ending in 4242`
+        const NO_COLON_PREFIX: &str = "card ending in ";
+        if trimmed_start.len() >= NO_COLON_PREFIX.len()
+            && trimmed_start.is_char_boundary(NO_COLON_PREFIX.len())
+            && trimmed_start[..NO_COLON_PREFIX.len()].eq_ignore_ascii_case(NO_COLON_PREFIX)
+        {
+            let label_slice = &trimmed_start[..NO_COLON_PREFIX.len()];
+            let rest = &trimmed_start[NO_COLON_PREFIX.len()..];
+            let val = rest.trim();
+            if val.is_empty() || is_only_placeholders(val) {
+                return line.to_string();
+            }
+            let placeholder = self.field_placeholder(val);
+            return format!("{indent}{label_slice}{placeholder}");
+        }
 
-        let lower = trimmed_start.to_lowercase();
-        for label in LABELS {
-            if lower.starts_with(label) {
-                let prefix_len = byte_prefix_len_case_folded(trimmed_start, label);
+        // General `Label:` / `标签：` / spaced CJK fapiao `名 称：` matcher
+        if let Some((colon_idx, colon_ch)) = trimmed_start
+            .char_indices()
+            .take_while(|(idx, _)| *idx < 64)
+            .find(|(_, ch)| matches!(ch, ':' | '：'))
+        {
+            let raw_label = &trimmed_start[..colon_idx];
+            if is_sensitive_label_raw(raw_label) {
+                let prefix_len = colon_idx + colon_ch.len_utf8();
                 let label_slice = &trimmed_start[..prefix_len];
                 let rest = &trimmed_start[prefix_len..];
                 let val = rest.trim();
                 if val.is_empty() || is_only_placeholders(val) {
                     return line.to_string();
                 }
-                let sep =
-                    if label_slice.ends_with(' ') || label_slice.ends_with('：') || rest.is_empty()
-                    {
-                        ""
-                    } else {
-                        " "
-                    };
+                let sep = if label_slice.ends_with('：') {
+                    ""
+                } else {
+                    " "
+                };
                 let placeholder = self.field_placeholder(val);
                 return format!("{indent}{label_slice}{sep}{placeholder}");
             }
@@ -427,6 +380,55 @@ impl Redactor {
                 i = end;
                 continue;
             }
+            if let Some(end) = match_uuid(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some(end) = match_payment_processor_id(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some(end) = match_cn_resident_id(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some(end) = match_cn_uscc(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some(end) = match_eu_vat(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some(end) = match_us_ssn(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some(end) = match_us_ein(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some((prefix, val, end)) = match_last4_card_ref(input, i) {
+                let ph = self.id_placeholder(val);
+                out.push_str(prefix);
+                out.push_str(&ph);
+                i = end;
+                continue;
+            }
             if let Some(end) = match_prefixed_code(input, i) {
                 let matched = &input[i..end];
                 out.push_str(&self.id_placeholder(matched));
@@ -434,6 +436,24 @@ impl Redactor {
                 continue;
             }
             if let Some(end) = match_masked_card(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some(end) = match_mid_masked_card_or_phone(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some(end) = match_parenthesized_phone(input, i) {
+                let matched = &input[i..end];
+                out.push_str(&self.id_placeholder(matched));
+                i = end;
+                continue;
+            }
+            if let Some(end) = match_dotted_phone(input, i) {
                 let matched = &input[i..end];
                 out.push_str(&self.id_placeholder(matched));
                 i = end;
@@ -458,6 +478,108 @@ pub fn redact_template(req: RedactRequest) -> Report {
         Ok(report) => report,
         Err(fail) => fail.into_report(),
     }
+}
+
+/// Redacts a vaulted source entirely in memory without creating plaintext files in `%TEMP%`/`/tmp`.
+#[allow(dead_code)]
+pub(crate) fn redact_vault_source_in_memory(
+    vault: &Path,
+    source_id: &str,
+    redact_terms: Vec<String>,
+    auth: &AuthInput,
+) -> Report {
+    match redact_vault_source_in_memory_inner(vault, source_id, redact_terms, auth) {
+        Ok(report) => report,
+        Err(fail) => fail.into_report(),
+    }
+}
+
+fn redact_vault_source_in_memory_inner(
+    vault: &Path,
+    source_id: &str,
+    redact_terms: Vec<String>,
+    auth: &AuthInput,
+) -> Result<Report, Fail> {
+    for term in &redact_terms {
+        if term.trim().is_empty() {
+            return Err(Fail::new(EXIT_USAGE, "Usage", "empty_redact_term"));
+        }
+    }
+    if !is_prefixed_id(source_id, "src_") {
+        return Err(Fail::new(EXIT_USAGE, "Usage", "bad_id"));
+    }
+    let loaded = load_vault_source(vault, source_id, auth)?;
+    let kind = detect_kind(&loaded.bytes, loaded.media_type.as_deref());
+    let mut redactor = Redactor::new(redact_terms);
+    let (body_text, redacted_lines) = match kind {
+        InputKind::Pdf => redact_pdf(&loaded.bytes, &mut redactor)?,
+        InputKind::Html => {
+            let allow_non_utf8 = loaded.vault_format.is_none_or(|v| v >= 6);
+            let (text, _) = super::html::decode_html_bytes(&loaded.bytes, allow_non_utf8)
+                .ok_or_else(|| {
+                    Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
+                        .extra("read_only", json!(true))
+                        .extra("output_written", json!(false))
+                })?;
+            redact_html(&text, &mut redactor)
+        }
+        InputKind::Text => {
+            let text = std::str::from_utf8(&loaded.bytes).map_err(|_| {
+                Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
+                    .extra("read_only", json!(true))
+                    .extra("output_written", json!(false))
+            })?;
+            redact_plain_text(text, &mut redactor)
+        }
+    };
+    let (header, header_lines) = format_header(kind);
+    let final_output = format!("{header}{body_text}");
+    let shifted_lines: Vec<usize> = redacted_lines
+        .into_iter()
+        .map(|ln| ln + header_lines)
+        .collect();
+
+    let total_redactions = redactor.counts.total_redactions();
+    let mut body = honesty("Redacted");
+    body.insert("slice".into(), json!("M4-real"));
+    body.insert("read_only".into(), json!(true));
+    body.insert("new_effect".into(), json!(false));
+    body.insert("input_mode".into(), json!(loaded.input_mode));
+    body.insert("input_kind".into(), json!(kind.as_str()));
+    body.insert("redacted_text".into(), json!(final_output));
+    body.insert("redaction_rules".into(), json!(REDACTION_RULES_VERSION));
+    body.insert("manual_review_required".into(), json!(true));
+    body.insert("total_redactions".into(), json!(total_redactions));
+    body.insert(
+        "counts".into(),
+        json!({
+            "custom_terms": redactor.counts.custom_terms,
+            "header_fields": redactor.counts.header_fields,
+            "emails": redactor.counts.emails,
+            "urls_and_ips": redactor.counts.urls_and_ips,
+            "identifiers": redactor.counts.identifiers,
+            "amounts": redactor.counts.amounts,
+            "dates": redactor.counts.dates,
+            "stripped_scripts": redactor.counts.stripped_scripts,
+            "stripped_styles": redactor.counts.stripped_styles,
+            "stripped_comments": redactor.counts.stripped_comments,
+            "total_redactions": total_redactions,
+        }),
+    );
+    body.insert("redacted_lines".into(), json!(shifted_lines));
+    if let Some(sid) = loaded.source_id {
+        body.insert("source_id".into(), json!(sid));
+    }
+    if let Some(version) = loaded.vault_format {
+        body.insert("vault_format".into(), json!(version));
+        apply_format_honesty(&mut body, version, loaded.protection);
+    } else {
+        body.insert("synthetic_only".into(), json!(false));
+    }
+    Ok(Report {
+        code: EXIT_OK,
+        body: Value::Object(body),
+    })
 }
 
 fn redact_inner(req: RedactRequest) -> Result<Report, Fail> {
@@ -491,12 +613,14 @@ fn redact_inner(req: RedactRequest) -> Result<Report, Fail> {
     let (body_text, redacted_lines) = match kind {
         InputKind::Pdf => redact_pdf(&loaded.bytes, &mut redactor)?,
         InputKind::Html => {
-            let text = std::str::from_utf8(&loaded.bytes).map_err(|_| {
-                Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
-                    .extra("read_only", json!(true))
-                    .extra("output_written", json!(false))
-            })?;
-            redact_html(text, &mut redactor)
+            let allow_non_utf8 = loaded.vault_format.is_none_or(|v| v >= 6);
+            let (text, _) = super::html::decode_html_bytes(&loaded.bytes, allow_non_utf8)
+                .ok_or_else(|| {
+                    Fail::new(EXIT_REJECTED, "Rejected", "invalid_utf8")
+                        .extra("read_only", json!(true))
+                        .extra("output_written", json!(false))
+                })?;
+            redact_html(&text, &mut redactor)
         }
         InputKind::Text => {
             let text = std::str::from_utf8(&loaded.bytes).map_err(|_| {
@@ -753,11 +877,26 @@ fn redact_plain_text(text: &str, redactor: &mut Redactor) -> (String, Vec<usize>
     (out, redacted_lines)
 }
 
+#[derive(Default)]
+struct HtmlTableState {
+    next_td_sensitive: bool,
+    cell_mode: HtmlCellMode,
+}
+
+#[derive(Default)]
+enum HtmlCellMode {
+    #[default]
+    None,
+    CapturingLabel(String),
+    SensitiveTd,
+}
+
 fn redact_html(html: &str, redactor: &mut Redactor) -> (String, Vec<usize>) {
     let normalized = html.replace("\r\n", "\n").replace('\r', "\n");
     let mut out = String::with_capacity(normalized.len());
     let mut i = 0usize;
     let bytes = normalized.as_bytes();
+    let mut table_stack = vec![HtmlTableState::default()];
     while i < bytes.len() {
         if normalized[i..].starts_with("<!--") {
             if let Some(rel_end) = normalized[i + 4..].find("-->") {
@@ -772,21 +911,26 @@ fn redact_html(html: &str, redactor: &mut Redactor) -> (String, Vec<usize>) {
         if bytes[i] == b'<' {
             if let Some(end_tag) = find_tag_end(&normalized, i) {
                 let tag = &normalized[i..end_tag];
-                let lower_name = html_tag_name(tag);
-                if lower_name == "script" {
+                let (is_closing, is_self_closing, lower_name) = html_tag_info(tag);
+                if !is_closing && lower_name == "script" {
                     redactor.counts.stripped_scripts += 1;
                     out.push_str("<!-- [STRIPPED_SCRIPT] -->");
                     i = skip_until_closing_tag(&normalized, end_tag, "script");
                     continue;
                 }
-                if lower_name == "style" {
+                if !is_closing && lower_name == "style" {
                     redactor.counts.stripped_styles += 1;
                     out.push_str("<!-- [STRIPPED_STYLE] -->");
                     i = skip_until_closing_tag(&normalized, end_tag, "style");
                     continue;
                 }
+                update_html_table_state(&mut table_stack, is_closing, is_self_closing, &lower_name);
                 out.push_str(&sanitize_html_tag(tag, redactor));
                 i = end_tag;
+                continue;
+            } else {
+                out.push_str("&lt;");
+                i += 1;
                 continue;
             }
         }
@@ -796,8 +940,40 @@ fn redact_html(html: &str, redactor: &mut Redactor) -> (String, Vec<usize>) {
             .map(|rel| i + rel)
             .unwrap_or(normalized.len());
         let text_seg = &normalized[i..next_lt];
-        let (redacted_seg, _) = redactor.redact_text_node(text_seg);
-        out.push_str(&redacted_seg);
+        let decoded = html_escape::decode_html_entities(text_seg);
+        let state = table_stack.last_mut().expect("table_stack is non-empty");
+        match &mut state.cell_mode {
+            HtmlCellMode::SensitiveTd => {
+                let redacted = if decoded.trim().is_empty() {
+                    decoded.into_owned()
+                } else {
+                    let trimmed = decoded.trim();
+                    let after_terms = redactor.redact_custom_terms(trimmed);
+                    let lead_len = decoded.len() - decoded.trim_start().len();
+                    let trail_start = decoded.trim_end().len();
+                    let lead = &decoded[..lead_len];
+                    let trail = &decoded[trail_start..];
+                    if is_only_placeholders(&after_terms) {
+                        format!("{lead}{after_terms}{trail}")
+                    } else {
+                        let ph = redactor.field_placeholder(trimmed);
+                        format!("{lead}{ph}{trail}")
+                    }
+                };
+                out.push_str(&escape_html_text(&redacted));
+            }
+            HtmlCellMode::CapturingLabel(buf) => {
+                if buf.len() < 256 {
+                    buf.push_str(&decoded);
+                }
+                let (redacted_seg, _) = redactor.redact_text_node(&decoded);
+                out.push_str(&escape_html_text(&redacted_seg));
+            }
+            HtmlCellMode::None => {
+                let (redacted_seg, _) = redactor.redact_text_node(&decoded);
+                out.push_str(&escape_html_text(&redacted_seg));
+            }
+        }
         i = next_lt;
     }
     let redacted_lines: Vec<usize> = out
@@ -815,6 +991,108 @@ fn redact_html(html: &str, redactor: &mut Redactor) -> (String, Vec<usize>) {
         out.push('\n');
     }
     (out, redacted_lines)
+}
+
+fn update_html_table_state(
+    table_stack: &mut Vec<HtmlTableState>,
+    is_closing: bool,
+    is_self_closing: bool,
+    lower_name: &str,
+) {
+    match (is_closing, lower_name) {
+        (false, "table") if !is_self_closing => {
+            if let Some(top) = table_stack.last_mut() {
+                if matches!(top.cell_mode, HtmlCellMode::CapturingLabel(_)) {
+                    top.cell_mode = HtmlCellMode::None;
+                }
+            }
+            table_stack.push(HtmlTableState::default());
+        }
+        (true, "table") => {
+            if table_stack.len() > 1 {
+                table_stack.pop();
+            } else if let Some(top) = table_stack.last_mut() {
+                *top = HtmlTableState::default();
+            }
+        }
+        (_, "tr") => {
+            if let Some(top) = table_stack.last_mut() {
+                top.cell_mode = HtmlCellMode::None;
+                top.next_td_sensitive = false;
+            }
+        }
+        (false, "th") => {
+            if let Some(top) = table_stack.last_mut() {
+                top.next_td_sensitive = false;
+                top.cell_mode = if is_self_closing {
+                    HtmlCellMode::None
+                } else {
+                    HtmlCellMode::CapturingLabel(String::new())
+                };
+            }
+        }
+        (false, "td") => {
+            if let Some(top) = table_stack.last_mut() {
+                if let HtmlCellMode::CapturingLabel(buf) = std::mem::take(&mut top.cell_mode) {
+                    if is_sensitive_label(&buf) {
+                        top.next_td_sensitive = true;
+                    }
+                }
+                if is_self_closing {
+                    top.next_td_sensitive = false;
+                    top.cell_mode = HtmlCellMode::None;
+                } else if top.next_td_sensitive {
+                    top.next_td_sensitive = false;
+                    top.cell_mode = HtmlCellMode::SensitiveTd;
+                } else {
+                    top.cell_mode = HtmlCellMode::CapturingLabel(String::new());
+                }
+            }
+        }
+        (true, "th" | "td") => {
+            if let Some(top) = table_stack.last_mut() {
+                top.next_td_sensitive = match std::mem::take(&mut top.cell_mode) {
+                    HtmlCellMode::CapturingLabel(buf) => is_sensitive_label(&buf),
+                    HtmlCellMode::SensitiveTd | HtmlCellMode::None => false,
+                };
+            }
+        }
+        _ => {}
+    }
+}
+
+fn escape_html_text(s: &str) -> String {
+    if !s.contains(['&', '<', '>']) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn escape_html_attr(s: &str, quote_char: char) -> String {
+    if !s.contains(['&', '<', '>', quote_char]) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' if quote_char == '"' => out.push_str("&quot;"),
+            '\'' if quote_char == '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn find_tag_end(s: &str, start: usize) -> Option<usize> {
@@ -837,16 +1115,24 @@ fn find_tag_end(s: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn html_tag_name(tag: &str) -> String {
-    let inner = tag.trim_start_matches('<').trim_start();
-    if inner.starts_with('/') || inner.starts_with('!') || inner.starts_with('?') {
-        return String::new();
+fn html_tag_info(tag: &str) -> (bool, bool, String) {
+    let inner = tag.strip_prefix('<').unwrap_or(tag);
+    let inner = inner.strip_suffix('>').unwrap_or(inner).trim();
+    if inner.starts_with('!') || inner.starts_with('?') {
+        return (false, false, String::new());
     }
-    inner
+    let (is_closing, rest) = if let Some(after_slash) = inner.strip_prefix('/') {
+        (true, after_slash.trim_start())
+    } else {
+        (false, inner)
+    };
+    let is_self_closing = !is_closing && rest.ends_with('/');
+    let name = rest
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == ':')
         .collect::<String>()
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    (is_closing, is_self_closing, name)
 }
 
 fn skip_until_closing_tag(s: &str, from: usize, tag_name: &str) -> usize {
@@ -953,13 +1239,22 @@ fn sanitize_html_tag(tag: &str, redactor: &mut Redactor) -> String {
                 out.push_str(&format!(" {attr_name}={quote_char}{raw_val}{quote_char}"));
             } else if matches!(
                 lower_attr.as_str(),
-                "href" | "src" | "action" | "poster" | "cite"
+                "href"
+                    | "src"
+                    | "action"
+                    | "poster"
+                    | "cite"
+                    | "srcset"
+                    | "formaction"
+                    | "xlink:href"
             ) {
                 let ph = redactor.url_placeholder(raw_val);
                 out.push_str(&format!(" {attr_name}={quote_char}{ph}{quote_char}"));
             } else {
-                let cleaned = redactor.redact_inline_only(raw_val);
-                out.push_str(&format!(" {attr_name}={quote_char}{cleaned}{quote_char}"));
+                let decoded_attr = html_escape::decode_html_entities(raw_val);
+                let cleaned = redactor.redact_inline_only(&decoded_attr);
+                let escaped = escape_html_attr(&cleaned, quote_char);
+                out.push_str(&format!(" {attr_name}={quote_char}{escaped}{quote_char}"));
             }
         } else if !attr_name.is_empty() {
             out.push(' ');
@@ -1065,13 +1360,130 @@ fn replace_case_insensitive(
     out
 }
 
-fn byte_prefix_len_case_folded(original: &str, lower_prefix: &str) -> usize {
-    let want = lower_prefix.chars().count();
-    original
-        .char_indices()
-        .nth(want)
-        .map(|(idx, _)| idx)
-        .unwrap_or(original.len())
+const ASCII_SENSITIVE_LABELS: &[&str] = &[
+    "billing address",
+    "billing name",
+    "account holder",
+    "account email",
+    "account name",
+    "account id",
+    "customer email",
+    "customer name",
+    "payment method",
+    "card ending in",
+    "card ending",
+    "cardholder",
+    "billed to",
+    "bill to",
+    "ship to",
+    "full name",
+    "subscriber",
+    "recipient",
+    "telephone",
+    "customer",
+    "username",
+    "member id",
+    "user id",
+    "account",
+    "address",
+    "street",
+    "mobile",
+    "tax id",
+    "vat id",
+    "email",
+    "phone",
+    "name",
+    "city",
+    "vat",
+    "gst",
+    "tin",
+];
+
+const CJK_SENSITIVE_LABELS: &[&str] = &[
+    "购买方名称",
+    "购方名称",
+    "买方名称",
+    "发票抬头",
+    "抬头",
+    "名称",
+    "纳税人识别号",
+    "税号",
+    "统一社会信用代码",
+    "地址、电话",
+    "地址电话",
+    "开户行及账号",
+    "开户银行",
+    "银行账号",
+    "开票人",
+    "收款人",
+    "复核",
+    "复核人",
+    "身份证号",
+    "身份证号码",
+    "发票代码",
+    "发票号码",
+    "校验码",
+    "机器编号",
+    "订单号",
+    "订单编号",
+    "交易单号",
+    "商户单号",
+    "流水号",
+    "客户姓名",
+    "账单地址",
+    "付款方式",
+    "收件人",
+    "姓名",
+    "账户",
+    "账号",
+    "地址",
+    "电话",
+    "手机",
+    "邮箱",
+    "卡号",
+];
+
+fn is_sensitive_label_raw(raw_label: &str) -> bool {
+    let trimmed = raw_label.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().all(|c| c.is_ascii() || c.is_whitespace()) {
+        let mut norm = String::with_capacity(trimmed.len());
+        let mut prev_ws = false;
+        for ch in trimmed.chars() {
+            if ch.is_whitespace() {
+                if !prev_ws {
+                    norm.push(' ');
+                    prev_ws = true;
+                }
+            } else {
+                norm.push(ch.to_ascii_lowercase());
+                prev_ws = false;
+            }
+        }
+        return ASCII_SENSITIVE_LABELS.contains(&norm.as_str());
+    }
+    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    CJK_SENSITIVE_LABELS.contains(&compact.as_str())
+}
+
+fn is_sensitive_label(cell_text: &str) -> bool {
+    let stripped = cell_text
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, ':' | '：') || c.is_whitespace());
+    is_sensitive_label_raw(stripped)
+}
+
+fn skip_inline_spaces(s: &str, mut pos: usize) -> usize {
+    while let Some(ch) = s[pos..].chars().next() {
+        if matches!(ch, ' ' | '\t' | '\u{00A0}' | '\u{3000}') {
+            pos += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    pos
 }
 
 fn match_url(s: &str, start: usize) -> Option<usize> {
@@ -1174,74 +1586,6 @@ fn is_email_local(b: u8) -> bool {
 }
 
 fn match_date(s: &str, start: usize) -> Option<(usize, &'static str)> {
-    let bytes = s.as_bytes();
-    let prev_alnum = start > 0 && bytes[start - 1].is_ascii_alphanumeric();
-    if prev_alnum {
-        return None;
-    }
-    // 1. ISO YYYY-MM-DD or YYYY/MM/DD
-    if start + 10 <= bytes.len()
-        && bytes[start..start + 4].iter().all(u8::is_ascii_digit)
-        && (bytes[start + 4] == b'-' || bytes[start + 4] == b'/')
-        && bytes[start + 5..start + 7].iter().all(u8::is_ascii_digit)
-        && bytes[start + 7] == bytes[start + 4]
-        && bytes[start + 8..start + 10].iter().all(u8::is_ascii_digit)
-        && !bytes.get(start + 10).is_some_and(u8::is_ascii_alphanumeric)
-    {
-        let year: u16 = s[start..start + 4].parse().ok()?;
-        let month: u8 = s[start + 5..start + 7].parse().ok()?;
-        let day: u8 = s[start + 8..start + 10].parse().ok()?;
-        if (1990..=2100).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day) {
-            return Some((start + 10, "ISO"));
-        }
-    }
-    // 2. Chinese YYYY年MM月DD日
-    if start + 4 <= bytes.len() && bytes[start..start + 4].iter().all(u8::is_ascii_digit) {
-        let rest = &s[start + 4..];
-        if let Some(after_y) = rest.strip_prefix('年') {
-            let m_len = after_y.bytes().take_while(u8::is_ascii_digit).count();
-            if (1..=2).contains(&m_len) {
-                if let Some(after_m) = after_y[m_len..].strip_prefix('月') {
-                    let d_len = after_m.bytes().take_while(u8::is_ascii_digit).count();
-                    if (1..=2).contains(&d_len) {
-                        if let Some(after_d) = after_m[d_len..].strip_prefix('日') {
-                            let consumed = s.len() - start - after_d.len();
-                            return Some((start + consumed, "CJK"));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // 3. Slash MM/DD/YYYY or DD/MM/YYYY
-    if start + 8 <= bytes.len() && bytes[start].is_ascii_digit() {
-        let mut p = start;
-        let a_start = p;
-        while p < bytes.len() && bytes[p].is_ascii_digit() {
-            p += 1;
-        }
-        if (1..=2).contains(&(p - a_start)) && bytes.get(p) == Some(&b'/') {
-            p += 1;
-            let b_start = p;
-            while p < bytes.len() && bytes[p].is_ascii_digit() {
-                p += 1;
-            }
-            if (1..=2).contains(&(p - b_start)) && bytes.get(p) == Some(&b'/') {
-                p += 1;
-                let y_start = p;
-                while p < bytes.len() && bytes[p].is_ascii_digit() {
-                    p += 1;
-                }
-                if p - y_start == 4 && !bytes.get(p).is_some_and(u8::is_ascii_alphanumeric) {
-                    let year: u16 = s[y_start..p].parse().ok()?;
-                    if (1990..=2100).contains(&year) {
-                        return Some((p, "SLASH"));
-                    }
-                }
-            }
-        }
-    }
-    // 4. English text date: "Sep 01, 2026" / "September 1, 2026"
     const MONTHS: &[&str] = &[
         "january",
         "february",
@@ -1268,7 +1612,174 @@ fn match_date(s: &str, start: usize) -> Option<(usize, &'static str)> {
         "nov",
         "dec",
     ];
+
+    let bytes = s.as_bytes();
+    let prev_alnum = start > 0 && bytes[start - 1].is_ascii_alphanumeric();
+    if prev_alnum {
+        return None;
+    }
+
+    // 1. ISO / dotted: YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD
+    if start + 10 <= bytes.len()
+        && bytes[start..start + 4].iter().all(u8::is_ascii_digit)
+        && matches!(bytes[start + 4], b'-' | b'/' | b'.')
+        && bytes[start + 5..start + 7].iter().all(u8::is_ascii_digit)
+        && bytes[start + 7] == bytes[start + 4]
+        && bytes[start + 8..start + 10].iter().all(u8::is_ascii_digit)
+        && !bytes.get(start + 10).is_some_and(u8::is_ascii_alphanumeric)
+    {
+        let sep = bytes[start + 4];
+        let dot_boundary_bad = sep == b'.'
+            && ((start > 0 && bytes[start - 1] == b'.')
+                || (bytes.get(start + 10) == Some(&b'.')
+                    && bytes.get(start + 11).is_some_and(u8::is_ascii_digit)));
+        if !dot_boundary_bad {
+            if let (Ok(year), Ok(month), Ok(day)) = (
+                s[start..start + 4].parse::<u16>(),
+                s[start + 5..start + 7].parse::<u8>(),
+                s[start + 8..start + 10].parse::<u8>(),
+            ) {
+                if (1900..=2100).contains(&year)
+                    && (1..=12).contains(&month)
+                    && (1..=31).contains(&day)
+                {
+                    return Some((start + 10, "ISO"));
+                }
+            }
+        }
+    }
+
+    // 2. Chinese YYYY年MM月DD日
+    if start + 4 <= bytes.len() && bytes[start..start + 4].iter().all(u8::is_ascii_digit) {
+        let rest = &s[start + 4..];
+        if let Some(after_y) = rest.strip_prefix('年') {
+            let m_len = after_y.bytes().take_while(u8::is_ascii_digit).count();
+            if (1..=2).contains(&m_len) {
+                if let Some(after_m) = after_y[m_len..].strip_prefix('月') {
+                    let d_len = after_m.bytes().take_while(u8::is_ascii_digit).count();
+                    if (1..=2).contains(&d_len) {
+                        if let Some(after_d) = after_m[d_len..].strip_prefix('日') {
+                            if let (Ok(year), Ok(month), Ok(day)) = (
+                                s[start..start + 4].parse::<u16>(),
+                                after_y[..m_len].parse::<u8>(),
+                                after_m[..d_len].parse::<u8>(),
+                            ) {
+                                if (1900..=2100).contains(&year)
+                                    && (1..=12).contains(&month)
+                                    && (1..=31).contains(&day)
+                                {
+                                    let consumed = s.len() - start - after_d.len();
+                                    return Some((start + consumed, "CJK"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Slash MM/DD/YYYY or DD/MM/YYYY
+    if start + 8 <= bytes.len() && bytes[start].is_ascii_digit() {
+        let mut p = start;
+        let a_start = p;
+        while p < bytes.len() && bytes[p].is_ascii_digit() {
+            p += 1;
+        }
+        if (1..=2).contains(&(p - a_start)) && bytes.get(p) == Some(&b'/') {
+            p += 1;
+            let b_start = p;
+            while p < bytes.len() && bytes[p].is_ascii_digit() {
+                p += 1;
+            }
+            if (1..=2).contains(&(p - b_start)) && bytes.get(p) == Some(&b'/') {
+                p += 1;
+                let y_start = p;
+                while p < bytes.len() && bytes[p].is_ascii_digit() {
+                    p += 1;
+                }
+                if p - y_start == 4 && !bytes.get(p).is_some_and(u8::is_ascii_alphanumeric) {
+                    if let (Ok(a), Ok(b), Ok(year)) = (
+                        s[a_start..b_start - 1].parse::<u8>(),
+                        s[b_start..y_start - 1].parse::<u8>(),
+                        s[y_start..p].parse::<u16>(),
+                    ) {
+                        if (1900..=2100).contains(&year)
+                            && (1..=31).contains(&a)
+                            && (1..=31).contains(&b)
+                            && (a <= 12 || b <= 12)
+                        {
+                            return Some((p, "SLASH"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let tail = &s[start..];
+
+    // 4. English text date: `DD Mon YYYY` / `DD Month YYYY` (e.g., `15 Oct 2026`, `3 November 2026`)
+    if tail.as_bytes()[0].is_ascii_digit() {
+        let mut p = 0usize;
+        while tail.as_bytes().get(p).is_some_and(u8::is_ascii_digit) {
+            p += 1;
+        }
+        if (1..=2).contains(&p) {
+            if let Ok(day) = tail[..p].parse::<u8>() {
+                if (1..=31).contains(&day) {
+                    if tail.len() >= p + 2 {
+                        let ord = &tail.as_bytes()[p..p + 2];
+                        if ord.eq_ignore_ascii_case(b"st")
+                            || ord.eq_ignore_ascii_case(b"nd")
+                            || ord.eq_ignore_ascii_case(b"rd")
+                            || ord.eq_ignore_ascii_case(b"th")
+                        {
+                            p += 2;
+                        }
+                    }
+                    let ws1 = p;
+                    p = skip_inline_spaces(tail, p);
+                    if p > ws1 {
+                        let m_start = p;
+                        while tail.as_bytes().get(p).is_some_and(u8::is_ascii_alphabetic) {
+                            p += 1;
+                        }
+                        if p > m_start {
+                            let word = tail[m_start..p].to_ascii_lowercase();
+                            if MONTHS.contains(&word.as_str()) {
+                                if matches!(tail.as_bytes().get(p), Some(b'.' | b',')) {
+                                    p += 1;
+                                }
+                                let ws2 = p;
+                                p = skip_inline_spaces(tail, p);
+                                if p > ws2 {
+                                    let y_start = p;
+                                    while tail.as_bytes().get(p).is_some_and(u8::is_ascii_digit) {
+                                        p += 1;
+                                    }
+                                    if p - y_start == 4
+                                        && !tail
+                                            .as_bytes()
+                                            .get(p)
+                                            .is_some_and(u8::is_ascii_alphanumeric)
+                                    {
+                                        if let Ok(year) = tail[y_start..p].parse::<u16>() {
+                                            if (1900..=2100).contains(&year) {
+                                                return Some((start + p, "TEXT"));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. English text date: `Sep 01, 2026` / `September 1, 2026`
     if tail.as_bytes()[0].is_ascii_alphabetic() {
         let word_len = tail.bytes().take_while(u8::is_ascii_alphabetic).count();
         let word = tail[..word_len].to_ascii_lowercase();
@@ -1278,36 +1789,47 @@ fn match_date(s: &str, start: usize) -> Option<(usize, &'static str)> {
                 p += 1;
             }
             let ws1 = p;
-            while tail.as_bytes().get(p) == Some(&b' ') {
-                p += 1;
-            }
+            p = skip_inline_spaces(tail, p);
             if p > ws1 {
                 let d_start = p;
                 while tail.as_bytes().get(p).is_some_and(u8::is_ascii_digit) {
                     p += 1;
                 }
                 if (1..=2).contains(&(p - d_start)) {
-                    if tail.as_bytes().get(p) == Some(&b',') {
-                        p += 1;
-                    }
-                    let ws2 = p;
-                    while tail.as_bytes().get(p) == Some(&b' ') {
-                        p += 1;
-                    }
-                    if p > ws2 {
-                        let y_start = p;
-                        while tail.as_bytes().get(p).is_some_and(u8::is_ascii_digit) {
-                            p += 1;
-                        }
-                        if p - y_start == 4
-                            && !tail
-                                .as_bytes()
-                                .get(p)
-                                .is_some_and(u8::is_ascii_alphanumeric)
-                        {
-                            let year: u16 = tail[y_start..p].parse().ok()?;
-                            if (1990..=2100).contains(&year) {
-                                return Some((start + p, "TEXT"));
+                    if let Ok(day) = tail[d_start..p].parse::<u8>() {
+                        if (1..=31).contains(&day) {
+                            if tail.len() >= p + 2 {
+                                let ord = &tail.as_bytes()[p..p + 2];
+                                if ord.eq_ignore_ascii_case(b"st")
+                                    || ord.eq_ignore_ascii_case(b"nd")
+                                    || ord.eq_ignore_ascii_case(b"rd")
+                                    || ord.eq_ignore_ascii_case(b"th")
+                                {
+                                    p += 2;
+                                }
+                            }
+                            if tail.as_bytes().get(p) == Some(&b',') {
+                                p += 1;
+                            }
+                            let ws2 = p;
+                            p = skip_inline_spaces(tail, p);
+                            if p > ws2 {
+                                let y_start = p;
+                                while tail.as_bytes().get(p).is_some_and(u8::is_ascii_digit) {
+                                    p += 1;
+                                }
+                                if p - y_start == 4
+                                    && !tail
+                                        .as_bytes()
+                                        .get(p)
+                                        .is_some_and(u8::is_ascii_alphanumeric)
+                                {
+                                    if let Ok(year) = tail[y_start..p].parse::<u16>() {
+                                        if (1900..=2100).contains(&year) {
+                                            return Some((start + p, "TEXT"));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1323,6 +1845,7 @@ fn match_currency_amount(s: &str, start: usize) -> Option<(&str, &str, &str, usi
         "USD", "EUR", "GBP", "JPY", "CNY", "RMB", "HKD", "CAD", "AUD", "SGD", "CHF", "TWD", "KRW",
     ];
     const SYMBOLS: &[&str] = &["US$", "HK$", "CA$", "AU$", "NT$", "$", "€", "£", "¥", "￥"];
+    const SUFFIX_SYMBOLS: &[&str] = &["元", "€", "$", "£", "¥", "￥"];
 
     let bytes = s.as_bytes();
     let prev_alnum = start > 0 && bytes[start - 1].is_ascii_alphanumeric();
@@ -1332,15 +1855,12 @@ fn match_currency_amount(s: &str, start: usize) -> Option<(&str, &str, &str, usi
     if !prev_alnum {
         for code in CODES {
             if tail.starts_with(code)
-                && tail
-                    .as_bytes()
-                    .get(code.len())
-                    .is_some_and(|b| b.is_ascii_whitespace())
+                && tail[code.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| matches!(c, ' ' | '\t' | '\u{00A0}'))
             {
-                let mut p = code.len();
-                while tail.as_bytes().get(p) == Some(&b' ') {
-                    p += 1;
-                }
+                let p = skip_inline_spaces(tail, code.len());
                 if let Some((num_end, num_slice)) = scan_money_number(&tail[p..]) {
                     let prefix = &tail[..p];
                     return Some((prefix, num_slice, "", start + p + num_end));
@@ -1353,10 +1873,7 @@ fn match_currency_amount(s: &str, start: usize) -> Option<(&str, &str, &str, usi
     if !prev_alnum {
         for sym in SYMBOLS {
             if tail.starts_with(sym) {
-                let mut p = sym.len();
-                while tail.as_bytes().get(p) == Some(&b' ') {
-                    p += 1;
-                }
+                let p = skip_inline_spaces(tail, sym.len());
                 if let Some((num_end, num_slice)) = scan_money_number(&tail[p..]) {
                     let prefix = &tail[..p];
                     return Some((prefix, num_slice, "", start + p + num_end));
@@ -1365,15 +1882,14 @@ fn match_currency_amount(s: &str, start: usize) -> Option<(&str, &str, &str, usi
         }
     }
 
-    // 3. Number + currency code suffix: `15.99 USD`
-    if !prev_alnum && bytes[start].is_ascii_digit() {
+    // 3. Number + currency code/symbol suffix: `15.99 USD`, `98.00元`, `19,99 €`, `20.00 $`, `15.00 £`
+    let valid_num_start = bytes[start].is_ascii_digit()
+        || (matches!(bytes[start], b'+' | b'-')
+            && bytes.get(start + 1).is_some_and(u8::is_ascii_digit));
+    if !prev_alnum && valid_num_start {
         if let Some((num_end, num_slice)) = scan_money_number(tail) {
-            let mut p = num_end;
-            let ws_start = p;
-            while tail.as_bytes().get(p) == Some(&b' ') {
-                p += 1;
-            }
-            if p > ws_start {
+            let p = skip_inline_spaces(tail, num_end);
+            if p > num_end {
                 for code in CODES {
                     if tail[p..].starts_with(code)
                         && !tail
@@ -1384,6 +1900,23 @@ fn match_currency_amount(s: &str, start: usize) -> Option<(&str, &str, &str, usi
                         let suffix = &tail[num_end..p + code.len()];
                         return Some(("", num_slice, suffix, start + p + code.len()));
                     }
+                }
+            }
+            for sym in SUFFIX_SYMBOLS {
+                if tail[p..].starts_with(sym) {
+                    let after_sym = p + sym.len();
+                    // Avoid mistaking a prefix symbol of the next amount (e.g., `Item 1 $9.99`)
+                    // for a suffix of the preceding number.
+                    if *sym != "元"
+                        && tail
+                            .as_bytes()
+                            .get(after_sym)
+                            .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-'))
+                    {
+                        continue;
+                    }
+                    let suffix = &tail[num_end..after_sym];
+                    return Some(("", num_slice, suffix, start + after_sym));
                 }
             }
         }
@@ -1402,7 +1935,11 @@ fn scan_money_number(tail: &str) -> Option<(usize, &str)> {
     if !bytes.get(p).is_some_and(u8::is_ascii_digit) {
         return None;
     }
+    let mut had_comma = false;
     while p < bytes.len() && (bytes[p].is_ascii_digit() || bytes[p] == b',') {
+        if bytes[p] == b',' {
+            had_comma = true;
+        }
         p += 1;
     }
     while p > d_start && bytes[p - 1] == b',' {
@@ -1410,14 +1947,381 @@ fn scan_money_number(tail: &str) -> Option<(usize, &str)> {
     }
     if bytes.get(p) == Some(&b'.') && bytes.get(p + 1).is_some_and(u8::is_ascii_digit) {
         p += 1;
+        let frac_start = p;
         while p < bytes.len() && bytes[p].is_ascii_digit() {
             p += 1;
+        }
+        let frac_len = p - frac_start;
+        // European thousands + decimal comma: e.g. `1.234,56`
+        if !had_comma
+            && frac_len == 3
+            && bytes.get(p) == Some(&b',')
+            && bytes.get(p + 1).is_some_and(u8::is_ascii_digit)
+        {
+            let dec_start = p + 1;
+            let mut q = dec_start;
+            while q < bytes.len() && bytes[q].is_ascii_digit() {
+                q += 1;
+            }
+            if (1..=2).contains(&(q - dec_start))
+                && !bytes.get(q).is_some_and(u8::is_ascii_alphanumeric)
+            {
+                p = q;
+            }
         }
     }
     if bytes.get(p).is_some_and(u8::is_ascii_alphanumeric) {
         return None;
     }
     Some((p, &tail[..p]))
+}
+
+fn match_uuid(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    if start + 36 > bytes.len() {
+        return None;
+    }
+    let seg = &bytes[start..start + 36];
+    let valid = seg[0..8].iter().all(u8::is_ascii_hexdigit)
+        && seg[8] == b'-'
+        && seg[9..13].iter().all(u8::is_ascii_hexdigit)
+        && seg[13] == b'-'
+        && seg[14..18].iter().all(u8::is_ascii_hexdigit)
+        && seg[18] == b'-'
+        && seg[19..23].iter().all(u8::is_ascii_hexdigit)
+        && seg[23] == b'-'
+        && seg[24..36].iter().all(u8::is_ascii_hexdigit);
+    if !valid {
+        return None;
+    }
+    if bytes.get(start + 36).is_some_and(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    Some(start + 36)
+}
+
+fn match_payment_processor_id(s: &str, start: usize) -> Option<usize> {
+    const PREFIXES: &[&str] = &[
+        "in_", "cus_", "pi_", "pm_", "ch_", "sub_", "cs_", "py_", "re_",
+    ];
+    let bytes = s.as_bytes();
+    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        return None;
+    }
+    let tail = &s[start..];
+    for prefix in PREFIXES {
+        if let Some(after_prefix) = tail.strip_prefix(prefix) {
+            let mut offset = prefix.len();
+            if *prefix == "cs_"
+                && (after_prefix.starts_with("test_") || after_prefix.starts_with("live_"))
+            {
+                offset += 5;
+            }
+            let body_start = offset;
+            let mut p = offset;
+            let mut has_digit = false;
+            let mut has_upper = false;
+            let mut has_lower = false;
+            while p < tail.len() && tail.as_bytes()[p].is_ascii_alphanumeric() {
+                let b = tail.as_bytes()[p];
+                if b.is_ascii_digit() {
+                    has_digit = true;
+                } else if b.is_ascii_uppercase() {
+                    has_upper = true;
+                } else if b.is_ascii_lowercase() {
+                    has_lower = true;
+                }
+                p += 1;
+            }
+            let body_len = p - body_start;
+            let is_mixed_case = has_upper && has_lower;
+            let trailing_underscore = tail.as_bytes().get(p) == Some(&b'_');
+            if body_len >= 8
+                && (!trailing_underscore || has_digit)
+                && (has_digit || (is_mixed_case && body_len >= 12))
+            {
+                return Some(start + p);
+            }
+        }
+    }
+    None
+}
+
+fn match_cn_resident_id(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    if start + 18 > bytes.len() {
+        return None;
+    }
+    let seg = &bytes[start..start + 18];
+    if !seg[..17].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if !(seg[17].is_ascii_digit() || matches!(seg[17], b'X' | b'x')) {
+        return None;
+    }
+    if bytes.get(start + 18).is_some_and(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    Some(start + 18)
+}
+
+fn is_uscc_char(b: u8) -> bool {
+    b.is_ascii_digit()
+        || matches!(
+            b,
+            b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'R' | b'T' | b'U' | b'W'..=b'Y'
+        )
+}
+
+fn match_cn_uscc(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    if start + 18 > bytes.len() {
+        return None;
+    }
+    let seg = &bytes[start..start + 18];
+    if !(is_uscc_char(seg[0])
+        && is_uscc_char(seg[1])
+        && seg[2..8].iter().all(u8::is_ascii_digit)
+        && seg[8..18].iter().copied().all(is_uscc_char))
+    {
+        return None;
+    }
+    if bytes.get(start + 18).is_some_and(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    Some(start + 18)
+}
+
+fn match_eu_vat(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    let tail = bytes.get(start..)?;
+    if tail.len() < 10 {
+        return None;
+    }
+    let is_up_num = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit();
+    let len = match [tail[0], tail[1]] {
+        // DE\d{9}
+        [b'D', b'E'] if tail.len() >= 11 && tail[2..11].iter().all(u8::is_ascii_digit) => Some(11),
+        // FR[A-Z0-9]{2}\d{9}
+        [b'F', b'R']
+            if tail.len() >= 13
+                && is_up_num(tail[2])
+                && is_up_num(tail[3])
+                && tail[4..13].iter().all(u8::is_ascii_digit) =>
+        {
+            Some(13)
+        }
+        // GB\d{12} or GB\d{9}
+        [b'G', b'B'] if tail.len() >= 14 && tail[2..14].iter().all(u8::is_ascii_digit) => Some(14),
+        [b'G', b'B'] if tail.len() >= 11 && tail[2..11].iter().all(u8::is_ascii_digit) => Some(11),
+        // IE\d[A-Z0-9]\d{5}[A-Z]{1,2}
+        [b'I', b'E']
+            if tail.len() >= 10
+                && tail[2].is_ascii_digit()
+                && is_up_num(tail[3])
+                && tail[4..9].iter().all(u8::is_ascii_digit)
+                && tail[9].is_ascii_uppercase() =>
+        {
+            if tail.get(10).is_some_and(u8::is_ascii_uppercase) {
+                Some(11)
+            } else {
+                Some(10)
+            }
+        }
+        // NL\d{9}B\d{2}
+        [b'N', b'L']
+            if tail.len() >= 14
+                && tail[2..11].iter().all(u8::is_ascii_digit)
+                && tail[11] == b'B'
+                && tail[12..14].iter().all(u8::is_ascii_digit) =>
+        {
+            Some(14)
+        }
+        // ES[A-Z0-9]\d{7}[A-Z0-9]
+        [b'E', b'S']
+            if tail.len() >= 11
+                && is_up_num(tail[2])
+                && tail[3..10].iter().all(u8::is_ascii_digit)
+                && is_up_num(tail[10]) =>
+        {
+            Some(11)
+        }
+        // IT\d{11}
+        [b'I', b'T'] if tail.len() >= 13 && tail[2..13].iter().all(u8::is_ascii_digit) => Some(13),
+        _ => None,
+    }?;
+    let end = start + len;
+    if bytes.get(end).is_some_and(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    Some(end)
+}
+
+fn match_us_ssn(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start > 0
+        && (bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'-' | b'.'))
+    {
+        return None;
+    }
+    if start + 11 > bytes.len() {
+        return None;
+    }
+    let seg = &bytes[start..start + 11];
+    if !(seg[0..3].iter().all(u8::is_ascii_digit)
+        && seg[3] == b'-'
+        && seg[4..6].iter().all(u8::is_ascii_digit)
+        && seg[6] == b'-'
+        && seg[7..11].iter().all(u8::is_ascii_digit))
+    {
+        return None;
+    }
+    let end = start + 11;
+    if end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric()
+            || bytes[end] == b'-'
+            || (bytes[end] == b'.' && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)))
+    {
+        return None;
+    }
+    Some(end)
+}
+
+fn match_us_ein(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start > 0
+        && (bytes[start - 1].is_ascii_alphanumeric() || matches!(bytes[start - 1], b'-' | b'.'))
+    {
+        return None;
+    }
+    if start + 10 > bytes.len() {
+        return None;
+    }
+    let seg = &bytes[start..start + 10];
+    if !(seg[0..2].iter().all(u8::is_ascii_digit)
+        && seg[2] == b'-'
+        && seg[3..10].iter().all(u8::is_ascii_digit))
+    {
+        return None;
+    }
+    let end = start + 10;
+    if end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric()
+            || bytes[end] == b'-'
+            || (bytes[end] == b'.' && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)))
+    {
+        return None;
+    }
+    if !has_ein_context(s, start, end) {
+        return None;
+    }
+    Some(end)
+}
+
+fn has_ein_context(s: &str, start: usize, end: usize) -> bool {
+    let mut win_start = start.saturating_sub(48);
+    while win_start > 0 && !s.is_char_boundary(win_start) {
+        win_start -= 1;
+    }
+    let mut win_end = (end + 24).min(s.len());
+    while win_end < s.len() && !s.is_char_boundary(win_end) {
+        win_end += 1;
+    }
+    let window = s[win_start..win_end].to_ascii_lowercase();
+    window.contains("tax")
+        || window.contains("fein")
+        || window.contains("employer")
+        || window.contains("federal")
+        || window.contains("税")
+        || contains_ascii_word(&window, "ein")
+        || contains_ascii_word(&window, "tin")
+        || contains_ascii_word(&window, "irs")
+}
+
+fn contains_ascii_word(haystack: &str, word: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut pos = 0usize;
+    while let Some(rel) = haystack[pos..].find(word) {
+        let abs = pos + rel;
+        let end = abs + word.len();
+        let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphabetic();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphabetic();
+        if before_ok && after_ok {
+            return true;
+        }
+        pos = end;
+    }
+    false
+}
+
+fn match_last4_card_ref(s: &str, start: usize) -> Option<(&str, &str, usize)> {
+    let bytes = s.as_bytes();
+    let tail = &s[start..];
+
+    // 1. English last-4 references (word boundary before start)
+    if start == 0 || !bytes[start - 1].is_ascii_alphanumeric() {
+        const EN_PREFIXES: &[&str] = &["ending in", "ends in", "last 4 digits", "last 4 digit"];
+        for prefix in EN_PREFIXES {
+            if tail.len() > prefix.len() + 4
+                && tail.is_char_boundary(prefix.len())
+                && tail[..prefix.len()].eq_ignore_ascii_case(prefix)
+            {
+                let mut p = prefix.len();
+                let mut had_colon = false;
+                if tail.as_bytes().get(p) == Some(&b':') {
+                    p += 1;
+                    had_colon = true;
+                }
+                let ws_start = p;
+                p = skip_inline_spaces(tail, p);
+                if (p > ws_start || had_colon)
+                    && p + 4 <= tail.len()
+                    && tail.as_bytes()[p..p + 4].iter().all(u8::is_ascii_digit)
+                    && !tail
+                        .as_bytes()
+                        .get(p + 4)
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                {
+                    return Some((&tail[..p], &tail[p..p + 4], start + p + 4));
+                }
+            }
+        }
+    }
+
+    // 2. Chinese last-4 references (`卡号尾号`, `尾号`)
+    const CJK_PREFIXES: &[&str] = &["卡号尾号", "尾号"];
+    for prefix in CJK_PREFIXES {
+        if tail.starts_with(prefix) {
+            let mut p = prefix.len();
+            if let Some(ch @ (':' | '：')) = tail[p..].chars().next() {
+                p += ch.len_utf8();
+            }
+            p = skip_inline_spaces(tail, p);
+            if p + 4 <= tail.len()
+                && tail.as_bytes()[p..p + 4].iter().all(u8::is_ascii_digit)
+                && !tail
+                    .as_bytes()
+                    .get(p + 4)
+                    .is_some_and(u8::is_ascii_alphanumeric)
+            {
+                return Some((&tail[..p], &tail[p..p + 4], start + p + 4));
+            }
+        }
+    }
+
+    None
 }
 
 fn match_prefixed_code(s: &str, start: usize) -> Option<usize> {
@@ -1457,13 +2361,17 @@ fn match_prefixed_code(s: &str, start: usize) -> Option<usize> {
 
 fn match_masked_card(s: &str, start: usize) -> Option<usize> {
     let tail = &s[start..];
-    if !(tail.starts_with("****") || tail.starts_with("••••") || tail.starts_with("XXXX")) {
+    if !(tail.starts_with("****")
+        || tail.starts_with("••••")
+        || tail.starts_with("＊＊＊＊")
+        || tail.starts_with("XXXX"))
+    {
         return None;
     }
     let mut p = 0usize;
     let mut digits = 0usize;
     for (idx, ch) in tail.char_indices() {
-        if matches!(ch, '*' | '•' | 'X' | 'x' | '-' | ' ') {
+        if matches!(ch, '*' | '•' | '＊' | 'X' | 'x' | '-' | ' ') {
             p = idx + ch.len_utf8();
         } else if ch.is_ascii_digit() {
             digits += 1;
@@ -1472,7 +2380,7 @@ fn match_masked_card(s: &str, start: usize) -> Option<usize> {
             break;
         }
     }
-    while p > 0 && tail.as_bytes()[p - 1] == b' ' {
+    while p > 0 && matches!(tail.as_bytes()[p - 1], b' ' | b'-') {
         p -= 1;
     }
     if digits >= 4 {
@@ -1482,9 +2390,220 @@ fn match_masked_card(s: &str, start: usize) -> Option<usize> {
     }
 }
 
-fn match_long_number_or_phone(s: &str, start: usize) -> Option<usize> {
+fn match_mid_masked_card_or_phone(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'*') {
+        return None;
+    }
+    let tail = &s[start..];
+    let mut p = 0usize;
+
+    // Optional international prefix like `+86 ` before `138****8000`
+    if bytes[start] == b'+' {
+        p += 1;
+        let cc_start = p;
+        while p < tail.len() && tail.as_bytes()[p].is_ascii_digit() {
+            p += 1;
+        }
+        if !(1..=3).contains(&(p - cc_start)) {
+            return None;
+        }
+        if matches!(tail.as_bytes().get(p), Some(b' ' | b'-')) {
+            p += 1;
+        } else {
+            return None;
+        }
+    }
+
+    // Leading digits (e.g., `138`, `6222`, `4111 11`)
+    let mut lead_digits = 0usize;
+    while p < tail.len() {
+        let b = tail.as_bytes()[p];
+        if b.is_ascii_digit() {
+            lead_digits += 1;
+            p += 1;
+        } else if matches!(b, b' ' | b'-')
+            && lead_digits >= 2
+            && tail.as_bytes().get(p + 1).is_some_and(u8::is_ascii_digit)
+        {
+            p += 1;
+        } else {
+            break;
+        }
+    }
+    if !(2..=8).contains(&lead_digits) {
+        return None;
+    }
+
+    // Optional single space or hyphen between leading digits and mask
+    if matches!(tail.as_bytes().get(p), Some(b' ' | b'-')) {
+        p += 1;
+    }
+
+    // Mask run: >= 3 mask chars (`*`, `•`, `＊`, `X`, `x`) with optional internal spaces/hyphens
+    let mut mask_chars = 0usize;
+    let mut mask_end = p;
+    while p < tail.len() {
+        let ch = tail[p..].chars().next()?;
+        if matches!(ch, '*' | '•' | '＊' | 'X' | 'x') {
+            mask_chars += 1;
+            p += ch.len_utf8();
+            mask_end = p;
+        } else if matches!(ch, ' ' | '-') && mask_chars > 0 {
+            p += 1;
+        } else {
+            break;
+        }
+    }
+    if mask_chars < 3 || p > mask_end + 1 {
+        return None;
+    }
+
+    // Trailing digits (e.g., `1234`, `8000`)
+    let mut trail_digits = 0usize;
+    while p < tail.len() && tail.as_bytes()[p].is_ascii_digit() {
+        trail_digits += 1;
+        p += 1;
+    }
+    if !(4..=6).contains(&trail_digits) {
+        return None;
+    }
+
+    if p < tail.len() && (tail.as_bytes()[p].is_ascii_alphanumeric() || tail.as_bytes()[p] == b'*')
+    {
+        return None;
+    }
+    Some(start + p)
+}
+
+fn match_parenthesized_phone(s: &str, start: usize) -> Option<usize> {
     let bytes = s.as_bytes();
     if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'.') {
+        return None;
+    }
+    let mut p = start;
+    let mut total_digits = 0usize;
+
+    // Optional `+CC ` or `+CC-` country code prefix before `(`
+    if bytes[p] == b'+' {
+        p += 1;
+        let cc_start = p;
+        while p < bytes.len() && bytes[p].is_ascii_digit() {
+            p += 1;
+        }
+        let cc_len = p - cc_start;
+        if !(1..=3).contains(&cc_len) {
+            return None;
+        }
+        total_digits += cc_len;
+        if matches!(bytes.get(p), Some(b' ' | b'-')) {
+            p += 1;
+        }
+    }
+
+    if bytes.get(p) != Some(&b'(') {
+        return None;
+    }
+    p += 1;
+    let area_start = p;
+    while p < bytes.len() && bytes[p].is_ascii_digit() {
+        p += 1;
+    }
+    let area_len = p - area_start;
+    if !(2..=4).contains(&area_len) || bytes.get(p) != Some(&b')') {
+        return None;
+    }
+    total_digits += area_len;
+    p += 1;
+
+    if matches!(bytes.get(p), Some(b' ' | b'-' | b'.')) {
+        p += 1;
+    }
+    if !bytes.get(p).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+
+    let mut sub_digits = 0usize;
+    let mut last_digit_end = p;
+    while p < bytes.len() {
+        if bytes[p].is_ascii_digit() {
+            sub_digits += 1;
+            total_digits += 1;
+            p += 1;
+            last_digit_end = p;
+        } else if matches!(bytes[p], b'-' | b' ' | b'.')
+            && bytes.get(p + 1).is_some_and(u8::is_ascii_digit)
+        {
+            p += 1;
+        } else {
+            break;
+        }
+    }
+
+    if last_digit_end < bytes.len()
+        && (bytes[last_digit_end].is_ascii_alphanumeric()
+            || (bytes[last_digit_end] == b'.'
+                && bytes
+                    .get(last_digit_end + 1)
+                    .is_some_and(u8::is_ascii_digit)))
+    {
+        return None;
+    }
+    if total_digits >= 10 && sub_digits >= 6 {
+        Some(last_digit_end)
+    } else {
+        None
+    }
+}
+
+fn match_dotted_phone(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'.') {
+        return None;
+    }
+    let mut p = start;
+    if bytes[p] == b'+' {
+        p += 1;
+        let cc_start = p;
+        while p < bytes.len() && bytes[p].is_ascii_digit() {
+            p += 1;
+        }
+        if !(1..=3).contains(&(p - cc_start)) || bytes.get(p) != Some(&b'.') {
+            return None;
+        }
+        p += 1;
+    } else if bytes[p] == b'1' && bytes.get(p + 1) == Some(&b'.') {
+        p += 2;
+    }
+
+    if p + 12 > bytes.len() {
+        return None;
+    }
+    if !(bytes[p..p + 3].iter().all(u8::is_ascii_digit)
+        && bytes[p + 3] == b'.'
+        && bytes[p + 4..p + 7].iter().all(u8::is_ascii_digit)
+        && bytes[p + 7] == b'.'
+        && bytes[p + 8..p + 12].iter().all(u8::is_ascii_digit))
+    {
+        return None;
+    }
+    let end = p + 12;
+    if end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric()
+            || (bytes[end] == b'.' && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)))
+    {
+        return None;
+    }
+    Some(end)
+}
+
+fn match_long_number_or_phone(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if start > 0
+        && (bytes[start - 1].is_ascii_alphanumeric()
+            || bytes[start - 1] == b'.'
+            || (bytes[start - 1] == b'-' && start >= 2 && bytes[start - 2].is_ascii_digit()))
+    {
         return None;
     }
     let has_plus = bytes[start] == b'+';
@@ -1513,7 +2632,11 @@ fn match_long_number_or_phone(s: &str, start: usize) -> Option<usize> {
         }
     }
     if last_digit_end < bytes.len()
-        && (bytes[last_digit_end].is_ascii_alphanumeric() || bytes[last_digit_end] == b'.')
+        && (bytes[last_digit_end].is_ascii_alphanumeric()
+            || (bytes[last_digit_end] == b'.'
+                && bytes
+                    .get(last_digit_end + 1)
+                    .is_some_and(u8::is_ascii_digit)))
     {
         return None;
     }
@@ -1571,4 +2694,257 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex_encode(&hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_chinese_fapiao_fields_uscc_and_yuan_amounts() {
+        let input = concat!(
+            "名 称：北京星云科技有限公司\n",
+            "名\u{3000}称：上海测试网络有限公司\n",
+            "购买方名称：深圳示例科技股份有限公司\n",
+            "纳税人识别号：91110108MA01ABCD12\n",
+            "统一社会信用代码 91310000775785552L 与 91110108MA01ABCD12\n",
+            "地址、电话：北京市海淀区中关村大街1号 010-12345678\n",
+            "开户行及账号：中国工商银行 6222021001123456789\n",
+            "发票代码：011002200111\n",
+            "发票号码：24112000000123456789\n",
+            "校验码：12345 67890 12345 67890\n",
+            "机器编号：661619901234\n",
+            "订单号：ORD202610150001\n",
+            "开票人：王五\n",
+            "收款人：张三\n",
+            "复 核：李四\n",
+            "价税合计：98.00元\n",
+            "优惠：98元\n",
+            "标签：ABCDEFGHJKLMNPQRTU\n",
+        );
+
+        let mut redactor = Redactor::new(Vec::new());
+        let (out, _) = redact_plain_text(input, &mut redactor);
+
+        assert!(out.contains("名 称：[REDACTED_FIELD_"), "{out}");
+        assert!(out.contains("名\u{3000}称：[REDACTED_FIELD_"), "{out}");
+        assert!(out.contains("购买方名称：[REDACTED_FIELD_"), "{out}");
+        assert!(out.contains("纳税人识别号：[REDACTED_FIELD_"), "{out}");
+        assert!(
+            out.contains("统一社会信用代码 [REDACTED_ID_1] 与 [REDACTED_ID_2]"),
+            "{out}"
+        );
+        assert!(out.contains("地址、电话：[REDACTED_FIELD_"), "{out}");
+        assert!(out.contains("开户行及账号：[REDACTED_FIELD_"), "{out}");
+        assert!(out.contains("发票号码：[REDACTED_FIELD_"), "{out}");
+        assert!(out.contains("价税合计：[AMOUNT_"), "{out}");
+        assert!(out.contains("]元"), "{out}");
+        assert!(out.contains("标签：ABCDEFGHJKLMNPQRTU"), "{out}");
+
+        for secret in [
+            "北京星云科技有限公司",
+            "上海测试网络有限公司",
+            "深圳示例科技股份有限公司",
+            "91110108MA01ABCD12",
+            "91310000775785552L",
+            "中关村大街1号",
+            "010-12345678",
+            "6222021001123456789",
+            "011002200111",
+            "24112000000123456789",
+            "661619901234",
+            "ORD202610150001",
+            "王五",
+            "张三",
+            "李四",
+            "98.00",
+            "98元",
+        ] {
+            assert!(!out.contains(secret), "leaked {secret:?} in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn redacts_national_ids_phones_masked_cards_and_last4_refs() {
+        let input = concat!(
+            "Resident ID 11010119900307123X and 31010119851215002x\n",
+            "US SSN 123-45-6789\n",
+            "Federal Tax EIN 12-3456789\n",
+            "FEIN: 98-7654321\n",
+            "Catalog code 12-3456789\n",
+            "Phones: (415) 555-0199, +1 (415) 555-0199, 415.555.0199\n",
+            "Landlines: 010-12345678 and 0755-88886666.\n",
+            "Cards: 6222 **** **** 1234 and **** **** **** 4242\n",
+            "Cell numbers: 138****8000 and 138 **** 8000\n",
+            "Paid with Visa ending in 4242, card ends in 6184, last 4 digits: 9012\n",
+            "银行卡尾号8899 / 卡号尾号 7766\n",
+            "Resolution: 1920x1080\n",
+        );
+
+        let mut redactor = Redactor::new(Vec::new());
+        let (out, _) = redact_plain_text(input, &mut redactor);
+
+        assert_eq!(redactor.counts.header_fields, 0, "{out}");
+        assert!(out.contains("Catalog code 12-3456789"), "{out}");
+        assert!(out.contains("Resolution: 1920x1080"), "{out}");
+        assert!(out.contains("Cell numbers: [REDACTED_ID_"), "{out}");
+        assert!(out.contains("Visa ending in [REDACTED_ID_"), "{out}");
+        assert!(out.contains("card ends in [REDACTED_ID_"), "{out}");
+        assert!(out.contains("last 4 digits: [REDACTED_ID_"), "{out}");
+        assert!(out.contains("银行卡尾号[REDACTED_ID_"), "{out}");
+        assert!(out.contains("卡号尾号 [REDACTED_ID_"), "{out}");
+
+        for secret in [
+            "11010119900307123X",
+            "31010119851215002x",
+            "123-45-6789",
+            "98-7654321",
+            "(415) 555-0199",
+            "+1 (415) 555-0199",
+            "555-0199",
+            "415.555.0199",
+            "010-12345678",
+            "0755-88886666",
+            "6222 **** **** 1234",
+            "**** **** **** 4242",
+            "138****8000",
+            "138 **** 8000",
+            "4242",
+            "6184",
+            "9012",
+            "8899",
+            "7766",
+        ] {
+            assert!(!out.contains(secret), "leaked {secret:?} in:\n{out}");
+        }
+        assert!(!out.contains("Federal Tax EIN 12-3456789"), "{out}");
+    }
+
+    #[test]
+    fn redacts_uuids_payment_ids_eu_vat_dates_and_suffix_amounts() {
+        let input = concat!(
+            "Trace: 550e8400-e29b-41d4-a716-446655440000\n",
+            "Stripe: in_1Ab2Cd3Ef4Gh5Ij6 cus_NffrFeUfNV2Hib pi_3MtwBwLkdIwHu7ix pm_1CardToken99 ch_3Abcdefgh sub_12345678 cs_test_a1b2c3d4e5f6 py_1A2B3C4D re_9Z8Y7X6W\n",
+            "Labels: in_memory sub_total re_authentication\n",
+            "Registration: DE123456789 FRXX123456789 GB123456789 IE1A23456B NL123456789B01 ESA1234567B IT12345678901\n",
+            "Dates: 15 Oct 2026, 3 November 2026, 2026.05.01, 2026.10.15, 1985-04-20\n",
+            "Prices: 10,00 €, 19,99 €, 20.00 $, 15.00 £, 98.00元, 98元\n",
+            "Qty: Item 1 $9.99\n",
+        );
+
+        let mut redactor = Redactor::new(Vec::new());
+        let (out, _) = redact_plain_text(input, &mut redactor);
+
+        assert_eq!(redactor.counts.header_fields, 0, "{out}");
+        assert!(
+            out.contains("Labels: in_memory sub_total re_authentication"),
+            "{out}"
+        );
+        assert!(out.contains("Registration: [REDACTED_ID_"), "{out}");
+        assert!(out.contains("Qty: Item 1 $[AMOUNT_"), "{out}");
+        assert!(out.contains("[DATE_TEXT_"), "{out}");
+        assert!(out.contains("[DATE_ISO_"), "{out}");
+        assert!(out.contains("] €"), "{out}");
+        assert!(out.contains("] $"), "{out}");
+        assert!(out.contains("] £"), "{out}");
+        assert!(out.contains("]元"), "{out}");
+
+        for secret in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "in_1Ab2Cd3Ef4Gh5Ij6",
+            "cus_NffrFeUfNV2Hib",
+            "pi_3MtwBwLkdIwHu7ix",
+            "pm_1CardToken99",
+            "ch_3Abcdefgh",
+            "sub_12345678",
+            "cs_test_a1b2c3d4e5f6",
+            "py_1A2B3C4D",
+            "re_9Z8Y7X6W",
+            "DE123456789",
+            "FRXX123456789",
+            "GB123456789",
+            "IE1A23456B",
+            "NL123456789B01",
+            "ESA1234567B",
+            "IT12345678901",
+            "15 Oct 2026",
+            "3 November 2026",
+            "2026.05.01",
+            "2026.10.15",
+            "1985-04-20",
+            "10,00",
+            "19,99",
+            "20.00",
+            "15.00",
+            "98.00",
+            "9.99",
+        ] {
+            assert!(!out.contains(secret), "leaked {secret:?} in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn redacts_html_adjacent_cells_entities_and_expanded_url_attrs() {
+        let html = concat!(
+            "<!doctype html><html><body>\n",
+            "<table>\n",
+            "<tr><th>纳税人识别号</th><td>91110108MA01ABCD12</td></tr>\n",
+            "<tr><th>名 称：</th><td>星云科技有限公司</td></tr>\n",
+            "<tr><td>Billing Name</td><td>Alice Secret</td><td>订单号</td><td>ORD-889900</td></tr>\n",
+            "<tr><th>Amount</th><td>19,99 €</td></tr>\n",
+            "</table>\n",
+            "<p>Contact: alice&#64;example&#x2E;com for AT&amp;T &lt;Pro&gt;</p>\n",
+            "<img srcset=\"https://cdn.example.com/u1-1x.png 1x, https://cdn.example.com/u1-2x.png 2x\" />\n",
+            "<button formaction=\"https://pay.example.com/checkout?acct=secret99\">Pay</button>\n",
+            "<svg><use xlink:href=\"https://tracker.example.com/icon.svg#user42\" /></svg>\n",
+            "</body></html>\n",
+        );
+
+        let mut redactor = Redactor::new(Vec::new());
+        let (out, lines) = redact_html(html, &mut redactor);
+
+        assert!(!lines.is_empty());
+        assert_eq!(redactor.counts.header_fields, 4, "{out}");
+        assert_eq!(redactor.counts.amounts, 1, "{out}");
+        assert_eq!(redactor.counts.emails, 1, "{out}");
+        assert_eq!(redactor.counts.urls_and_ips, 3, "{out}");
+        assert!(
+            out.contains("<tr><th>纳税人识别号</th><td>[REDACTED_FIELD_"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<tr><th>名 称：</th><td>[REDACTED_FIELD_"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<td>Billing Name</td><td>[REDACTED_FIELD_"),
+            "{out}"
+        );
+        assert!(out.contains("<td>订单号</td><td>[REDACTED_FIELD_"), "{out}");
+        assert!(out.contains("<tr><th>Amount</th><td>[AMOUNT_"), "{out}");
+        assert!(
+            out.contains("Contact: [REDACTED_EMAIL_1] for AT&amp;T &lt;Pro&gt;"),
+            "{out}"
+        );
+        assert!(out.contains("srcset=\"[REDACTED_URL_"), "{out}");
+        assert!(out.contains("formaction=\"[REDACTED_URL_"), "{out}");
+        assert!(out.contains("xlink:href=\"[REDACTED_URL_"), "{out}");
+
+        for secret in [
+            "91110108MA01ABCD12",
+            "星云科技有限公司",
+            "Alice Secret",
+            "ORD-889900",
+            "19,99",
+            "alice",
+            "example.com",
+            "cdn.example.com",
+            "pay.example.com",
+            "tracker.example.com",
+            "secret99",
+            "user42",
+        ] {
+            assert!(!out.contains(secret), "leaked {secret:?} in:\n{out}");
+        }
+    }
 }
